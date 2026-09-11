@@ -1,0 +1,5 @@
+<Project>
+  <Target Name="PatchShareEngineForAppleUsbccgp" BeforeTargets="CoreCompile">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\BuildFix.ps1&quot;" />
+  </Target>
+</Project>
