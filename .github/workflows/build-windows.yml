@@ -21,6 +21,49 @@ jobs:
         with:
           dotnet-version: "8.x"
 
+      - name: Build open-source Microsoft USB NCM host driver
+        shell: pwsh
+        run: |
+          $ncm = Join-Path $env:RUNNER_TEMP "NCM-Driver-for-Windows"
+          git clone --depth 1 --branch release_21H2 --recurse-submodules https://github.com/microsoft/NCM-Driver-for-Windows.git $ncm
+          $inf = Join-Path $ncm "host\UsbNcmSample.inf"
+          if (-not (Test-Path $inf)) { throw "Microsoft NCM host INF was not found." }
+          # Bind the sample host driver to standard CDC-NCM interfaces. This is
+          # an experimental Win10 path; Windows 10 does not ship UsbNcm.sys.
+          $text = Get-Content $inf -Raw
+          $text = $text -replace '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00', '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
+          Set-Content -Path $inf -Value $text -NoNewline
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found." }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.Microsoft.VisualStudio.Component.WindowsDriverKit -property installationPath
+          if (-not $vs) { $vs = & $vswhere -latest -products * -property installationPath }
+          if (-not $vs) { throw "Visual Studio installation not found." }
+          $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
+          if (-not (Test-Path $msbuild)) { throw "MSBuild.exe not found at $msbuild" }
+          & $msbuild (Join-Path $ncm "projects\host\host.vcxproj") /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver build failed ($LASTEXITCODE)." }
+          $driverRoot = Join-Path $ncm "artifacts\UsbNcmHost"
+          New-Item -ItemType Directory -Force $driverRoot | Out-Null
+          $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Where-Object { $_.FullName -match '\\Release\\x64\\' } | Select-Object -First 1
+          if (-not $sys) { $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Select-Object -First 1 }
+          if (-not $sys) { throw "UsbNcmSample.sys was not produced." }
+          Copy-Item $sys.FullName (Join-Path $driverRoot "UsbNcmSample.sys") -Force
+          Copy-Item $inf (Join-Path $driverRoot "UsbNcmSample.inf") -Force
+          if (Test-Path (Join-Path $ncm "LICENSE")) { Copy-Item (Join-Path $ncm "LICENSE") (Join-Path $driverRoot "MICROSOFT-NCM-LICENSE.txt") -Force }
+          Set-Content (Join-Path $driverRoot "README.txt") @"
+          Experimental Microsoft USB NCM host driver
+
+          Source: https://github.com/microsoft/NCM-Driver-for-Windows
+          Branch: release_21H2
+          License: MIT
+
+          This driver is included as an experimental open-source Windows 10 path.
+          It is NOT automatically installed by iPhoneUsbShare yet because ordinary
+          Windows 10 systems require a properly signed kernel driver package.
+          "@
+          New-Item -ItemType Directory -Force .\artifacts\ncm-driver | Out-Null
+          Compress-Archive -Path "$driverRoot\*" -DestinationPath .\artifacts\ncm-driver\Microsoft-UsbNcm-Host-x64-experimental.zip -Force
+
       - name: Publish self-contained EXE
         shell: pwsh
         run: |
@@ -61,6 +104,11 @@ jobs:
           Copyright and license information: https://github.com/mcuee/libusb-win32
           The libusb-win32 user-space library (libusb0.dll) is distributed under the LGPL.
           The application downloads the matching signed libusb-win32 driver package on first setup and verifies its SHA-256 hash.
+
+          Microsoft NCM-Driver-for-Windows
+          Source: https://github.com/microsoft/NCM-Driver-for-Windows
+          License: MIT
+          An experimental x64 host-driver build is provided separately by the workflow.
           "@
           Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
 
@@ -69,5 +117,13 @@ jobs:
         with:
           name: iPhoneUsbShare-win-x64
           path: artifacts/iPhoneUsbShare-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload experimental Microsoft NCM driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: Microsoft-UsbNcm-Host-x64-experimental
+          path: artifacts/ncm-driver/Microsoft-UsbNcm-Host-x64-experimental.zip
           if-no-files-found: error
           retention-days: 14
