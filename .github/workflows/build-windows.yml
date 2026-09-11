@@ -42,9 +42,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $path = 'src\ShareEngine.cs'
           $text = Get-Content $path -Raw
-          $needle = '        await EnsurePrerequisitesAsync();\r\n'
+          $nl = [Environment]::NewLine
+          $needle = "        await EnsurePrerequisitesAsync();$nl"
           if (-not $text.Contains($needle)) { throw 'Could not find StartAsync prerequisite call.' }
-          $replacement = '        await EnsurePrerequisitesAsync();\r\n        InstallBundledAppleEthernetDriver();\r\n'
+          $replacement = "        await EnsurePrerequisitesAsync();$nl        InstallBundledAppleEthernetDriver();$nl"
           $text = $text.Replace($needle, $replacement)
           $method = @'
 
@@ -71,7 +72,7 @@ jobs:
 '@
           $anchor = '    private void ConfigureUsbDevice(PnpDevice phone)'
           if (-not $text.Contains($anchor)) { throw 'Could not find ConfigureUsbDevice insertion point.' }
-          $text = $text.Replace($anchor, $method + "\r\n" + $anchor)
+          $text = $text.Replace($anchor, $method + $nl + $anchor)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
           Write-Host 'Apple Ethernet driver installation hook added to build.'
 
