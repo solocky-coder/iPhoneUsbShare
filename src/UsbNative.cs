@@ -88,10 +88,23 @@ internal static class UsbNative
             {
                 var buf = new byte[4];
                 var n = usb_control_msg(h, 0xC0, 0x45, 0, 0, buf, 4, 1000);
+                var bytes = n > 0 ? string.Join(" ", buf.Take(Math.Min(n, buf.Length)).Select(b => b.ToString("X2"))) : "";
+
+                // The iPhone path normally returns four bytes (3:3:3:0). The iPad Air 2
+                // has been observed to return the same tuple without the trailing zero:
+                // three bytes (3:3:3). libusb-win32 correctly reports the actual byte
+                // count, so do not reject that shorter-but-valid response.
+                if (n == 3)
+                {
+                    var mode3 = string.Join(":", buf.Take(3));
+                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode3, $"GET_MODE returned 3 bytes (accepted iPad form): {bytes}");
+                }
+
                 if (n != 4)
-                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null, $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {GetUsbError()}");
+                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null, $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {bytes} ({GetUsbError()})");
+
                 var mode = string.Join(":", buf);
-                return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode, "GET_MODE succeeded.");
+                return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode, $"GET_MODE succeeded: {bytes}");
             }
             finally { usb_close(h); }
         }
