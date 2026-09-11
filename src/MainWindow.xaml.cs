@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -32,14 +31,14 @@ public partial class MainWindow : Window
         try
         {
             var s = await _engine.GetStatusAsync();
-            PhoneText.Text = s.PhoneConnected ? s.PhoneName : "Connect your iPhone or iPad by USB";
+            PhoneText.Text = s.AppleConnected ? s.AppleName : "Connect your iPhone or iPad by USB";
             AdapterText.Text = s.AdapterName is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.AdapterName} ({s.AdapterStatus})";
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                s.PhoneConnected ? (s.Sharing ? "#16A34A" : "#D97706") : "#98A2B3"));
+                s.AppleConnected ? (s.Sharing ? "#16A34A" : "#D97706") : "#98A2B3"));
             StateText.Text = s.Sharing ? "Internet sharing is ON" : "Ready";
-            IpText.Text = s.PhoneIp ?? "—";
-            RxText.Text = $"{s.RxKbps:0.0} KB/s";
-            TxText.Text = $"{s.TxKbps:0.0} KB/s";
+            IpText.Text = s.Lease ?? "—";
+            RxText.Text = $"{s.Rx:0.0} KB/s";
+            TxText.Text = $"{s.Tx:0.0} KB/s";
             if (_sharing && !s.Sharing && s.AdapterName is null)
             {
                 _sharing = false;
