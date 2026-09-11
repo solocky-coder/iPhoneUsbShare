@@ -53,12 +53,12 @@ internal static class UsbNative
                 if (n == 3)
                 {
                     var mode3 = string.Join(":", buf.Take(3));
-                    if (mode3 == "5:3:3") DumpMode5Descriptors(h, id);
+                    if (mode3 == "5:3:3") DumpAllConfigurations(h, id);
                     return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode3, $"GET_MODE returned 3 bytes (accepted iPad form): {bytes}");
                 }
                 if (n != 4) return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null, $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {bytes} ({GetUsbError()})");
                 var mode = string.Join(":", buf);
-                if (mode == "5:3:3:0") DumpMode5Descriptors(h, id);
+                if (mode == "5:3:3:0") DumpAllConfigurations(h, id);
                 return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode, $"GET_MODE succeeded: {bytes}");
             }
             finally { usb_close(h); }
@@ -66,35 +66,49 @@ internal static class UsbNative
         catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private static void DumpMode5Descriptors(IntPtr handle, string id)
+    private static void DumpAllConfigurations(IntPtr handle, string id)
     {
         try
         {
             var dev = new byte[18];
             var dn = usb_get_descriptor(handle, 0x01, 0, dev, dev.Length);
-            AppendRaw($"USB MODE 5 DESCRIPTOR: {id}, deviceDescriptorReturn={dn}, bNumConfigurations={(dn >= 18 ? dev[17].ToString() : "?")}");
-            var cfgHead = new byte[9];
-            var hn = usb_get_descriptor(handle, 0x02, 0, cfgHead, cfgHead.Length);
-            if (hn < 9) { AppendRaw($"USB MODE 5 CONFIG HEADER FAILED: return={hn}, error={GetUsbError()}"); return; }
-            var total = cfgHead[2] | (cfgHead[3] << 8);
-            var cfg = new byte[Math.Clamp(total, 9, 4096)];
-            var cn = usb_get_descriptor(handle, 0x02, 0, cfg, cfg.Length);
-            AppendRaw($"USB MODE 5 CONFIG: return={cn}, totalLength={total}, raw={Hex(cfg, cn > 0 ? Math.Min(cn, cfg.Length) : 0)}");
-            var pos = 0;
-            while (pos + 2 <= cn)
-            {
-                var len = cfg[pos]; var type = cfg[pos + 1];
-                if (len < 2 || pos + len > cn) break;
-                if (type == 0x04 && len >= 9)
-                    AppendRaw($"USB MODE 5 INTERFACE: offset={pos}, if={cfg[pos+2]}, alt={cfg[pos+3]}, eps={cfg[pos+4]}, class={cfg[pos+5]:X2}, subclass={cfg[pos+6]:X2}, protocol={cfg[pos+7]:X2}, iInterface={cfg[pos+8]}");
-                else if (type == 0x05 && len >= 7)
-                    AppendRaw($"USB MODE 5 ENDPOINT: offset={pos}, addr={cfg[pos+2]:X2}, attrs={cfg[pos+3]:X2}, maxPacket={(cfg[pos+4] | (cfg[pos+5] << 8))}, interval={cfg[pos+6]}");
-                else if (type == 0x24)
-                    AppendRaw($"USB MODE 5 CDC EXTRA: offset={pos}, len={len}, subtype={(len >= 3 ? cfg[pos+2].ToString("X2") : "??")}, raw={Hex(cfg, pos, len)}");
-                pos += len;
-            }
+            var configCount = dn >= 18 ? dev[17] : (byte)0;
+            AppendRaw($"USB MODE 5 DESCRIPTOR: {id}, deviceDescriptorReturn={dn}, bNumConfigurations={configCount}");
+            for (byte index = 0; index < configCount; index++) DumpConfiguration(handle, id, index);
         }
-        catch (Exception ex) { AppendRaw($"USB MODE 5 DESCRIPTOR DUMP ERROR: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { AppendRaw($"USB MODE 5 ALL-CONFIG DUMP ERROR: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static void DumpConfiguration(IntPtr handle, string id, byte index)
+    {
+        var cfgHead = new byte[9];
+        var hn = usb_get_descriptor(handle, 0x02, index, cfgHead, cfgHead.Length);
+        if (hn < 9)
+        {
+            AppendRaw($"USB CONFIG {index + 1}: HEADER FAILED return={hn}, error={GetUsbError()}");
+            return;
+        }
+        var total = cfgHead[2] | (cfgHead[3] << 8);
+        var value = cfgHead[5];
+        var cfg = new byte[Math.Clamp(total, 9, 8192)];
+        var cn = usb_get_descriptor(handle, 0x02, index, cfg, cfg.Length);
+        AppendRaw($"USB CONFIG {index + 1}: descriptorIndex={index}, value={value}, return={cn}, totalLength={total}, interfaces={(cn >= 5 ? cfg[4].ToString() : "?")}, raw={Hex(cfg, cn > 0 ? Math.Min(cn, cfg.Length) : 0)}");
+        if (cn < 9) return;
+        var pos = 0;
+        while (pos + 2 <= cn)
+        {
+            var len = cfg[pos]; var type = cfg[pos + 1];
+            if (len < 2 || pos + len > cn) break;
+            if (type == 0x04 && len >= 9)
+                AppendRaw($"USB CONFIG {index + 1} INTERFACE: offset={pos}, if={cfg[pos+2]}, alt={cfg[pos+3]}, eps={cfg[pos+4]}, class={cfg[pos+5]:X2}, subclass={cfg[pos+6]:X2}, protocol={cfg[pos+7]:X2}, iInterface={cfg[pos+8]}");
+            else if (type == 0x05 && len >= 7)
+                AppendRaw($"USB CONFIG {index + 1} ENDPOINT: offset={pos}, addr={cfg[pos+2]:X2}, attrs={cfg[pos+3]:X2}, maxPacket={(cfg[pos+4] | (cfg[pos+5] << 8))}, interval={cfg[pos+6]}");
+            else if (type == 0x0B)
+                AppendRaw($"USB CONFIG {index + 1} IAD: offset={pos}, raw={Hex(cfg, pos, len)}");
+            else if (type == 0x24)
+                AppendRaw($"USB CONFIG {index + 1} CDC EXTRA: offset={pos}, len={len}, subtype={(len >= 3 ? cfg[pos+2].ToString("X2") : "??")}, raw={Hex(cfg, pos, len)}");
+            pos += len;
+        }
     }
 
     private static string Hex(byte[] data, int count) => Hex(data, 0, count);
