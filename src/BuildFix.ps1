@@ -27,12 +27,8 @@ $method = @'
         if (parent is null) throw new InvalidOperationException("Apple composite parent devnode was not found.");
         var parentId = parent.Id;
         var parentPath = $@"SYSTEM\CurrentControlSet\Enum\{parentId}";
-        var paramsPath = parentPath + @"\Device Parameters";
         using var parentKey = Registry.LocalMachine.OpenSubKey(parentPath, writable: true) ?? throw new InvalidOperationException("Cannot open Apple composite hardware registry key.");
-
-        // Microsoft documents these values on the USB device hardware key.
-        // Keep the Device Parameters copy as well because Apple's composite INF
-        // and the upstream reverse-tethering setup also use that location.
+        var paramsPath = parentPath + @"\Device Parameters";
         parentKey.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
         parentKey.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
         using (var parameters = Registry.LocalMachine.OpenSubKey(paramsPath, writable: true))
@@ -40,41 +36,42 @@ $method = @'
             parameters?.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
             parameters?.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
         }
-
-        // AppleLowerFilter can force the device back to configuration 1.
         var lower = parentKey.GetValue("LowerFilters") as string[];
         if (lower is not null && lower.Any(x => x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)))
         {
             var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
-            if (remaining.Length == 0) parentKey.DeleteValue("LowerFilters", false);
-            else parentKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+            if (remaining.Length == 0) parentKey.DeleteValue("LowerFilters", false); else parentKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
             WriteLog("Removed AppleLowerFilter from Apple composite parent.");
         }
-
         var drv = parentKey.GetValue("Driver") as string;
         if (!string.IsNullOrWhiteSpace(drv))
         {
             using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true);
             sw?.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
         }
-
         WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}, registry=hardware+Device Parameters");
-
-        // pnputil /restart-device can report success while deferring the actual
-        // restart because Windows has a pending PnP operation. Use ConfigMgr's
-        // synchronous disable/enable path so usbccgp is actually torn down and
-        // rebuilt after the configuration policy is written.
+        // CM_Disable_DevNode can be vetoed by usbccgp (CR_REMOVE_VETOED=0x17).
+        // Use pnputil restart as the supported fallback instead of aborting.
         if (CM_Locate_DevNodeW(out var devInst, parentId, 0) != 0)
             throw new InvalidOperationException("Could not locate the Apple composite devnode for restart.");
-
         var disable = CM_Disable_DevNode(devInst, 0x00000004);
         WriteLog($"CM_Disable_DevNode(Apple composite, UI_NOT_OK) = {disable}");
-        if (disable != 0) throw new InvalidOperationException($"Could not disable the Apple composite devnode (CM error {disable}).");
-        Thread.Sleep(1500);
-
-        var enable = CM_Enable_DevNode(devInst, 0);
-        WriteLog($"CM_Enable_DevNode(Apple composite) = {enable}");
-        if (enable != 0) throw new InvalidOperationException($"Could not enable the Apple composite devnode (CM error {enable}).");
+        if (disable == 0)
+        {
+            Thread.Sleep(1500);
+            var enable = CM_Enable_DevNode(devInst, 0);
+            WriteLog($"CM_Enable_DevNode(Apple composite) = {enable}");
+            if (enable != 0) throw new InvalidOperationException($"Could not enable the Apple composite devnode (CM error {enable}).");
+        }
+        else
+        {
+            WriteLog($"CM disable was vetoed (CR_REMOVE_VETOED={disable}); falling back to PnPUtil restart.");
+            var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{parentId}\"");
+            WriteLog($"Apple composite PnPUtil restart exit code: {restart.ExitCode}");
+            if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite restart output: {restart.Output.Trim()}");
+            if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple composite restart error: {restart.Error.Trim()}");
+            if (restart.ExitCode != 0 && restart.ExitCode != 3010) throw new InvalidOperationException($"Apple composite restart failed ({restart.ExitCode}): {restart.Error}");
+        }
         Thread.Sleep(3000);
     }
 
@@ -105,7 +102,8 @@ $method = @'
         try
         {
             var parent = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase));
-            if (parent is not null && CM_Locate_DevNodeW(out var devInst, parent.Id, 0) == 0) WriteLog($"CM_Reenumerate_DevNode(parent, SYNCHRONOUS) = {CM_Reenumerate_DevNode(devInst, 1)}");
+            if (parent is not null && CM_Locate_DevNodeW(out var devInst, parent.Id, 0))
+                WriteLog($"CM_Reenumerate_DevNode(parent, SYNCHRONOUS) = {CM_Reenumerate_DevNode(devInst, 1)}");
         }
         catch (Exception ex) { WriteLog($"CM composite re-enumeration failed: {ex.Message}"); }
         var scan = RunAllowRestart("pnputil.exe", "/scan-devices");
