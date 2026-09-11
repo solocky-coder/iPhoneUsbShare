@@ -10,7 +10,15 @@ if ($text.Contains($marker)) {
   if ($e -lt 0) { throw 'Could not locate end of previous Apple hook.' }
   $text = $text.Remove($s, $e - $s)
 }
-$hook = @('            ConfigureAppleCompositeConfiguration(5, 2);','            await Task.Delay(3000);','            InstallBundledAppleEthernetDriver();','            RescanAppleNetworkingInterfaces();','            await Task.Delay(2000);','',$anchor) -join $nl
+$hook = @(
+'            ConfigureAppleCompositeConfiguration(5, 2);',
+'            await Task.Delay(3000);',
+'            InstallBundledAppleEthernetDriver();',
+'            RescanAppleNetworkingInterfaces();',
+'            await Task.Delay(2000);',
+'',
+$anchor
+) -join $nl
 $text = $text.Replace($anchor, $hook)
 $method = @'
     private void ConfigureAppleCompositeConfiguration(uint original, uint alternate)
@@ -18,38 +26,47 @@ $method = @'
         var parent = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase));
         if (parent is null) throw new InvalidOperationException("Apple composite parent devnode was not found.");
         var parentId = parent.Id;
-        var keyPath = $@"SYSTEM\CurrentControlSet\Enum\{parentId}\Device Parameters";
-        using var key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true) ?? throw new InvalidOperationException("Cannot open Apple composite Device Parameters registry key.");
-        key.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
-        key.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
-        WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}");
+        var parentPath = $@"SYSTEM\CurrentControlSet\Enum\{parentId}";
+        var paramsPath = parentPath + @"\Device Parameters";
+        using var parentKey = Registry.LocalMachine.OpenSubKey(parentPath, writable: true) ?? throw new InvalidOperationException("Cannot open Apple composite hardware registry key.");
 
-        // SET_MODE can make the Apple device disappear briefly. PnPUtil returns 1167
-        // while the USB device is in that transition, so wait for the same composite
-        // devnode to come back before asking usbccgp to restart it.
-        PnpDevice? reappeared = null;
-        for (var i = 1; i <= 30; i++)
+        // Microsoft documents these two values on the USB device hardware key.
+        // Keep the Device Parameters copy as well because Apple's composite INF
+        // and the upstream reverse-tethering setup also use that location.
+        parentKey.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
+        parentKey.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
+        using (var parameters = Registry.LocalMachine.OpenSubKey(paramsPath, writable: true))
         {
-            try
-            {
-                reappeared = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => string.Equals(d.Id, parentId, StringComparison.OrdinalIgnoreCase));
-            }
-            catch { }
-            if (reappeared is not null) break;
-            if (i == 1) WriteLog("Apple composite device is temporarily disconnected after SET_MODE; waiting for PnP reappearance…");
-            Thread.Sleep(500);
+            parameters?.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
+            parameters?.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
         }
 
-        var restartId = reappeared?.Id ?? parentId;
-        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{restartId}\"");
+        // AppleLowerFilter is attached to the composite parent on affected
+        // Windows 10 installs. It forces configuration 1 and can zero the
+        // usbccgp selection value on restart, so remove it from the parent.
+        var lower = parentKey.GetValue("LowerFilters") as string[];
+        if (lower is not null && lower.Any(x => x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)))
+        {
+            var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (remaining.Length == 0) parentKey.DeleteValue("LowerFilters", false);
+            else parentKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+            WriteLog("Removed AppleLowerFilter from Apple composite parent.");
+        }
+
+        // usbccgp uses EnumeratorClass on its class instance to enumerate the
+        // interface functions instead of treating the composite as one USB PDO.
+        var drv = parentKey.GetValue("Driver") as string;
+        if (!string.IsNullOrWhiteSpace(drv))
+        {
+            using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true);
+            sw?.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
+        }
+
+        WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}, registry=hardware+Device Parameters");
+        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{parentId}\"");
         WriteLog($"Apple composite parent restart exit code: {restart.ExitCode}");
         if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite parent restart output: {restart.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple composite parent restart error: {restart.Error.Trim()}");
-        if (restart.ExitCode == 1167)
-        {
-            WriteLog("Apple composite parent was still disconnected; continuing and allowing the device to re-enumerate normally.");
-            return;
-        }
         if (restart.ExitCode != 0 && restart.ExitCode != 3010) throw new InvalidOperationException($"Apple composite parent restart failed ({restart.ExitCode}): {restart.Error}");
     }
 
@@ -89,6 +106,8 @@ if (-not $text.Contains('private void ConfigureAppleCompositeConfiguration')) {
   if (-not $text.Contains($a)) { throw 'ConfigureUsbDevice anchor not found.' }
   $text = $text.Replace($a, $method + $nl + $a)
 }
-if (-not $text.Contains('using System.Runtime.InteropServices;')) { $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl) }
+if (-not $text.Contains('using System.Runtime.InteropServices;')) {
+  $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl)
+}
 Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
 Write-Host 'BuildFix completed.'
