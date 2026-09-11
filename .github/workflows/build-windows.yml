@@ -34,12 +34,36 @@ jobs:
             -p:DebugType=None `
             -o .\artifacts\publish
 
+      - name: Prepare libusb-win32 runtime DLL
+        shell: pwsh
+        run: |
+          $url = "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "libusb-win32-bin-1.4.0.2.zip"
+          $expected = "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "libusb-win32 SHA-256 mismatch. Expected $expected, got $actual"
+          }
+          $extract = Join-Path $env:RUNNER_TEMP "libusb-win32"
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $dll = Join-Path $extract "libusb-win32-bin-1.4.0.2\bin\amd64\libusb0.dll"
+          if (-not (Test-Path $dll)) { throw "x64 libusb0.dll was not found in the official libusb-win32 package." }
+          New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
+          Copy-Item $dll .\artifacts\package\libusb0.dll -Force
+
       - name: Create user package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe .\artifacts\package\iPhoneUsbShare.exe
           Copy-Item .\README.md .\artifacts\package\README.txt
+          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt @"
+          libusb-win32 1.4.0.2
+          Copyright and license information: https://github.com/mcuee/libusb-win32
+          The libusb-win32 user-space library (libusb0.dll) is distributed under the LGPL.
+          The application downloads the matching signed libusb-win32 driver package on first setup and verifies its SHA-256 hash.
+          "@
           Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
 
       - name: Upload ready-to-run Windows package
