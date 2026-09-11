@@ -22,7 +22,6 @@ public sealed class ShareEngine
     private const string NcmIndexValue = "4";
     private const string Subnet = "192.168.137.";
 
-    // libusb-win32 release used by the original project. SHA-256 is pinned.
     private const string LibUsbZipUrl =
         "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip";
     private const string LibUsbZipSha256 =
@@ -36,6 +35,9 @@ public sealed class ShareEngine
     public async Task EnsurePrerequisitesAsync()
     {
         Directory.CreateDirectory(CacheDir);
+        // UsbNative loads the bundled DLL when checking reachability. Never overwrite a
+        // loaded DLL: the previous code copied another libusb0.dll here and Windows
+        // correctly rejected that copy with ERROR_SHARING_VIOLATION.
         if (UsbNative.IsReachable()) return;
 
         Log?.Invoke(this, "Installing the USB filter driver (one-time)…");
@@ -60,20 +62,24 @@ public sealed class ShareEngine
 
         var baseDir = extracted;
         var installer = Path.Combine(baseDir, "bin", arch, "install-filter.exe");
-        var dll = Path.Combine(baseDir, "bin", arch, "libusb0.dll");
+        var packageDll = Path.Combine(baseDir, "bin", arch, "libusb0.dll");
         var sys = Path.Combine(baseDir, "bin", arch, "libusb0.sys");
-        if (!File.Exists(installer) || !File.Exists(dll) || !File.Exists(sys))
+        if (!File.Exists(installer) || !File.Exists(packageDll) || !File.Exists(sys))
             throw new InvalidOperationException("The libusb-win32 package is missing the required files.");
+
+        // The application is shipped with libusb0.dll beside the EXE. The installer
+        // has its own package copy, so there is no reason to copy or replace the app DLL.
+        if (!File.Exists(Path.Combine(AppDir, "libusb0.dll")))
+            throw new InvalidOperationException("libusb0.dll is missing beside iPhoneUsbShare.exe. Re-extract the complete ZIP and try again.");
 
         var phone = FindAppleDevice();
         if (phone is null)
             throw new InvalidOperationException("Connect an iPhone or iPad with a data-capable USB cable and try again.");
 
         Run(installer, $"install --device=USB\\VID_{Vendor}&PID_{GetApplePid(phone.Id)}");
-        File.Copy(dll, Path.Combine(AppDir, "libusb0.dll"), true);
-        var driverDest = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "drivers", "libusb0.sys");
-        if (!File.Exists(driverDest)) File.Copy(sys, driverDest, true);
 
+        // install-filter.exe installs the signed kernel driver itself. Do not manually
+        // copy libusb0.sys into System32\drivers either; that can bypass driver-store setup.
         ConfigureUsbDevice(phone);
         Log?.Invoke(this, "USB driver setup complete.");
     }
@@ -230,7 +236,6 @@ public sealed class ShareEngine
         if (wifiCfg is null || phoneCfg is null)
             throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
 
-        // ICSSHARINGTYPE_PUBLIC = 0, PRIVATE = 1.
         wifiCfg.EnableSharing(0);
         phoneCfg.EnableSharing(1);
         await Task.Delay(3000);
@@ -351,7 +356,6 @@ public sealed class ShareEngine
 
     private static (double rx, double tx) GetRates(string name)
     {
-        // UI uses instantaneous-ish counters. Full rate history is intentionally kept out of the engine.
         var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == name);
         if (nic is null) return (0, 0);
         var s = nic.GetIPv4Statistics();
