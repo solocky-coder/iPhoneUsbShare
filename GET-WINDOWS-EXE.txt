@@ -1,0 +1,25 @@
+GET THE WINDOWS EXE — NO LOCAL BUILD REQUIRED
+
+1. Create a new empty GitHub repository.
+2. Upload the contents of this folder to that repository (keep the .github folder).
+3. On GitHub open: Actions -> Build Windows EXE.
+4. Click Run workflow -> Run workflow.
+5. Wait for the green check.
+6. Open the completed run and download the artifact:
+   iPhoneUsbShare-win-x64
+7. Extract the ZIP. Run iPhoneUsbShare.exe on Windows.
+
+The GitHub workflow uses a Windows runner and produces a self-contained
+Windows x64 EXE. You do NOT need .NET, Visual Studio, Python, or any
+developer tools on the Windows PC where you run the EXE.
+
+DEVICE TARGET
+- iPhone: Apple VID 05AC / PID 12A8
+- iPad Air 2: Apple VID 05AC / PID 12AB
+- Your iPad was observed as: USB\VID_05AC&PID_12AB&MI_01
+
+IMPORTANT
+The iPad Air 2 / iPadOS 15 USB mode-switch path has not been physically
+tested in this environment. The app will detect the iPad profile and
+report a clear failure if its firmware does not accept the expected
+CDC-NCM control sequence. It will not silently claim success.

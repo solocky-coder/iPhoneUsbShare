@@ -1,0 +1,51 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.x"
+
+      - name: Publish self-contained EXE
+        shell: pwsh
+        run: |
+          dotnet restore .\src\iPhoneUsbShare.csproj
+          dotnet publish .\src\iPhoneUsbShare.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=None `
+            -o .\artifacts\publish
+
+      - name: Create user package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
+          Copy-Item .\artifacts\publish\iPhoneUsbShare.exe .\artifacts\package\iPhoneUsbShare.exe
+          Copy-Item .\README.md .\artifacts\package\README.txt
+          Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
+
+      - name: Upload ready-to-run Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneUsbShare-win-x64
+          path: artifacts/iPhoneUsbShare-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
