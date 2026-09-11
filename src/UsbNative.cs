@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace iPhoneUsbShare;
 
@@ -40,6 +41,7 @@ internal static class UsbNative
     private static readonly int Ptr = IntPtr.Size;
     private static readonly int BusDevicesOffset = Ptr * 2 + 512;
     private static readonly int DeviceDescriptorOffset = Ptr * 3 + 512;
+    private static readonly object LogLock = new();
 
     internal sealed record ModeDiagnostic(
         int BusCount,
@@ -68,25 +70,16 @@ internal static class UsbNative
         catch { return null; }
     }
 
-    public static Task<string?> GetModeAsync() => Task.Run(() => GetMode());
+    public static Task<string?> GetModeAsync() => Task.Run(() =>
+    {
+        var d = GetModeDiagnostic();
+        if (d.Mode is null) AppendDiagnostic(d);
+        return d.Mode;
+    });
 
     public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(GetModeDiagnostic);
 
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
-
-    private static string? GetMode()
-    {
-        var h = OpenPhone();
-        if (h == IntPtr.Zero) return null;
-        try
-        {
-            var buf = new byte[4];
-            var n = usb_control_msg(h, 0xC0, 0x45, 0, 0, buf, 4, 1000);
-            if (n != 4) return null;
-            return string.Join(":", buf);
-        }
-        finally { usb_close(h); }
-    }
 
     private static ModeDiagnostic GetModeDiagnostic()
     {
@@ -117,7 +110,7 @@ internal static class UsbNative
                 if (n != 4)
                 {
                     return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null,
-                        $"usb_open() succeeded for {id}, but GET_MODE (0x45) returned {n} byte(s): {GetUsbError()}");
+                        $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {GetUsbError()}");
                 }
 
                 var mode = string.Join(":", buf);
@@ -130,6 +123,19 @@ internal static class UsbNative
             return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null,
                 $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    private static void AppendDiagnostic(ModeDiagnostic d)
+    {
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] LIBUSB GET_MODE DETAIL: buses={d.BusCount}, devices={d.DeviceCount}, enumerated={d.DeviceEnumerated}, device={d.DeviceId ?? "none"}, open={d.OpenSucceeded}, return={d.ControlReturn}/{d.ExpectedBytes}, error={d.Error}";
+        try
+        {
+            lock (LogLock)
+            {
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), line + Environment.NewLine, new UTF8Encoding(false));
+            }
+        }
+        catch { }
     }
 
     private static string? GetUsbError()
