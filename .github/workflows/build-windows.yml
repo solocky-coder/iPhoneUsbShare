@@ -27,37 +27,50 @@ jobs:
             Write-Host "$p : $((Get-Item $p).Length) bytes"
           }
 
-      - name: Add Apple Ethernet driver hook
+      - name: Add Apple Ethernet diagnostics hook
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $path = 'src\ShareEngine.cs'
           $text = Get-Content $path -Raw
           $nl = [Environment]::NewLine
-          $old = '        await EnsurePrerequisitesAsync();'
-          $call = $old + $nl + '        InstallBundledAppleEthernetDriver();'
-          if (-not $text.Contains($old)) { throw 'StartAsync prerequisite call not found.' }
-          $text = $text.Replace($old, $call, 1)
+          $old = '            // Windows 10 has no inbox UsbNcm.sys.'
+          if (-not $text.Contains($old)) { throw 'Windows 10 Ethernet comment anchor not found.' }
+          $replacement = @(
+            '            // Force a PnP rescan now that the iPad is in networking mode.',
+            '            RescanAppleNetworkingInterfaces();',
+            '',
+            $old
+          ) -join $nl
+          $text = $text.Replace($old, $replacement, 1)
           $method = @(
             '',
-            '    private void InstallBundledAppleEthernetDriver()',
+            '    private void RescanAppleNetworkingInterfaces()',
             '    {',
-            '        var inf = Path.Combine(AppDir, "netaapl64.inf");',
-            '        var sys = Path.Combine(AppDir, "netaapl64.sys");',
-            '        var cat = Path.Combine(AppDir, "netaapl64.cat");',
-            '        var wdf = Path.Combine(AppDir, "WdfCoInstaller01009.dll");',
-            '        if (!File.Exists(inf) || !File.Exists(sys) || !File.Exists(cat) || !File.Exists(wdf))',
+            '        WriteLog("Forcing Windows PnP rescan for Apple networking interfaces…");',
+            '        var scan = RunAllowRestart("pnputil.exe", "/scan-devices");',
+            '        WriteLog($"PNPUTIL scan exit code: {scan.ExitCode}");',
+            '        if (!string.IsNullOrWhiteSpace(scan.Output)) WriteLog($"PNPUTIL scan output: {scan.Output.Trim()}");',
+            '        if (!string.IsNullOrWhiteSpace(scan.Error)) WriteLog($"PNPUTIL scan error: {scan.Error.Trim()}");',
+            '        try',
             '        {',
-            '            WriteLog("Bundled Apple Ethernet driver files are missing; continuing without them.");',
-            '            return;',
+            '            var apple = FindPnP("VID_05AC&PID_12AB", "");',
+            '            if (apple.Count == 0) WriteLog("Apple PID 12AB PnP enumeration: no matching interfaces found after scan.");',
+            '            foreach (var d in apple)',
+            '            {',
+            '                WriteLog($"Apple interface: {d.Id} | {d.Name}");',
+            '                if (d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase))',
+            '                {',
+            '                    WriteLog("Apple MI_02 networking interface detected; applying bundled Apple Ethernet INF.");',
+            '                    var inf = Path.Combine(AppDir, "netaapl64.inf");',
+            '                    var install = RunAllowRestart("pnputil.exe", $"/add-driver \\"{inf}\\" /install");',
+            '                    WriteLog($"MI_02 driver install exit code: {install.ExitCode}");',
+            '                    if (!string.IsNullOrWhiteSpace(install.Output)) WriteLog($"MI_02 driver install output: {install.Output.Trim()}");',
+            '                    if (!string.IsNullOrWhiteSpace(install.Error)) WriteLog($"MI_02 driver install error: {install.Error.Trim()}");',
+            '                }',
+            '            }',
             '        }',
-            '        WriteLog("Staging bundled Apple Mobile Device Ethernet driver…");',
-            '        var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");',
-            '        WriteLog($"Apple Ethernet driver pnputil exit code: {result.ExitCode}");',
-            '        if (!string.IsNullOrWhiteSpace(result.Output)) WriteLog($"Apple Ethernet driver output: {result.Output.Trim()}");',
-            '        if (!string.IsNullOrWhiteSpace(result.Error)) WriteLog($"Apple Ethernet driver error: {result.Error.Trim()}");',
-            '        if (result.ExitCode != 0 && result.ExitCode != 3010)',
-            '            throw new InvalidOperationException($"Apple Ethernet driver installation failed ({result.ExitCode}): {result.Error}");',
+            '        catch (Exception ex) { WriteLog($"Apple networking PnP enumeration failed: {ex.Message}"); }',
             '    }',
             ''
           ) -join $nl
@@ -65,7 +78,7 @@ jobs:
           if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
           $text = $text.Replace($anchor, $method + $anchor, 1)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple Ethernet driver hook inserted with corrected PnPUtil quoting.'
+          Write-Host 'Apple MI_02 PnP rescan/diagnostic hook inserted.'
 
       - name: Publish EXE
         shell: pwsh
