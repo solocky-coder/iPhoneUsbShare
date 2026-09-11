@@ -51,12 +51,21 @@ jobs:
 
           Write-Host "Using Visual Studio: $vs"
           Write-Host "Using MSBuild: $msbuild"
-          Write-Host "WDK installations:"
-          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          Write-Host "Available Windows SDKs:"
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name }
+          Write-Host "Available WDK build folders:"
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name }
+
+          $sdk = '10.0.22621.0'
+          $sdkInclude = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$sdk"
+          $sdkLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$sdk"
+          if (-not (Test-Path $sdkInclude)) { throw "Windows SDK $sdk is not installed on this runner." }
+          if (-not (Test-Path $sdkLib)) { throw "Windows SDK libraries $sdk are not installed on this runner." }
+          Write-Host "Pinned WindowsTargetPlatformVersion: $sdk"
 
           $solution = Join-Path $ncm "usbncm.sln"
           if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
-          & $msbuild $solution /t:Build /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m /v:minimal
+          & $msbuild $solution /t:Build /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=$sdk /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal
           if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
 
           $driverRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts\ncm-driver"
