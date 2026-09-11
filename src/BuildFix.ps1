@@ -30,7 +30,7 @@ $method = @'
         var paramsPath = parentPath + @"\Device Parameters";
         using var parentKey = Registry.LocalMachine.OpenSubKey(parentPath, writable: true) ?? throw new InvalidOperationException("Cannot open Apple composite hardware registry key.");
 
-        // Microsoft documents these two values on the USB device hardware key.
+        // Microsoft documents these values on the USB device hardware key.
         // Keep the Device Parameters copy as well because Apple's composite INF
         // and the upstream reverse-tethering setup also use that location.
         parentKey.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
@@ -41,9 +41,7 @@ $method = @'
             parameters?.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
         }
 
-        // AppleLowerFilter is attached to the composite parent on affected
-        // Windows 10 installs. It forces configuration 1 and can zero the
-        // usbccgp selection value on restart, so remove it from the parent.
+        // AppleLowerFilter can force the device back to configuration 1.
         var lower = parentKey.GetValue("LowerFilters") as string[];
         if (lower is not null && lower.Any(x => x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)))
         {
@@ -53,8 +51,6 @@ $method = @'
             WriteLog("Removed AppleLowerFilter from Apple composite parent.");
         }
 
-        // usbccgp uses EnumeratorClass on its class instance to enumerate the
-        // interface functions instead of treating the composite as one USB PDO.
         var drv = parentKey.GetValue("Driver") as string;
         if (!string.IsNullOrWhiteSpace(drv))
         {
@@ -63,11 +59,23 @@ $method = @'
         }
 
         WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}, registry=hardware+Device Parameters");
-        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{parentId}\"");
-        WriteLog($"Apple composite parent restart exit code: {restart.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite parent restart output: {restart.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple composite parent restart error: {restart.Error.Trim()}");
-        if (restart.ExitCode != 0 && restart.ExitCode != 3010) throw new InvalidOperationException($"Apple composite parent restart failed ({restart.ExitCode}): {restart.Error}");
+
+        // pnputil /restart-device can report success while deferring the actual
+        // restart because Windows has a pending PnP operation. Use ConfigMgr's
+        // synchronous disable/enable path so usbccgp is actually torn down and
+        // rebuilt after the configuration policy is written.
+        if (CM_Locate_DevNodeW(out var devInst, parentId, 0) != 0)
+            throw new InvalidOperationException("Could not locate the Apple composite devnode for restart.");
+
+        var disable = CM_Disable_DevNode(devInst, 0x00000004);
+        WriteLog($"CM_Disable_DevNode(Apple composite, UI_NOT_OK) = {disable}");
+        if (disable != 0) throw new InvalidOperationException($"Could not disable the Apple composite devnode (CM error {disable}).");
+        Thread.Sleep(1500);
+
+        var enable = CM_Enable_DevNode(devInst, 0);
+        WriteLog($"CM_Enable_DevNode(Apple composite) = {enable}");
+        if (enable != 0) throw new InvalidOperationException($"Could not enable the Apple composite devnode (CM error {enable}).");
+        Thread.Sleep(3000);
     }
 
     private void InstallBundledAppleEthernetDriver()
@@ -85,6 +93,10 @@ $method = @'
 
     [DllImport("CfgMgr32.dll", CharSet = CharSet.Unicode)]
     private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+    [DllImport("CfgMgr32.dll")]
+    private static extern uint CM_Disable_DevNode(uint dnDevInst, uint ulFlags);
+    [DllImport("CfgMgr32.dll")]
+    private static extern uint CM_Enable_DevNode(uint dnDevInst, uint ulFlags);
     [DllImport("CfgMgr32.dll")]
     private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
