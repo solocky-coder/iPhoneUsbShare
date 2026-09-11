@@ -38,14 +38,14 @@ jobs:
           if (-not $text.Contains($old)) { throw 'Windows 10 Ethernet comment anchor not found.' }
           $replacement = @(
             '            // The iPad descriptor dump shows CDC-NCM in configuration 5.',
-            '            // Activate configuration 5 so Windows enumerates MI_02/MI_03 and MI_04/MI_05.',
+            '            // Activate configuration 5 so Windows can enumerate MI_02/MI_03 and MI_04/MI_05.',
             '            WriteLog("Activating Apple USB configuration 5 for CDC-NCM networking…");',
             '            if (!await UsbNative.SetConfigurationAsync(5))',
             '                throw new InvalidOperationException("The iPad exposed CDC-NCM configuration 5, but USB configuration 5 could not be activated.");',
             '            await Task.Delay(1500);',
             '            InstallBundledAppleEthernetDriver();',
             '            RescanAppleNetworkingInterfaces();',
-            '            await Task.Delay(1500);',
+            '            await Task.Delay(2000);',
             '',
             $old
           ) -join $nl
@@ -68,9 +68,42 @@ jobs:
             '        if (r.ExitCode != 0 && r.ExitCode != 3010) throw new InvalidOperationException($"Apple Ethernet driver installation failed ({r.ExitCode}): {r.Error}");',
             '    }',
             '',
+            '    [DllImport("CfgMgr32.dll", CharSet = CharSet.Unicode)]',
+            '    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);',
+            '    [DllImport("CfgMgr32.dll")]',
+            '    private static extern uint CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);',
+            '    [DllImport("CfgMgr32.dll")]',
+            '    private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);',
+            '',
             '    private void RescanAppleNetworkingInterfaces()',
             '    {',
-            '        WriteLog("Forcing Windows PnP rescan for Apple networking interfaces…");',
+            '        WriteLog("Forcing usbccgp composite re-enumeration for Apple networking interfaces…");',
+            '        try',
+            '        {',
+            '            var child = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => d.Id.Contains("&MI_01\\", StringComparison.OrdinalIgnoreCase));',
+            '            if (child is null) child = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase));',
+            '            if (child is null)',
+            '            {',
+            '                WriteLog("Could not locate an Apple PID 12AB child devnode for CM_Reenumerate_DevNode.");',
+            '            }',
+            '            else',
+            '            {',
+            '                var locate = CM_Locate_DevNodeW(out var childDevInst, child.Id, 0);',
+            '                WriteLog($"CM_Locate_DevNodeW({child.Id}) = {locate}");',
+            '                if (locate == 0)',
+            '                {',
+            '                    var parentResult = CM_Get_Parent(out var parentDevInst, childDevInst, 0);',
+            '                    WriteLog($"CM_Get_Parent = {parentResult}");',
+            '                    if (parentResult == 0)',
+            '                    {',
+            '                        var reenum = CM_Reenumerate_DevNode(parentDevInst, 0x00000001);',
+            '                        WriteLog($"CM_Reenumerate_DevNode(parent, SYNCHRONOUS) = {reenum}");',
+            '                    }',
+            '                }',
+            '            }',
+            '        }',
+            '        catch (Exception ex) { WriteLog($"CM composite re-enumeration failed: {ex.Message}"); }',
+            '',
             '        var scan = RunAllowRestart("pnputil.exe", "/scan-devices");',
             '        WriteLog($"PNPUTIL scan exit code: {scan.ExitCode}");',
             '        if (!string.IsNullOrWhiteSpace(scan.Output)) WriteLog($"PNPUTIL scan output: {scan.Output.Trim()}");',
@@ -78,7 +111,7 @@ jobs:
             '        try',
             '        {',
             '            var apple = FindPnP("VID_05AC&PID_12AB", null).ToList();',
-            '            if (apple.Count == 0) WriteLog("Apple PID 12AB PnP enumeration: no matching interfaces found after scan.");',
+            '            if (apple.Count == 0) WriteLog("Apple PID 12AB PnP enumeration: no matching interfaces found after composite re-enumeration.");',
             '            foreach (var d in apple)',
             '            {',
             '                WriteLog($"Apple interface: {d.Id} | {d.Name}");',
@@ -95,8 +128,11 @@ jobs:
           $anchor = '    private void ConfigureUsbDevice(PnpDevice phone)'
           if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
           $text = $text.Replace($anchor, $method + $anchor, 1)
+          if (-not $text.Contains('using System.Runtime.InteropServices;')) {
+            $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl, 1)
+          }
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple USB configuration-5 activation and Ethernet driver hook inserted.'
+          Write-Host 'Apple USB configuration-5 activation, driver installation, and cfgmgr32 composite re-enumeration hook inserted.'
 
       - name: Publish EXE
         shell: pwsh
