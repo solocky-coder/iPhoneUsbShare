@@ -24,7 +24,7 @@ public partial class MainWindow : Window
             catch (Exception ex) { Log($"Setup check: {ex.Message}"); }
             await RefreshAsync();
         };
-        Closed += (_, _) => _timer.Stop();
+        Closed += (_, _) => { _timer.Stop(); _engine.WriteLog("iPhoneUsbShare session ended"); };
     }
 
     private async Task RefreshAsync()
@@ -98,9 +98,10 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            _engine.WriteLog($"ERROR: Diagnostics: {ex.Message}");
             MessageBox.Show(this, ex.Message, "Diagnostics failed", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    private void Log(string message) => LogText.Text = $"[{DateTime.Now:HH:mm:ss}] {message}\n" + LogText.Text;
+    private void Log(string message) => _engine.WriteLog(message);
 }
