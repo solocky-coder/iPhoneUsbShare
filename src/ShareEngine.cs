@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Diagnostics;
+using System.Net.Http;
 
 namespace iPhoneUsbShare;
 
@@ -299,14 +300,14 @@ public sealed class ShareEngine
     private static string GetApplePid(string pnpId) =>
         pnpId.Contains($"PID_{IpadPid}", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
 
-    private static PnpDevice? FindPhoneAdapter() =>
+    private static NetworkInterface? FindPhoneAdapter() =>
         NetworkInterface.GetAllNetworkInterfaces()
             .FirstOrDefault(n => n.Id.Contains($"VID_{Vendor}&PID_12A", StringComparison.OrdinalIgnoreCase));
 
     private static List<PnpDevice> FindPnP(string needle, string? className)
     {
         using var searcher = new ManagementObjectSearcher(
-            $"SELECT PNPDeviceID, Name, Status FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%{needle}%'");
+            $"SELECT PNPDeviceID, Name, Status, PNPClass FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%{needle}%'");
         var list = new List<PnpDevice>();
         foreach (ManagementObject m in searcher.Get())
         {
