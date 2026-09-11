@@ -67,8 +67,8 @@ public sealed class ShareEngine
         if (!File.Exists(installer) || !File.Exists(packageDll) || !File.Exists(sys))
             throw new InvalidOperationException("The libusb-win32 package is missing the required files.");
 
-        // The application is shipped with libusb0.dll beside the EXE. The installer
-        // has its own package copy, so there is no reason to copy or replace the app DLL.
+        // Keep the application DLL beside the EXE. Do not overwrite it while this
+        // process has libusb0.dll loaded.
         if (!File.Exists(Path.Combine(AppDir, "libusb0.dll")))
             throw new InvalidOperationException("libusb0.dll is missing beside iPhoneUsbShare.exe. Re-extract the complete ZIP and try again.");
 
@@ -78,10 +78,29 @@ public sealed class ShareEngine
 
         Run(installer, $"install --device=USB\\VID_{Vendor}&PID_{GetApplePid(phone.Id)}");
 
-        // install-filter.exe installs the signed kernel driver itself. Do not manually
-        // copy libusb0.sys into System32\drivers either; that can bypass driver-store setup.
+        // IMPORTANT: install-filter registers the service but does not install the
+        // kernel driver binary. The upstream project explicitly copies libusb0.sys
+        // into System32\\drivers before starting the libusb0 service. We must do the
+        // same; omitting this leaves usbccgp in control and libusb0.dll sees no device.
+        var sysDst = Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys");
+        if (!File.Exists(sysDst) || !File.Exists(Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys")))
+        {
+            File.Copy(sys, sysDst, true);
+        }
+        try
+        {
+            using var svc = new System.ServiceProcess.ServiceController("libusb0");
+            if (svc.Status != System.ServiceProcess.ServiceControllerStatus.Running)
+                svc.Start();
+        }
+        catch { }
+
         ConfigureUsbDevice(phone);
         Log?.Invoke(this, "USB driver setup complete.");
+
+        // ConfigureUsbDevice restarts the device. Give the kernel filter time to bind,
+        // then require libusb to actually see the Apple device before continuing.
+        await WaitUntil(() => UsbNative.IsReachable(), 15, "Apple USB filter driver");
     }
 
     public async Task StartAsync()
@@ -363,6 +382,5 @@ public sealed class ShareEngine
     }
 
     private sealed record PnpDevice(string Id, string Name, string Status);
-    public sealed record Status(bool PhoneConnected, string PhoneName, string? AdapterName,
-        string AdapterStatus, bool Sharing, string? PhoneIp, double RxKbps, double TxKbps);
+    public sealed record Status(bool Connected, string DeviceName, string? Adapter, string AdapterStatus, bool Sharing, string? Lease, double RxKb, double TxKb);
 }
