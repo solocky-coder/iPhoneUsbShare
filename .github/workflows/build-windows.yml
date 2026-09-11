@@ -34,9 +34,10 @@ jobs:
           $path = 'src\ShareEngine.cs'
           $text = Get-Content $path -Raw
           $nl = [Environment]::NewLine
-          $call = '        await EnsurePrerequisitesAsync();' + $nl + '        InstallBundledAppleEthernetDriver();'
-          if (-not $text.Contains('        await EnsurePrerequisitesAsync();')) { throw 'StartAsync prerequisite call not found.' }
-          $text = $text.Replace('        await EnsurePrerequisitesAsync();', $call, 1)
+          $old = '        await EnsurePrerequisitesAsync();'
+          $call = $old + $nl + '        InstallBundledAppleEthernetDriver();'
+          if (-not $text.Contains($old)) { throw 'StartAsync prerequisite call not found.' }
+          $text = $text.Replace($old, $call, 1)
           $method = @(
             '',
             '    private void InstallBundledAppleEthernetDriver()',
@@ -51,7 +52,7 @@ jobs:
             '            return;',
             '        }',
             '        WriteLog("Staging bundled Apple Mobile Device Ethernet driver…");',
-            '        var result = RunAllowRestart("pnputil.exe", $"/add-driver \\\"{inf}\\\" /install");',
+            '        var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");',
             '        WriteLog($"Apple Ethernet driver pnputil exit code: {result.ExitCode}");',
             '        if (!string.IsNullOrWhiteSpace(result.Output)) WriteLog($"Apple Ethernet driver output: {result.Output.Trim()}");',
             '        if (!string.IsNullOrWhiteSpace(result.Error)) WriteLog($"Apple Ethernet driver error: {result.Error.Trim()}");',
@@ -64,7 +65,7 @@ jobs:
           if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
           $text = $text.Replace($anchor, $method + $anchor, 1)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple Ethernet driver hook inserted.'
+          Write-Host 'Apple Ethernet driver hook inserted with corrected PnPUtil quoting.'
 
       - name: Publish EXE
         shell: pwsh
