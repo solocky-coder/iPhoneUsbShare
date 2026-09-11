@@ -34,6 +34,7 @@ internal static class UsbNative
     public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(GetModeDiagnostic);
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
     public static Task<bool> SetConfigurationAsync(int configuration) => Task.Run(() => SetConfiguration(configuration));
+    public static Task<int?> GetConfigurationAsync() => Task.Run(GetConfiguration);
 
     private static ModeDiagnostic GetModeDiagnostic()
     {
@@ -79,9 +80,26 @@ internal static class UsbNative
         try
         {
             var result = usb_set_configuration(h, configuration);
-            AppendRaw($"USB SET_CONFIGURATION({configuration}): result={result}, error={(result < 0 ? GetUsbError() : "none")}");
+            var current = GetConfiguration(h);
+            AppendRaw($"USB SET_CONFIGURATION({configuration}): result={result}, current={(current?.ToString() ?? "unknown")}, error={(result < 0 ? GetUsbError() : "none")}");
             return result == 0;
         }
+        finally { usb_close(h); }
+    }
+
+    private static int? GetConfiguration(IntPtr h)
+    {
+        var buf = new byte[1];
+        var n = usb_control_msg(h, 0x80, 0x08, 0, 0, buf, 1, 1000);
+        if (n != 1) return null;
+        return buf[0];
+    }
+
+    private static int? GetConfiguration()
+    {
+        var h = OpenPhone();
+        if (h == IntPtr.Zero) return null;
+        try { return GetConfiguration(h); }
         finally { usb_close(h); }
     }
 
