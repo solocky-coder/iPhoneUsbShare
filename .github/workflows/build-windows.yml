@@ -27,7 +27,7 @@ jobs:
             Write-Host "$p : $((Get-Item $p).Length) bytes"
           }
 
-      - name: Add Apple Ethernet diagnostics hook
+      - name: Add Apple Ethernet activation hook
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -37,13 +37,36 @@ jobs:
           $old = '            // Windows 10 has no inbox UsbNcm.sys.'
           if (-not $text.Contains($old)) { throw 'Windows 10 Ethernet comment anchor not found.' }
           $replacement = @(
-            '            // Force a PnP rescan now that the iPad is in networking mode.',
+            '            // The iPad descriptor dump shows CDC-NCM in configuration 5.',
+            '            // Activate configuration 5 so Windows enumerates MI_02/MI_03 and MI_04/MI_05.',
+            '            WriteLog("Activating Apple USB configuration 5 for CDC-NCM networking…");',
+            '            if (!await UsbNative.SetConfigurationAsync(5))',
+            '                throw new InvalidOperationException("The iPad exposed CDC-NCM configuration 5, but USB configuration 5 could not be activated.");',
+            '            await Task.Delay(1500);',
+            '            InstallBundledAppleEthernetDriver();',
             '            RescanAppleNetworkingInterfaces();',
+            '            await Task.Delay(1500);',
             '',
             $old
           ) -join $nl
           $text = $text.Replace($old, $replacement, 1)
+
           $method = @(
+            '',
+            '    private void InstallBundledAppleEthernetDriver()',
+            '    {',
+            '        var inf = Path.Combine(AppDir, "netaapl64.inf");',
+            '        var cat = Path.Combine(AppDir, "netaapl64.cat");',
+            '        var sys = Path.Combine(AppDir, "netaapl64.sys");',
+            '        if (!File.Exists(inf) || !File.Exists(cat) || !File.Exists(sys))',
+            '            throw new InvalidOperationException("The bundled Apple Mobile Device Ethernet driver files are missing.");',
+            '        WriteLog("Installing bundled Apple Mobile Device Ethernet driver netaapl64 1.8.5.1…");',
+            '        var r = RunAllowRestart("pnputil.exe", $"/add-driver {(char)34}{inf}{(char)34} /install");',
+            '        WriteLog($"Apple Ethernet driver PnPUtil exit code: {r.ExitCode}");',
+            '        if (!string.IsNullOrWhiteSpace(r.Output)) WriteLog($"Apple Ethernet driver PnPUtil output: {r.Output.Trim()}");',
+            '        if (!string.IsNullOrWhiteSpace(r.Error)) WriteLog($"Apple Ethernet driver PnPUtil error: {r.Error.Trim()}");',
+            '        if (r.ExitCode != 0 && r.ExitCode != 3010) throw new InvalidOperationException($"Apple Ethernet driver installation failed ({r.ExitCode}): {r.Error}");',
+            '    }',
             '',
             '    private void RescanAppleNetworkingInterfaces()',
             '    {',
@@ -59,31 +82,11 @@ jobs:
             '            foreach (var d in apple)',
             '            {',
             '                WriteLog($"Apple interface: {d.Id} | {d.Name}");',
-            '                try',
-            '                {',
-            '                    using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, PNPClass, Service, ClassGuid, Manufacturer, Status, ConfigManagerErrorCode FROM Win32_PnPEntity");',
-            '                    foreach (ManagementObject o in searcher.Get())',
-            '                    {',
-            '                        var id = o["PNPDeviceID"]?.ToString() ?? "";',
-            '                        if (!id.Equals(d.Id, StringComparison.OrdinalIgnoreCase)) continue;',
-            '                        WriteLog($"  Class={o["PNPClass"]} Service={o["Service"]} ClassGuid={o["ClassGuid"]} Manufacturer={o["Manufacturer"]} Status={o["Status"]} ConfigManagerErrorCode={o["ConfigManagerErrorCode"]}");',
-            '                        break;',
-            '                    }',
-            '                }',
-            '                catch (Exception ex) { WriteLog($"  Interface property query failed: {ex.Message}"); }',
+            '                WriteLog($"  Class={d.Class} Service={d.Service} Manufacturer={d.Manufacturer} Status={d.Status} ConfigManagerErrorCode={d.ConfigManagerErrorCode}");',
             '                var drivers = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid {(char)34}{d.Id}{(char)34} /drivers");',
             '                WriteLog($"  PnP driver query exit code: {drivers.ExitCode}");',
             '                if (!string.IsNullOrWhiteSpace(drivers.Output)) WriteLog($"  PnP driver query: {drivers.Output.Trim().Replace(Environment.NewLine, " | ")}");',
             '                if (!string.IsNullOrWhiteSpace(drivers.Error)) WriteLog($"  PnP driver query error: {drivers.Error.Trim().Replace(Environment.NewLine, " | ")}");',
-            '                if (d.Id.Contains("&MI_02", StringComparison.OrdinalIgnoreCase))',
-            '                {',
-            '                    WriteLog("Apple MI_02 networking interface detected; applying bundled Apple Ethernet INF.");',
-            '                    var inf = Path.Combine(AppDir, "netaapl64.inf");',
-            '                    var install = RunAllowRestart("pnputil.exe", $"/add-driver {(char)34}{inf}{(char)34} /install");',
-            '                    WriteLog($"MI_02 driver install exit code: {install.ExitCode}");',
-            '                    if (!string.IsNullOrWhiteSpace(install.Output)) WriteLog($"MI_02 driver install output: {install.Output.Trim()}");',
-            '                    if (!string.IsNullOrWhiteSpace(install.Error)) WriteLog($"MI_02 driver install error: {install.Error.Trim()}");',
-            '                }',
             '            }',
             '        }',
             '        catch (Exception ex) { WriteLog($"Apple networking PnP enumeration failed: {ex.Message}"); }',
@@ -94,7 +97,7 @@ jobs:
           if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
           $text = $text.Replace($anchor, $method + $anchor, 1)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple USB interface driver diagnostics hook inserted.'
+          Write-Host 'Apple USB configuration-5 activation and Ethernet driver hook inserted.'
 
       - name: Publish EXE
         shell: pwsh
