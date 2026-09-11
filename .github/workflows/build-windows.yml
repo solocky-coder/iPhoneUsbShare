@@ -21,24 +21,21 @@ jobs:
         with:
           dotnet-version: "8.x"
 
-      - name: Setup Microsoft EWDK 22621 build environment
+      - name: Setup Microsoft EWDK 22621
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $iso = Join-Path $env:RUNNER_TEMP "EWDK_22621.iso"
           $url = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/EWDK_ni_release_svc_prod1_22621_230929-1800.iso"
-          Write-Host "Downloading Microsoft EWDK 22621..."
           Invoke-WebRequest -Uri $url -OutFile $iso
           if (-not (Test-Path $iso)) { throw "EWDK ISO download failed." }
           $img = Mount-DiskImage -ImagePath $iso -PassThru
           $vol = $img | Get-Volume
           $drive = ($vol | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
-          if (-not $drive) { throw "Could not determine the EWDK mounted drive letter." }
+          if (-not $drive) { throw "Could not determine EWDK drive letter." }
           $root = "${drive}:\"
-          if (-not (Test-Path (Join-Path $root "LaunchBuildEnv.cmd"))) { throw "LaunchBuildEnv.cmd was not found on the EWDK ISO." }
-          "EWDK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "EWDK mounted at $root"
-          Write-Host "The EWDK is self-contained and supplies the matching SDK, WDK and MSBuild toolchain."
+          if (-not (Test-Path (Join-Path $root "LaunchBuildEnv.cmd"))) { throw "LaunchBuildEnv.cmd not found." }
+          "EWDK_ROOT=$root" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build open-source Microsoft USB NCM host driver with EWDK
         shell: pwsh
@@ -47,26 +44,16 @@ jobs:
           $ncm = Join-Path $env:RUNNER_TEMP "NCM-Driver-for-Windows"
           git clone --depth 1 --branch release_21H2 --recurse-submodules https://github.com/microsoft/NCM-Driver-for-Windows.git $ncm
           if (-not (Test-Path (Join-Path $ncm 'dmf'))) { throw 'DMF submodule was not populated.' }
-
           $inf = Join-Path $ncm "host\UsbNcmSample.inf"
-          if (-not (Test-Path $inf)) { throw "Microsoft NCM host INF was not found." }
           $text = Get-Content $inf -Raw
           $needle = '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
-          if ($text.Contains($needle)) {
-            $text = $text.Replace($needle, '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00')
-          }
+          if ($text.Contains($needle)) { $text = $text.Replace($needle, '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00') }
           Set-Content -Path $inf -Value $text -Encoding utf8 -NoNewline
-
-          $solution = Join-Path $ncm "usbncm.sln"
-          if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
-
-          # LaunchBuildEnv.cmd creates the EWDK command environment. Microsoft also
-          # requires SetupVSEnv inside that environment to add the bundled Visual Studio
-          # Build Tools/MSBuild binaries to PATH.
-          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && call SetupVSEnv && where msbuild && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
+          $setupVs = Join-Path $env:EWDK_ROOT "BuildEnv\SetupVSEnv.cmd"
+          if (-not (Test-Path $setupVs)) { throw "EWDK SetupVSEnv.cmd not found at $setupVs" }
+          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && call `"$setupVs`" && where msbuild && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
-
           $driverRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts\ncm-driver"
           New-Item -ItemType Directory -Force $driverRoot | Out-Null
           $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Where-Object { $_.FullName -match '\\Release\\x64\\' } | Select-Object -First 1
@@ -74,33 +61,13 @@ jobs:
           if (-not $sys) { throw "UsbNcmSample.sys was not produced." }
           Copy-Item $sys.FullName (Join-Path $driverRoot "UsbNcmSample.sys") -Force
           Copy-Item $inf (Join-Path $driverRoot "UsbNcmSample.inf") -Force
-          if (Test-Path (Join-Path $ncm "LICENSE")) { Copy-Item (Join-Path $ncm "LICENSE") (Join-Path $driverRoot "MICROSOFT-NCM-LICENSE.txt") -Force }
-          Set-Content (Join-Path $driverRoot "README.txt") @"
-          Experimental Microsoft USB NCM host driver
-
-          Source: https://github.com/microsoft/NCM-Driver-for-Windows
-          Branch: release_21H2
-          License: MIT
-
-          The generic CDC-NCM hardware match is enabled for Apple's NCM interface.
-          This is an engineering/test driver. Microsoft documents that Windows 10 does
-          not ship the inbox UsbNcm.sys driver; normal Windows 10 kernel-driver policy
-          also requires an appropriately signed driver package for ordinary deployment.
-          "@
           Compress-Archive -Path "$driverRoot\*" -DestinationPath "$driverRoot\Microsoft-UsbNcm-Host-x64-experimental.zip" -Force
 
       - name: Publish self-contained EXE
         shell: pwsh
         run: |
           dotnet restore .\src\iPhoneUsbShare.csproj
-          dotnet publish .\src\iPhoneUsbShare.csproj `
-            -c Release `
-            -r win-x64 `
-            --self-contained true `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:DebugType=None `
-            -o .\artifacts\publish
+          dotnet publish .\src\iPhoneUsbShare.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o .\artifacts\publish
 
       - name: Prepare libusb-win32 runtime DLL
         shell: pwsh
@@ -109,32 +76,20 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "libusb-win32-bin-1.4.0.2.zip"
           $expected = "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94"
           Invoke-WebRequest -Uri $url -OutFile $zip
-          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "libusb-win32 SHA-256 mismatch. Expected $expected, got $actual" }
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "libusb-win32 SHA-256 mismatch." }
           $extract = Join-Path $env:RUNNER_TEMP "libusb-win32"
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $dll = Join-Path $extract "libusb-win32-bin-1.4.0.2\bin\amd64\libusb0.dll"
-          if (-not (Test-Path $dll)) { throw "x64 libusb0.dll was not found in the official libusb-win32 package." }
+          if (-not (Test-Path $dll)) { throw "x64 libusb0.dll not found." }
           New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
           Copy-Item $dll .\artifacts\package\libusb0.dll -Force
 
       - name: Create user package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe .\artifacts\package\iPhoneUsbShare.exe
           Copy-Item .\README.md .\artifacts\package\README.txt
-          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt @"
-          libusb-win32 1.4.0.2
-          Copyright and license information: https://github.com/mcuee/libusb-win32
-          The libusb-win32 user-space library (libusb0.dll) is distributed under the LGPL.
-          The application downloads the matching signed libusb-win32 driver package on first setup and verifies its SHA-256 hash.
-
-          Microsoft NCM-Driver-for-Windows
-          Source: https://github.com/microsoft/NCM-Driver-for-Windows
-          License: MIT
-          An experimental x64 host-driver build is provided separately by the workflow.
-          "@
+          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt "libusb-win32 1.4.0.2`nMicrosoft NCM-Driver-for-Windows (MIT)"
           Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
 
       - name: Upload ready-to-run Windows package
