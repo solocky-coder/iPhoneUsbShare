@@ -18,6 +18,7 @@ internal static class UsbNative
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_close(IntPtr dev);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_control_msg(IntPtr dev, int requestType, int request, int value, int index, [Out] byte[] bytes, int size, int timeout);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_get_descriptor(IntPtr dev, byte type, byte index, [Out] byte[] bytes, int size);
+    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_set_configuration(IntPtr dev, int configuration);
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern IntPtr usb_strerror();
 
     private static readonly int Ptr = IntPtr.Size;
@@ -32,6 +33,7 @@ internal static class UsbNative
     public static Task<string?> GetModeAsync() => Task.Run(() => { var d = GetModeDiagnostic(); if (d.Mode is null) AppendDiagnostic(d); return d.Mode; });
     public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(GetModeDiagnostic);
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
+    public static Task<bool> SetConfigurationAsync(int configuration) => Task.Run(() => SetConfiguration(configuration));
 
     private static ModeDiagnostic GetModeDiagnostic()
     {
@@ -64,6 +66,23 @@ internal static class UsbNative
             finally { usb_close(h); }
         }
         catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static bool SetConfiguration(int configuration)
+    {
+        var h = OpenPhone();
+        if (h == IntPtr.Zero)
+        {
+            AppendRaw($"USB SET_CONFIGURATION({configuration}): usb_open failed: {GetUsbError()}");
+            return false;
+        }
+        try
+        {
+            var result = usb_set_configuration(h, configuration);
+            AppendRaw($"USB SET_CONFIGURATION({configuration}): result={result}, error={(result < 0 ? GetUsbError() : "none")}");
+            return result == 0;
+        }
+        finally { usb_close(h); }
     }
 
     private static void DumpAllConfigurations(IntPtr handle, string id)
