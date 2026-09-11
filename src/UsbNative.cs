@@ -34,11 +34,12 @@ internal static class UsbNative
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr usb_strerror();
 
-    // x64 layout from libusb-win32's packed C structs:
-    // usb_bus.devices = +528, usb_device.descriptor.idVendor = +536+8.
+    // libusb-win32 packs usb_bus and usb_device structs on 1-byte boundaries.
+    // On x64: usb_bus.devices = 16 + 512 = 528.
+    // usb_device.descriptor = 16 + 512 + 8 = 536.
     private static readonly int Ptr = IntPtr.Size;
     private static readonly int BusDevicesOffset = Ptr * 2 + 512;
-    private static readonly int DeviceDescriptorOffset = Ptr * 2 + 512 + Ptr;
+    private static readonly int DeviceDescriptorOffset = Ptr * 3 + 512;
 
     public static bool IsReachable()
     {
