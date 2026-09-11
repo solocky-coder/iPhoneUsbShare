@@ -38,12 +38,10 @@ jobs:
           if (-not $text.Contains($old)) { throw 'Windows 10 Ethernet comment anchor not found.' }
           $replacement = @(
             '            // The iPad descriptor dump shows CDC-NCM in configuration 5.',
-            '            // Usbccgp owns configuration selection for composite devices, so configure it to select 5 before restart.',
+            '            // Usbccgp owns configuration selection for composite devices. Configure it to select 5,',
+            '            // then restart the composite parent so usbccgp reopens the device using that configuration.',
             '            ConfigureAppleCompositeConfiguration(5, 2);',
-            '            WriteLog("Activating Apple USB configuration 5 for CDC-NCM networking…");',
-            '            if (!await UsbNative.SetConfigurationAsync(5))',
-            '                throw new InvalidOperationException("The iPad exposed CDC-NCM configuration 5, but USB configuration 5 could not be activated.");',
-            '            await Task.Delay(1500);',
+            '            await Task.Delay(2500);',
             '            InstallBundledAppleEthernetDriver();',
             '            RescanAppleNetworkingInterfaces();',
             '            await Task.Delay(2000);',
@@ -66,6 +64,12 @@ jobs:
             '            key.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);',
             '            key.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);',
             '            WriteLog($"Usbccgp configuration policy: parent={parent.Id}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}");',
+            '            var restart = RunAllowRestart("pnputil.exe", $"/restart-device {(char)34}{parent.Id}{(char)34}");',
+            '            WriteLog($"Apple composite parent restart exit code: {restart.ExitCode}");',
+            '            if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite parent restart output: {restart.Output.Trim()}");',
+            '            if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple composite parent restart error: {restart.Error.Trim()}");',
+            '            if (restart.ExitCode != 0 && restart.ExitCode != 3010)',
+            '                throw new InvalidOperationException($"Apple composite parent restart failed ({restart.ExitCode}): {restart.Error}");',
             '        }',
             '        catch (Exception ex)',
             '        {',
@@ -153,7 +157,7 @@ jobs:
             $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl, 1)
           }
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple usbccgp configuration policy and composite re-enumeration hook inserted.'
+          Write-Host 'Apple usbccgp configuration policy, parent restart, and composite re-enumeration hook inserted.'
 
       - name: Publish EXE
         shell: pwsh
