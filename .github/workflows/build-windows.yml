@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,25 +24,42 @@ jobs:
       - name: Build open-source Microsoft USB NCM host driver
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $ncm = Join-Path $env:RUNNER_TEMP "NCM-Driver-for-Windows"
           git clone --depth 1 --branch release_21H2 --recurse-submodules https://github.com/microsoft/NCM-Driver-for-Windows.git $ncm
+          if (-not (Test-Path (Join-Path $ncm 'dmf'))) { throw 'DMF submodule was not populated.' }
+
           $inf = Join-Path $ncm "host\UsbNcmSample.inf"
           if (-not (Test-Path $inf)) { throw "Microsoft NCM host INF was not found." }
-          # Bind the sample host driver to standard CDC-NCM interfaces. This is
-          # an experimental Win10 path; Windows 10 does not ship UsbNcm.sys.
+
+          # The Microsoft sample leaves the generic CDC-NCM match commented out.
+          # Enable it so the driver can bind to Apple's standard NCM interface.
           $text = Get-Content $inf -Raw
-          $text = $text -replace '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00', '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
-          Set-Content -Path $inf -Value $text -NoNewline
+          $needle = '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
+          if ($text.Contains($needle)) {
+            $text = $text.Replace($needle, '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00')
+          }
+          Set-Content -Path $inf -Value $text -Encoding utf8 -NoNewline
+
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found." }
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.Microsoft.VisualStudio.Component.WindowsDriverKit -property installationPath
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.Microsoft.Windows.DriverKit -property installationPath
           if (-not $vs) { $vs = & $vswhere -latest -products * -property installationPath }
           if (-not $vs) { throw "Visual Studio installation not found." }
           $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
           if (-not (Test-Path $msbuild)) { throw "MSBuild.exe not found at $msbuild" }
-          & $msbuild (Join-Path $ncm "projects\host\host.vcxproj") /p:Configuration=Release /p:Platform=x64 /m
-          if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver build failed ($LASTEXITCODE)." }
-          $driverRoot = Join-Path $ncm "artifacts\UsbNcmHost"
+
+          Write-Host "Using Visual Studio: $vs"
+          Write-Host "Using MSBuild: $msbuild"
+          Write-Host "WDK installations:"
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+
+          $solution = Join-Path $ncm "usbncm.sln"
+          if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
+          & $msbuild $solution /t:Build /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
+
+          $driverRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts\ncm-driver"
           New-Item -ItemType Directory -Force $driverRoot | Out-Null
           $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Where-Object { $_.FullName -match '\\Release\\x64\\' } | Select-Object -First 1
           if (-not $sys) { $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Select-Object -First 1 }
@@ -57,12 +74,12 @@ jobs:
           Branch: release_21H2
           License: MIT
 
-          This driver is included as an experimental open-source Windows 10 path.
-          It is NOT automatically installed by iPhoneUsbShare yet because ordinary
-          Windows 10 systems require a properly signed kernel driver package.
+          The generic CDC-NCM hardware match is enabled for this experimental build.
+          This is an engineering/test driver. Microsoft documents that Windows 10 does
+          not ship the inbox UsbNcm.sys driver; normal Windows 10 kernel-driver policy
+          also requires an appropriately signed driver package for ordinary deployment.
           "@
-          New-Item -ItemType Directory -Force .\artifacts\ncm-driver | Out-Null
-          Compress-Archive -Path "$driverRoot\*" -DestinationPath .\artifacts\ncm-driver\Microsoft-UsbNcm-Host-x64-experimental.zip -Force
+          Compress-Archive -Path "$driverRoot\*" -DestinationPath "$driverRoot\Microsoft-UsbNcm-Host-x64-experimental.zip" -Force
 
       - name: Publish self-contained EXE
         shell: pwsh
