@@ -54,7 +54,7 @@ jobs:
             '        if (!string.IsNullOrWhiteSpace(scan.Error)) WriteLog($"PNPUTIL scan error: {scan.Error.Trim()}");',
             '        try',
             '        {',
-            '            var apple = FindPnP("VID_05AC&PID_12AB", "").ToList();',
+            '            var apple = FindPnP("VID_05AC&PID_12AB", null).ToList();',
             '            if (apple.Count == 0) WriteLog("Apple PID 12AB PnP enumeration: no matching interfaces found after scan.");',
             '            foreach (var d in apple)',
             '            {',
