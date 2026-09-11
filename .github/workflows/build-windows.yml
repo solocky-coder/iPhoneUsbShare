@@ -42,20 +42,37 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $bin = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.22621.0\bin"
-          $task17 = Join-Path $bin "Microsoft.DriverKit.Build.Tasks.17.0.dll"
-          $task16 = Join-Path $bin "Microsoft.DriverKit.Build.Tasks.16.0.dll"
-          if (-not (Test-Path $task17)) {
-            if (-not (Test-Path $task16)) {
-              throw "WDK 22621 is missing both Microsoft.DriverKit.Build.Tasks.17.0.dll and the 16.0 compatibility task."
-            }
-            # Some WDK 22621 installer/VS combinations ship only the 16.0 task,
-            # while WindowsDriver.common.targets expects the 17.0 filename.
-            # Microsoft Q&A documents this exact MSB4062 workaround.
-            Copy-Item $task16 $task17 -Force
-            Write-Host "Created WDK compatibility task: $task17"
+          $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $versionedBin = Join-Path $kitRoot "build\10.0.22621.0\bin"
+          $globalBin = Join-Path $kitRoot "build\bin"
+          New-Item -ItemType Directory -Force $versionedBin | Out-Null
+
+          # WDK 22621's common targets can reference the VS2022 17.x task name,
+          # while the installer places the compatible task in the shared build\bin
+          # directory under the 16.x name. Microsoft documents this workaround.
+          $task17 = Join-Path $versionedBin "Microsoft.DriverKit.Build.Tasks.17.0.dll"
+          $task16 = Join-Path $globalBin "Microsoft.DriverKit.Build.Tasks.16.0.dll"
+          if (-not (Test-Path $task16)) {
+            $task16 = Get-ChildItem -Path (Join-Path $kitRoot "build") -Filter "Microsoft.DriverKit.Build.Tasks.16.0.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($task16) { $task16 = $task16.FullName }
           }
+          if (-not $task16 -or -not (Test-Path $task16)) {
+            throw "Could not locate Microsoft.DriverKit.Build.Tasks.16.0.dll anywhere under the installed WDK."
+          }
+          Copy-Item $task16 $task17 -Force
+
+          # Package-verifier tasks are referenced by some WDK targets later in the
+          # build, so provide the matching compatibility filename as well when present.
+          $pkg17 = Join-Path $versionedBin "Microsoft.DriverKit.Build.Tasks.PackageVerifier.17.0.dll"
+          $pkg16 = Join-Path $globalBin "Microsoft.DriverKit.Build.Tasks.PackageVerifier.16.0.dll"
+          if (-not (Test-Path $pkg16)) {
+            $pkg16Found = Get-ChildItem -Path (Join-Path $kitRoot "build") -Filter "Microsoft.DriverKit.Build.Tasks.PackageVerifier.16.0.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($pkg16Found) { $pkg16 = $pkg16Found.FullName }
+          }
+          if (Test-Path $pkg16) { Copy-Item $pkg16 $pkg17 -Force }
+
           if (-not (Test-Path $task17)) { throw "WDK MSBuild task compatibility file was not created." }
+          Write-Host "WDK task compatibility ready: $task17"
 
       - name: Build open-source Microsoft USB NCM host driver
         shell: pwsh
