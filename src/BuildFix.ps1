@@ -1,26 +1,17 @@
 $ErrorActionPreference = 'Stop'
 $path = Join-Path $PSScriptRoot 'ShareEngine.cs'
-$text = Get-Content $path -Raw
+$text = Get-Content -LiteralPath $path -Raw
+$nl = [Environment]::NewLine
 $anchor = '            // Windows 10 has no inbox UsbNcm.sys.'
 if (-not $text.Contains($anchor)) { throw 'Windows 10 Ethernet comment anchor not found.' }
 $marker = '            // The iPad descriptor dump shows CDC-NCM in configuration 5.'
 if ($text.Contains($marker)) {
-  $s = $text.IndexOf($marker)
-  $e = $text.IndexOf($anchor, $s)
+  $s = $text.IndexOf($marker); $e = $text.IndexOf($anchor, $s)
   if ($e -lt 0) { throw 'Could not locate end of previous Apple hook.' }
   $text = $text.Remove($s, $e - $s)
 }
-$nl = [Environment]::NewLine
-$hook = @(
-'            ConfigureAppleCompositeConfiguration(5, 2);',
-'            await Task.Delay(3000);',
-'            InstallBundledAppleEthernetDriver();',
-'            RescanAppleNetworkingInterfaces();',
-'            await Task.Delay(2000);',
-'',
-$anchor
-) -join $nl
-$text = $text.Replace($anchor, $hook, 1)
+$hook = @('            ConfigureAppleCompositeConfiguration(5, 2);','            await Task.Delay(3000);','            InstallBundledAppleEthernetDriver();','            RescanAppleNetworkingInterfaces();','            await Task.Delay(2000);','',$anchor) -join $nl
+$text = $text.Replace($anchor, $hook)
 $method = @'
     private void ConfigureAppleCompositeConfiguration(uint original, uint alternate)
     {
@@ -72,8 +63,8 @@ $method = @'
 if (-not $text.Contains('private void ConfigureAppleCompositeConfiguration')) {
   $a = '    private void ConfigureUsbDevice(PnpDevice phone)'
   if (-not $text.Contains($a)) { throw 'ConfigureUsbDevice anchor not found.' }
-  $text = $text.Replace($a, $method + $nl + $a, 1)
+  $text = $text.Replace($a, $method + $nl + $a)
 }
-if (-not $text.Contains('using System.Runtime.InteropServices;')) { $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl, 1) }
-Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
+if (-not $text.Contains('using System.Runtime.InteropServices;')) { $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl) }
+Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
 Write-Host 'BuildFix completed.'
