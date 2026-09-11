@@ -21,47 +21,59 @@ jobs:
         with:
           dotnet-version: "8.x"
 
-      - name: Setup Microsoft EWDK 22621
+      - name: Verify bundled Apple Ethernet driver files
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $iso = Join-Path $env:RUNNER_TEMP "EWDK_22621.iso"
-          $url = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/EWDK_ni_release_svc_prod1_22621_230929-1800.iso"
-          Invoke-WebRequest -Uri $url -OutFile $iso
-          if (-not (Test-Path $iso)) { throw "EWDK ISO download failed." }
-          $img = Mount-DiskImage -ImagePath $iso -PassThru
-          $vol = $img | Get-Volume
-          $drive = ($vol | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
-          if (-not $drive) { throw "Could not determine EWDK drive letter." }
-          $root = "${drive}:\"
-          if (-not (Test-Path (Join-Path $root "LaunchBuildEnv.cmd"))) { throw "LaunchBuildEnv.cmd not found." }
-          "EWDK_ROOT=$root" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $required = @(
+            'NetDrivers\netaapl64.inf',
+            'NetDrivers\netaapl64.sys',
+            'NetDrivers\netaapl64.cat',
+            'NetDrivers\WdfCoInstaller01009.dll'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) { throw "Missing bundled Apple driver file: $file" }
+            Write-Host "$file : $((Get-Item $file).Length) bytes"
+          }
 
-      - name: Build open-source Microsoft USB NCM host driver with EWDK
+      - name: Enable bundled Apple Ethernet driver installation in app
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ncm = Join-Path $env:RUNNER_TEMP "NCM-Driver-for-Windows"
-          git clone --depth 1 --branch release_21H2 --recurse-submodules https://github.com/microsoft/NCM-Driver-for-Windows.git $ncm
-          if (-not (Test-Path (Join-Path $ncm 'dmf'))) { throw 'DMF submodule was not populated.' }
-          $inf = Join-Path $ncm "host\UsbNcmSample.inf"
-          $text = Get-Content $inf -Raw
-          $needle = '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
-          if ($text.Contains($needle)) { $text = $text.Replace($needle, '%UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00') }
-          Set-Content -Path $inf -Value $text -Encoding utf8 -NoNewline
-          $setupVs = Join-Path $env:EWDK_ROOT "BuildEnv\SetupVSEnv.cmd"
-          if (-not (Test-Path $setupVs)) { throw "EWDK SetupVSEnv.cmd not found at $setupVs" }
-          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && call `"$setupVs`" && where msbuild && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
-          cmd.exe /d /s /c $cmd
-          if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
-          $driverRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts\ncm-driver"
-          New-Item -ItemType Directory -Force $driverRoot | Out-Null
-          $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Where-Object { $_.FullName -match '\\Release\\x64\\' } | Select-Object -First 1
-          if (-not $sys) { $sys = Get-ChildItem -Path $ncm -Filter UsbNcmSample.sys -Recurse | Select-Object -First 1 }
-          if (-not $sys) { throw "UsbNcmSample.sys was not produced." }
-          Copy-Item $sys.FullName (Join-Path $driverRoot "UsbNcmSample.sys") -Force
-          Copy-Item $inf (Join-Path $driverRoot "UsbNcmSample.inf") -Force
-          Compress-Archive -Path "$driverRoot\*" -DestinationPath "$driverRoot\Microsoft-UsbNcm-Host-x64-experimental.zip" -Force
+          $path = 'src\ShareEngine.cs'
+          $text = Get-Content $path -Raw
+          $needle = '        await EnsurePrerequisitesAsync();\r\n'
+          if (-not $text.Contains($needle)) { throw 'Could not find StartAsync prerequisite call.' }
+          $replacement = '        await EnsurePrerequisitesAsync();\r\n        InstallBundledAppleEthernetDriver();\r\n'
+          $text = $text.Replace($needle, $replacement)
+          $method = @'
+
+    private void InstallBundledAppleEthernetDriver()
+    {
+        var inf = Path.Combine(AppDir, "netaapl64.inf");
+        var sys = Path.Combine(AppDir, "netaapl64.sys");
+        var cat = Path.Combine(AppDir, "netaapl64.cat");
+        var wdf = Path.Combine(AppDir, "WdfCoInstaller01009.dll");
+        if (!File.Exists(inf) || !File.Exists(sys) || !File.Exists(cat) || !File.Exists(wdf))
+        {
+            WriteLog("Apple Ethernet driver package is not beside the EXE; continuing without it.");
+            return;
+        }
+
+        WriteLog("Installing/staging bundled Apple Mobile Device Ethernet driver…");
+        var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
+        WriteLog($"Apple Ethernet driver pnputil exit code: {result.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(result.Output)) WriteLog($"Apple Ethernet driver output: {result.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(result.Error)) WriteLog($"Apple Ethernet driver error: {result.Error.Trim()}");
+        if (result.ExitCode != 0 && result.ExitCode != 3010)
+            throw new InvalidOperationException($"Apple Ethernet driver installation failed ({result.ExitCode}): {result.Error}");
+    }
+'@
+          $anchor = '    private void ConfigureUsbDevice(PnpDevice phone)'
+          if (-not $text.Contains($anchor)) { throw 'Could not find ConfigureUsbDevice insertion point.' }
+          $text = $text.Replace($anchor, $method + "\r\n" + $anchor)
+          Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
+          Write-Host 'Apple Ethernet driver installation hook added to build.'
 
       - name: Publish self-contained EXE
         shell: pwsh
@@ -84,12 +96,23 @@ jobs:
           New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
           Copy-Item $dll .\artifacts\package\libusb0.dll -Force
 
+      - name: Package Apple Ethernet driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = '.\artifacts\package'
+          foreach ($name in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
+            Copy-Item (Join-Path 'NetDrivers' $name) (Join-Path $package $name) -Force
+          }
+          Write-Host 'Bundled Apple Ethernet driver files:'
+          Get-ChildItem $package | Select-Object Name,Length
+
       - name: Create user package
         shell: pwsh
         run: |
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe .\artifacts\package\iPhoneUsbShare.exe
           Copy-Item .\README.md .\artifacts\package\README.txt
-          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt "libusb-win32 1.4.0.2`nMicrosoft NCM-Driver-for-Windows (MIT)"
+          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt "libusb-win32 1.4.0.2`nApple Mobile Device Ethernet driver (netaapl64.sys/INF/CAT, WDF coinstaller)"
           Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
 
       - name: Upload ready-to-run Windows package
@@ -97,13 +120,5 @@ jobs:
         with:
           name: iPhoneUsbShare-win-x64
           path: artifacts/iPhoneUsbShare-win-x64.zip
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload experimental Microsoft NCM driver
-        uses: actions/upload-artifact@v4
-        with:
-          name: Microsoft-UsbNcm-Host-x64-experimental
-          path: artifacts/ncm-driver/Microsoft-UsbNcm-Host-x64-experimental.zip
           if-no-files-found: error
           retention-days: 14
