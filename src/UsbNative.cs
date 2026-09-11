@@ -1,3 +1,4 @@
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -28,31 +29,17 @@ internal static class UsbNative
     private static extern int usb_close(IntPtr dev);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-    private static extern int usb_control_msg(
-        IntPtr dev, int requestType, int request, int value, int index,
-        [Out] byte[] bytes, int size, int timeout);
+    private static extern int usb_control_msg(IntPtr dev, int requestType, int request, int value, int index, [Out] byte[] bytes, int size, int timeout);
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr usb_strerror();
 
-    // libusb-win32 packs usb_bus and usb_device structs on 1-byte boundaries.
-    // On x64: usb_bus.devices = 16 + 512 = 528.
-    // usb_device.descriptor = 16 + 512 + 8 = 536.
     private static readonly int Ptr = IntPtr.Size;
     private static readonly int BusDevicesOffset = Ptr * 2 + 512;
     private static readonly int DeviceDescriptorOffset = Ptr * 3 + 512;
     private static readonly object LogLock = new();
 
-    internal sealed record ModeDiagnostic(
-        int BusCount,
-        int DeviceCount,
-        bool DeviceEnumerated,
-        string? DeviceId,
-        bool OpenSucceeded,
-        int ControlReturn,
-        int ExpectedBytes,
-        string? Mode,
-        string Error);
+    internal sealed record ModeDiagnostic(int BusCount, int DeviceCount, bool DeviceEnumerated, string? DeviceId, bool OpenSucceeded, int ControlReturn, int ExpectedBytes, string? Mode, string Error);
 
     public static bool IsReachable()
     {
@@ -90,29 +77,19 @@ internal static class UsbNative
             var devices = usb_find_devices();
             var dev = FindDeviceAfterEnumeration(out var pid);
             if (dev == IntPtr.Zero)
-            {
-                return new ModeDiagnostic(buses, devices, false, null, false, 0, 4, null,
-                    $"libusb enumerated {buses} bus(es) and {devices} device(s), but no Apple 05AC device with PID 12A8/12AB was visible.");
-            }
+                return new ModeDiagnostic(buses, devices, false, null, false, 0, 4, null, $"libusb enumerated {buses} bus(es) and {devices} device(s), but no Apple 05AC device with PID 12A8/12AB was visible.");
 
             var id = $"05AC:{pid:X4}";
             var h = usb_open(dev);
             if (h == IntPtr.Zero)
-            {
-                return new ModeDiagnostic(buses, devices, true, id, false, 0, 4, null,
-                    $"libusb sees {id}, but usb_open() failed: {GetUsbError()}");
-            }
+                return new ModeDiagnostic(buses, devices, true, id, false, 0, 4, null, $"libusb sees {id}, but usb_open() failed: {GetUsbError()}");
 
             try
             {
                 var buf = new byte[4];
                 var n = usb_control_msg(h, 0xC0, 0x45, 0, 0, buf, 4, 1000);
                 if (n != 4)
-                {
-                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null,
-                        $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {GetUsbError()}");
-                }
-
+                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null, $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {GetUsbError()}");
                 var mode = string.Join(":", buf);
                 return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode, "GET_MODE succeeded.");
             }
@@ -120,8 +97,7 @@ internal static class UsbNative
         }
         catch (Exception ex)
         {
-            return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null,
-                $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}");
+            return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -131,14 +107,12 @@ internal static class UsbNative
         try
         {
             lock (LogLock)
-            {
                 File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), line + Environment.NewLine, new UTF8Encoding(false));
-            }
         }
         catch { }
     }
 
-    private static string? GetUsbError()
+    private static string GetUsbError()
     {
         try
         {
@@ -190,11 +164,7 @@ internal static class UsbNative
                 var descriptor = device + DeviceDescriptorOffset;
                 var vid = (ushort)Marshal.ReadInt16(descriptor, 8);
                 var pid = (ushort)Marshal.ReadInt16(descriptor, 10);
-                if (vid == Vid && SupportedPids.Contains(pid))
-                {
-                    foundPid = pid;
-                    return device;
-                }
+                if (vid == Vid && SupportedPids.Contains(pid)) { foundPid = pid; return device; }
                 device = Marshal.ReadIntPtr(device, 0);
             }
             bus = Marshal.ReadIntPtr(bus, 0);
