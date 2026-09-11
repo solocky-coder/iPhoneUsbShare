@@ -60,10 +60,10 @@ jobs:
           $solution = Join-Path $ncm "usbncm.sln"
           if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
 
-          # LaunchBuildEnv.cmd initializes the complete EWDK toolchain in the same
-          # cmd.exe process. This avoids the broken WDK/VS task-DLL combination on
-          # the hosted windows-2022 image.
-          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
+          # LaunchBuildEnv.cmd creates the EWDK command environment. Microsoft also
+          # requires SetupVSEnv inside that environment to add the bundled Visual Studio
+          # Build Tools/MSBuild binaries to PATH.
+          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && call SetupVSEnv && where msbuild && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
           cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
 
