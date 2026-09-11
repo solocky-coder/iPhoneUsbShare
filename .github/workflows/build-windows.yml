@@ -38,6 +38,25 @@ jobs:
           if (-not (Test-Path $wdkInclude)) { throw "Matching WDK headers 10.0.22621.0 were not installed." }
           Write-Host "Installed matching WDK 22621 successfully."
 
+      - name: Fix WDK 22621 MSBuild task compatibility
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "${env:ProgramFiles(x86)}\Windows Kits\10\build\10.0.22621.0\bin"
+          $task17 = Join-Path $bin "Microsoft.DriverKit.Build.Tasks.17.0.dll"
+          $task16 = Join-Path $bin "Microsoft.DriverKit.Build.Tasks.16.0.dll"
+          if (-not (Test-Path $task17)) {
+            if (-not (Test-Path $task16)) {
+              throw "WDK 22621 is missing both Microsoft.DriverKit.Build.Tasks.17.0.dll and the 16.0 compatibility task."
+            }
+            # Some WDK 22621 installer/VS combinations ship only the 16.0 task,
+            # while WindowsDriver.common.targets expects the 17.0 filename.
+            # Microsoft Q&A documents this exact MSB4062 workaround.
+            Copy-Item $task16 $task17 -Force
+            Write-Host "Created WDK compatibility task: $task17"
+          }
+          if (-not (Test-Path $task17)) { throw "WDK MSBuild task compatibility file was not created." }
+
       - name: Build open-source Microsoft USB NCM host driver
         shell: pwsh
         run: |
