@@ -21,30 +21,19 @@ public sealed class ShareEngine
     private const string SafeIndexValue = "2";
     private const string NcmIndexValue = "4";
     private const string Subnet = "192.168.137.";
-
-    private const string LibUsbZipUrl =
-        "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip";
-    private const string LibUsbZipSha256 =
-        "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94";
-
+    private const string LibUsbZipUrl = "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip";
+    private const string LibUsbZipSha256 = "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94";
     private string AppDir => AppContext.BaseDirectory;
-    private string CacheDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "iPhoneUsbShare");
+    private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
 
     public async Task EnsurePrerequisitesAsync()
     {
         Directory.CreateDirectory(CacheDir);
-        // UsbNative loads the bundled DLL when checking reachability. Never overwrite a
-        // loaded DLL: the previous code copied another libusb0.dll here and Windows
-        // correctly rejected that copy with ERROR_SHARING_VIOLATION.
         if (UsbNative.IsReachable()) return;
-
         Log?.Invoke(this, "Installing the USB filter driver (one-time)…");
         var arch = Environment.Is64BitOperatingSystem ? "amd64" : "x86";
         var zip = Path.Combine(CacheDir, "libusb-win32.zip");
         var extracted = Path.Combine(CacheDir, "libusb-win32-bin-1.4.0.2");
-
         if (!File.Exists(zip))
         {
             using var http = new HttpClient();
@@ -52,54 +41,27 @@ public sealed class ShareEngine
             await using var dst = File.Create(zip);
             await src.CopyToAsync(dst);
         }
-
         var hash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(zip))).ToLowerInvariant();
-        if (hash != LibUsbZipSha256)
-            throw new InvalidOperationException($"libusb-win32 download failed SHA-256 verification ({hash}).");
-
-        if (!Directory.Exists(extracted))
-            ZipFile.ExtractToDirectory(zip, CacheDir, overwriteFiles: true);
-
+        if (hash != LibUsbZipSha256) throw new InvalidOperationException($"libusb-win32 download failed SHA-256 verification ({hash}).");
+        if (!Directory.Exists(extracted)) ZipFile.ExtractToDirectory(zip, CacheDir, overwriteFiles: true);
         var baseDir = extracted;
         var installer = Path.Combine(baseDir, "bin", arch, "install-filter.exe");
         var packageDll = Path.Combine(baseDir, "bin", arch, "libusb0.dll");
         var sys = Path.Combine(baseDir, "bin", arch, "libusb0.sys");
-        if (!File.Exists(installer) || !File.Exists(packageDll) || !File.Exists(sys))
-            throw new InvalidOperationException("The libusb-win32 package is missing the required files.");
-
-        // Keep the application DLL beside the EXE. Do not overwrite it while this
-        // process has libusb0.dll loaded.
-        if (!File.Exists(Path.Combine(AppDir, "libusb0.dll")))
-            throw new InvalidOperationException("libusb0.dll is missing beside iPhoneUsbShare.exe. Re-extract the complete ZIP and try again.");
-
-        var phone = FindAppleDevice();
-        if (phone is null)
-            throw new InvalidOperationException("Connect an iPhone or iPad with a data-capable USB cable and try again.");
-
+        if (!File.Exists(installer) || !File.Exists(packageDll) || !File.Exists(sys)) throw new InvalidOperationException("The libusb-win32 package is missing the required files.");
+        if (!File.Exists(Path.Combine(AppDir, "libusb0.dll"))) throw new InvalidOperationException("libusb0.dll is missing beside iPhoneUsbShare.exe. Re-extract the complete ZIP and try again.");
+        var phone = FindAppleDevice() ?? throw new InvalidOperationException("Connect an iPhone or iPad with a data-capable USB cable and try again.");
         Run(installer, $"install --device=USB\\VID_{Vendor}&PID_{GetApplePid(phone.Id)}");
-
-        // IMPORTANT: install-filter registers the service but does not install the
-        // kernel driver binary. The upstream project explicitly copies libusb0.sys
-        // into System32\\drivers before starting the libusb0 service. We must do the
-        // same; omitting this leaves usbccgp in control and libusb0.dll sees no device.
         var sysDst = Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys");
-        if (!File.Exists(sysDst) || !File.Exists(Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys")))
-        {
-            File.Copy(sys, sysDst, true);
-        }
+        if (!File.Exists(sysDst)) File.Copy(sys, sysDst, false);
         try
         {
             using var svc = new System.ServiceProcess.ServiceController("libusb0");
-            if (svc.Status != System.ServiceProcess.ServiceControllerStatus.Running)
-                svc.Start();
+            if (svc.Status != System.ServiceProcess.ServiceControllerStatus.Running) svc.Start();
         }
         catch { }
-
         ConfigureUsbDevice(phone);
         Log?.Invoke(this, "USB driver setup complete.");
-
-        // ConfigureUsbDevice restarts the device. Give the kernel filter time to bind,
-        // then require libusb to actually see the Apple device before continuing.
         await WaitUntil(() => UsbNative.IsReachable(), 15, "Apple USB filter driver");
     }
 
@@ -110,23 +72,16 @@ public sealed class ShareEngine
         DisablePhotoInterfaces();
         var wifi = FindWifi() ?? throw new InvalidOperationException("No connected Wi-Fi adapter found.");
         Log?.Invoke(this, $"Internet source: {wifi.Name}");
-
         var adapter = FindPhoneAdapter();
-        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
-        {
-            Log?.Invoke(this, $"USB Ethernet already available: {adapter.Name}");
-        }
+        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up) Log?.Invoke(this, $"USB Ethernet already available: {adapter.Name}");
         else
         {
             SetConfig(phone.Id, SafeIndexValue, "0");
             RestartDevice(phone.Id);
             await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device to re-enumerate");
             DisablePhotoInterfaces();
-
             var mode = await UsbNative.GetModeAsync();
-            if (mode != "3:3:3:0")
-                throw new InvalidOperationException($"Unexpected Apple USB mode: {mode ?? "unreachable"}.");
-
+            if (mode != "3:3:3:0") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode ?? "unreachable"}.");
             SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
             var accepted = await UsbNative.SetModeAsync(3);
             if (!accepted)
@@ -134,13 +89,11 @@ public sealed class ShareEngine
                 SetConfig(phone.Id, SafeIndexValue, "0");
                 throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again.");
             }
-
             Log?.Invoke(this, "Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
             await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 35, "USB Ethernet adapter");
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             DisablePhotoInterfaces();
         }
-
         await ConfigureIcsAsync(wifi.Name, adapter.Name);
         Log?.Invoke(this, "Waiting for DHCP lease…");
         await WaitUntil(() => FindLease(adapter.Name) is not null, 30, "phone DHCP lease");
@@ -148,239 +101,98 @@ public sealed class ShareEngine
 
     public Task StopAsync()
     {
-        try
-        {
-            var adapter = FindPhoneAdapter();
-            if (adapter is not null) DisableAllIcs();
-            var phone = FindAppleDevice();
-            if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0");
-        }
-        catch { }
+        try { var adapter = FindPhoneAdapter(); if (adapter is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch { }
         return Task.CompletedTask;
     }
 
     public async Task<Status> GetStatusAsync()
     {
-        var p = FindAppleDevice();
-        var a = FindPhoneAdapter();
-        var lease = a is null ? null : FindLease(a.Name);
-        var sharing = a is not null && IsIcsEnabled(a.Name);
-        var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
-        return await Task.FromResult(new Status(
-            p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—",
-            sharing, lease, rx, tx));
+        var p = FindAppleDevice(); var a = FindPhoneAdapter(); var lease = a is null ? null : FindLease(a.Name); var sharing = a is not null && IsIcsEnabled(a.Name); var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
+        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, lease, rx, tx));
     }
 
     public async Task<string> DiagnosticsAsync()
     {
-        var sb = new StringBuilder();
-        var p = FindAppleDevice();
-        var a = FindPhoneAdapter();
-        sb.AppendLine($"Apple device: {(p is null ? "not connected" : p.Name)}");
-        sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}");
-        sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}");
-        sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
-        sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]");
-        sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}");
-        sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}");
-        return sb.ToString();
+        var sb = new StringBuilder(); var p = FindAppleDevice(); var a = FindPhoneAdapter();
+        sb.AppendLine($"Apple device: {(p is null ? "not connected" : p.Name)}"); sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}"); sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}"); sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}"); sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]"); sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}"); sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}"); return sb.ToString();
     }
 
     private void ConfigureUsbDevice(PnpDevice phone)
     {
-        using var baseKey = Registry.LocalMachine.OpenSubKey(
-            $@"SYSTEM\CurrentControlSet\Enum\{phone.Id}", writable: true)
-            ?? throw new InvalidOperationException("Cannot open the Apple USB PnP registry key.");
-
-        var drv = baseKey.GetValue("Driver") as string;
-        if (string.IsNullOrWhiteSpace(drv))
-            throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
-
-        using var sw = Registry.LocalMachine.OpenSubKey(
-            $@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true)
-            ?? throw new InvalidOperationException("Cannot open the usbccgp software key.");
-
+        using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{phone.Id}", writable: true) ?? throw new InvalidOperationException("Cannot open the Apple USB PnP registry key.");
+        var drv = baseKey.GetValue("Driver") as string; if (string.IsNullOrWhiteSpace(drv)) throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
+        using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true) ?? throw new InvalidOperationException("Cannot open the usbccgp software key.");
         sw.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
-
         var lower = baseKey.GetValue("LowerFilters") as string[];
         if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
         {
             var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
-            if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false);
-            else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+            if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false); else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
         }
-
-        SetConfig(phone.Id, SafeIndexValue, "0");
-        RestartDevice(phone.Id);
+        SetConfig(phone.Id, SafeIndexValue, "0"); RestartDevice(phone.Id);
     }
 
     private static void SetConfig(string pnpId, string original, string alt)
     {
-        using var k = Registry.LocalMachine.OpenSubKey(
-            $@"SYSTEM\CurrentControlSet\Enum\{pnpId}\Device Parameters", writable: true)
-            ?? throw new InvalidOperationException("Cannot open Apple USB device parameters.");
-        k.SetValue("OriginalConfigurationValue", uint.Parse(original), RegistryValueKind.DWord);
-        k.SetValue("AltConfigurationValue", uint.Parse(alt), RegistryValueKind.DWord);
+        using var k = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{pnpId}\Device Parameters", writable: true) ?? throw new InvalidOperationException("Cannot open Apple USB device parameters.");
+        k.SetValue("OriginalConfigurationValue", uint.Parse(original), RegistryValueKind.DWord); k.SetValue("AltConfigurationValue", uint.Parse(alt), RegistryValueKind.DWord);
     }
 
     private static void RestartDevice(string id)
     {
-        Run("pnputil.exe", $"/restart-device \"{id}\"");
+        var result = RunAllowRestart("pnputil.exe", $"/restart-device \"{id}\"");
+        if (result.ExitCode != 0 && result.ExitCode != 3010) throw new InvalidOperationException($"PNPUTIL.exe failed ({result.ExitCode}): {result.Error}");
     }
 
     private static void DisablePhotoInterfaces()
     {
-        foreach (var d in FindPnP("VID_05AC&PID_12A", "WPD"))
+        foreach (var d in FindPnP("VID_05AC&PID_12A", "WPD")) if (d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase))
         {
-            if (d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase))
-                Run("pnputil.exe", $"/disable-device \"{d.Id}\"");
+            var r = RunAllowRestart("pnputil.exe", $"/disable-device \"{d.Id}\"");
+            if (r.ExitCode != 0 && r.ExitCode != 3010) throw new InvalidOperationException($"PNPUTIL.exe failed ({r.ExitCode}): {r.Error}");
         }
+    }
+
+    private static CommandResult RunAllowRestart(string file, string args)
+    {
+        var psi = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        using var p = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {file}."); var output = p.StandardOutput.ReadToEnd(); var error = p.StandardError.ReadToEnd(); p.WaitForExit(); return new CommandResult(p.ExitCode, output, error);
     }
 
     private async Task ConfigureIcsAsync(string wifi, string phoneAdapter)
     {
-        DisableAllIcs();
-        var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
-            ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
-        dynamic mgr = Activator.CreateInstance(mgrType)!;
-        dynamic? wifiCfg = null, phoneCfg = null;
-
-        foreach (var c in mgr.EnumEveryConnection())
-        {
-            dynamic props = mgr.NetConnectionProps(c);
-            if ((string)props.Name == wifi) wifiCfg = mgr.INetSharingConfigurationForINetConnection(c);
-            if ((string)props.Name == phoneAdapter) phoneCfg = mgr.INetSharingConfigurationForINetConnection(c);
-        }
-
-        if (wifiCfg is null || phoneCfg is null)
-            throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
-
-        wifiCfg.EnableSharing(0);
-        phoneCfg.EnableSharing(1);
-        await Task.Delay(3000);
+        DisableAllIcs(); var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare") ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable."); dynamic mgr = Activator.CreateInstance(mgrType)!; dynamic? wifiCfg = null, phoneCfg = null;
+        foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name == wifi) wifiCfg = mgr.INetSharingConfigurationForINetConnection(c); if ((string)props.Name == phoneAdapter) phoneCfg = mgr.INetSharingConfigurationForINetConnection(c); }
+        if (wifiCfg is null || phoneCfg is null) throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters."); wifiCfg.EnableSharing(0); phoneCfg.EnableSharing(1); await Task.Delay(3000);
     }
 
     private static void DisableAllIcs()
     {
-        try
-        {
-            var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare");
-            if (mgrType is null) return;
-            dynamic mgr = Activator.CreateInstance(mgrType)!;
-            foreach (var c in mgr.EnumEveryConnection())
-            {
-                dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c);
-                if ((bool)cfg.SharingEnabled) cfg.DisableSharing();
-            }
-        }
-        catch { }
+        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); if ((bool)cfg.SharingEnabled) cfg.DisableSharing(); } } catch { }
     }
 
     private static bool IsIcsEnabled(string name)
     {
-        try
-        {
-            var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare");
-            if (mgrType is null) return false;
-            dynamic mgr = Activator.CreateInstance(mgrType)!;
-            foreach (var c in mgr.EnumEveryConnection())
-            {
-                dynamic props = mgr.NetConnectionProps(c);
-                if ((string)props.Name != name) continue;
-                dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c);
-                return (bool)cfg.SharingEnabled;
-            }
-        }
-        catch { }
-        return false;
+        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return false; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name != name) continue; dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); return (bool)cfg.SharingEnabled; } } catch { } return false;
     }
 
     private static string? FindLease(string adapterName)
     {
-        try
-        {
-            var nic = NetworkInterface.GetAllNetworkInterfaces()
-                .FirstOrDefault(n => n.Name == adapterName);
-            if (nic is null) return null;
-            foreach (var ua in nic.GetIPProperties().UnicastAddresses)
-                if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
-                    ua.Address.ToString().StartsWith(Subnet, StringComparison.Ordinal))
-                    return ua.Address.ToString();
-        }
-        catch { }
-        return null;
+        try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); if (nic is null) return null; foreach (var ua in nic.GetIPProperties().UnicastAddresses) if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && ua.Address.ToString().StartsWith(Subnet, StringComparison.Ordinal)) return ua.Address.ToString(); } catch { } return null;
     }
-
-    private static NetworkInterface? FindWifi() =>
-        NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up)
-            .Where(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
-            .FirstOrDefault();
-
-    private static PnpDevice? FindAppleDevice() =>
-        FindPnP($"VID_{Vendor}&PID_12A", null)
-            .OrderBy(d => d.Id.Contains("&MI_01", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
-            .FirstOrDefault();
-
-    private static string GetApplePid(string pnpId) =>
-        pnpId.Contains($"PID_{IpadPid}", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
-
-    private static NetworkInterface? FindPhoneAdapter() =>
-        NetworkInterface.GetAllNetworkInterfaces()
-            .FirstOrDefault(n => n.Id.Contains($"VID_{Vendor}&PID_12A", StringComparison.OrdinalIgnoreCase));
-
+    private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up).Where(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211).FirstOrDefault();
+    private static PnpDevice? FindAppleDevice() => FindPnP($"VID_{Vendor}&PID_12A", null).OrderBy(d => d.Id.Contains("&MI_01", StringComparison.OrdinalIgnoreCase) ? 0 : 1).FirstOrDefault();
+    private static string GetApplePid(string pnpId) => pnpId.Contains($"PID_{IpadPid}", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
+    private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Id.Contains($"VID_{Vendor}&PID_12A", StringComparison.OrdinalIgnoreCase));
     private static List<PnpDevice> FindPnP(string needle, string? className)
     {
-        using var searcher = new ManagementObjectSearcher(
-            $"SELECT PNPDeviceID, Name, Status, PNPClass FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%{needle}%'");
-        var list = new List<PnpDevice>();
-        foreach (ManagementObject m in searcher.Get())
-        {
-            var id = (string?)m["PNPDeviceID"];
-            var name = (string?)m["Name"];
-            var status = (string?)m["Status"];
-            if (id is not null && (className is null || string.Equals(className, (string?)m["PNPClass"], StringComparison.OrdinalIgnoreCase)))
-                list.Add(new PnpDevice(id, name ?? id, status ?? "Unknown"));
-        }
-        return list;
+        using var searcher = new ManagementObjectSearcher($"SELECT PNPDeviceID, Name, Status, PNPClass FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%{needle}%'"); var list = new List<PnpDevice>();
+        foreach (ManagementObject m in searcher.Get()) { var id = (string?)m["PNPDeviceID"]; var name = (string?)m["Name"]; var status = (string?)m["Status"]; if (id is not null && (className is null || string.Equals(className, (string?)m["PNPClass"], StringComparison.OrdinalIgnoreCase))) list.Add(new PnpDevice(id, name ?? id, status ?? "Unknown")); } return list;
     }
-
-    private static async Task WaitUntil(Func<bool> test, int seconds, string what)
-    {
-        for (var i = 0; i < seconds; i++)
-        {
-            if (test()) return;
-            await Task.Delay(1000);
-        }
-        throw new TimeoutException($"Timed out waiting for {what}.");
-    }
-
-    private static void Run(string file, string args)
-    {
-        var psi = new ProcessStartInfo(file, args)
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        using var p = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {file}.");
-        p.WaitForExit();
-        if (p.ExitCode != 0)
-        {
-            var err = p.StandardError.ReadToEnd();
-            throw new InvalidOperationException($"{Path.GetFileName(file)} failed ({p.ExitCode}): {err}");
-        }
-    }
-
-    private static (double rx, double tx) GetRates(string name)
-    {
-        var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == name);
-        if (nic is null) return (0, 0);
-        var s = nic.GetIPv4Statistics();
-        return (s.BytesReceived / 1024d, s.BytesSent / 1024d);
-    }
-
+    private static async Task WaitUntil(Func<bool> test, int seconds, string what) { for (var i = 0; i < seconds; i++) { if (test()) return; await Task.Delay(1000); } throw new TimeoutException($"Timed out waiting for {what}."); }
+    private static void Run(string file, string args) { var r = RunAllowRestart(file, args); if (r.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(file)} failed ({r.ExitCode}): {r.Error}"); }
+    private static (double rx, double tx) GetRates(string name) { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == name); if (nic is null) return (0, 0); var s = nic.GetIPv4Statistics(); return (s.BytesReceived / 1024d, s.BytesSent / 1024d); }
     private sealed record PnpDevice(string Id, string Name, string Status);
-    public sealed record Status(bool Connected, string DeviceName, string? Adapter, string AdapterStatus, bool Sharing, string? Lease, double RxKb, double TxKb);
+    private sealed record CommandResult(int ExitCode, string Output, string Error);
+    public sealed record Status(bool PhoneConnected, string PhoneName, string? AdapterName, string AdapterStatus, bool Sharing, string? PhoneIp, double RxKbps, double TxKbps);
 }
