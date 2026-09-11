@@ -23,14 +23,38 @@ public sealed class ShareEngine
     private const string Subnet = "192.168.137.";
     private const string LibUsbZipUrl = "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip";
     private const string LibUsbZipSha256 = "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94";
+    private static readonly object LogFileLock = new();
     private string AppDir => AppContext.BaseDirectory;
+    private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
+
+    public ShareEngine()
+    {
+        WriteLog("============================================================");
+        WriteLog("iPhoneUsbShare session started");
+        WriteLog($"Application directory: {AppDir}");
+        WriteLog($"Activity log: {ActivityLogPath}");
+    }
+
+    public void WriteLog(string message)
+    {
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
+        try
+        {
+            lock (LogFileLock)
+            {
+                File.AppendAllText(ActivityLogPath, line + Environment.NewLine, new UTF8Encoding(false));
+            }
+        }
+        catch { }
+        Log?.Invoke(this, message);
+    }
 
     public async Task EnsurePrerequisitesAsync()
     {
         Directory.CreateDirectory(CacheDir);
         if (UsbNative.IsReachable()) return;
-        Log?.Invoke(this, "Installing the USB filter driver (one-time)…");
+        WriteLog("Installing the USB filter driver (one-time)…");
         var arch = Environment.Is64BitOperatingSystem ? "amd64" : "x86";
         var zip = Path.Combine(CacheDir, "libusb-win32.zip");
         var extracted = Path.Combine(CacheDir, "libusb-win32-bin-1.4.0.2");
@@ -51,17 +75,28 @@ public sealed class ShareEngine
         if (!File.Exists(installer) || !File.Exists(packageDll) || !File.Exists(sys)) throw new InvalidOperationException("The libusb-win32 package is missing the required files.");
         if (!File.Exists(Path.Combine(AppDir, "libusb0.dll"))) throw new InvalidOperationException("libusb0.dll is missing beside iPhoneUsbShare.exe. Re-extract the complete ZIP and try again.");
         var phone = FindAppleDevice() ?? throw new InvalidOperationException("Connect an iPhone or iPad with a data-capable USB cable and try again.");
-        Run(installer, $"install --device=USB\\VID_{Vendor}&PID_{GetApplePid(phone.Id)}");
+        WriteLog($"Apple USB device: {phone.Id}");
+        var installResult = RunAllowRestart(installer, $"install --device=USB\\VID_{Vendor}&PID_{GetApplePid(phone.Id)}");
+        WriteLog($"libusb filter installer exit code: {installResult.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(installResult.Output)) WriteLog($"libusb installer output: {installResult.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(installResult.Error)) WriteLog($"libusb installer error: {installResult.Error.Trim()}");
+        if (installResult.ExitCode != 0) throw new InvalidOperationException($"install-filter.exe failed ({installResult.ExitCode}): {installResult.Error}");
         var sysDst = Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys");
-        if (!File.Exists(sysDst)) File.Copy(sys, sysDst, false);
+        if (!File.Exists(sysDst))
+        {
+            File.Copy(sys, sysDst, false);
+            WriteLog($"Copied libusb0.sys to {sysDst}");
+        }
+        else WriteLog($"libusb0.sys already present: {sysDst}");
         try
         {
             using var svc = new System.ServiceProcess.ServiceController("libusb0");
-            if (svc.Status != System.ServiceProcess.ServiceControllerStatus.Running) svc.Start();
+            WriteLog($"libusb0 service status: {svc.Status}");
+            if (svc.Status != System.ServiceProcess.ServiceControllerStatus.Running) { svc.Start(); svc.WaitForStatus(System.ServiceProcess.ServiceControllerStatus.Running, TimeSpan.FromSeconds(10)); WriteLog("libusb0 service started."); }
         }
-        catch { }
+        catch (Exception ex) { WriteLog($"libusb0 service start check: {ex.Message}"); }
         ConfigureUsbDevice(phone);
-        Log?.Invoke(this, "USB driver setup complete.");
+        WriteLog("USB driver setup complete.");
         await WaitUntil(() => UsbNative.IsReachable(), 15, "Apple USB filter driver");
     }
 
@@ -69,49 +104,57 @@ public sealed class ShareEngine
     {
         await EnsurePrerequisitesAsync();
         var phone = FindAppleDevice() ?? throw new InvalidOperationException("iPhone/iPad not found.");
+        WriteLog($"Apple device found: {phone.Id} ({phone.Name})");
         DisablePhotoInterfaces();
         var wifi = FindWifi() ?? throw new InvalidOperationException("No connected Wi-Fi adapter found.");
-        Log?.Invoke(this, $"Internet source: {wifi.Name}");
+        WriteLog($"Internet source: {wifi.Name}");
         var adapter = FindPhoneAdapter();
-        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up) Log?.Invoke(this, $"USB Ethernet already available: {adapter.Name}");
+        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up) WriteLog($"USB Ethernet already available: {adapter.Name}");
         else
         {
             SetConfig(phone.Id, SafeIndexValue, "0");
+            WriteLog("Set Apple USB configuration to safe mode (2).");
             RestartDevice(phone.Id);
             await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device to re-enumerate");
             DisablePhotoInterfaces();
-            Log?.Invoke(this, "Waiting for Apple USB control interface…");
+            WriteLog("Waiting for Apple USB control interface…");
             string? mode = null;
             for (var i = 0; i < 20; i++)
             {
                 mode = await UsbNative.GetModeAsync();
+                WriteLog($"GET_MODE attempt {i + 1}/20: {(mode ?? "unreachable")}");
                 if (mode is not null) break;
                 await Task.Delay(1000);
             }
             if (mode is null)
                 throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The libusb filter did not reattach; unplug/replug the iPad and try again.");
-            Log?.Invoke(this, $"Apple USB mode: {mode}");
+            WriteLog($"Apple USB mode: {mode}");
             if (mode != "3:3:3:0") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
             SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
+            WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
             var accepted = await UsbNative.SetModeAsync(3);
+            WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
             if (!accepted)
             {
                 SetConfig(phone.Id, SafeIndexValue, "0");
                 throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again.");
             }
-            Log?.Invoke(this, "Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
+            WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
             await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 35, "USB Ethernet adapter");
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
+            WriteLog($"USB Ethernet adapter is up: {adapter.Name}");
             DisablePhotoInterfaces();
         }
         await ConfigureIcsAsync(wifi.Name, adapter.Name);
-        Log?.Invoke(this, "Waiting for DHCP lease…");
+        WriteLog("Waiting for DHCP lease…");
         await WaitUntil(() => FindLease(adapter.Name) is not null, 30, "phone DHCP lease");
+        WriteLog($"DHCP lease acquired: {FindLease(adapter.Name) ?? "none"}");
     }
 
     public Task StopAsync()
     {
-        try { var adapter = FindPhoneAdapter(); if (adapter is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch { }
+        try { var adapter = FindPhoneAdapter(); if (adapter is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); WriteLog("Sharing stopped and Apple USB configuration restored."); }
+        catch (Exception ex) { WriteLog($"Stop cleanup: {ex.Message}"); }
         return Task.CompletedTask;
     }
 
@@ -123,8 +166,11 @@ public sealed class ShareEngine
 
     public async Task<string> DiagnosticsAsync()
     {
+        WriteLog("Running diagnostics…");
         var sb = new StringBuilder(); var p = FindAppleDevice(); var a = FindPhoneAdapter();
-        sb.AppendLine($"Apple device: {(p is null ? "not connected" : p.Name)}"); sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}"); sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}"); sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}"); sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]"); sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}"); sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}"); return sb.ToString();
+        sb.AppendLine($"Apple device: {(p is null ? "not connected" : p.Name)}"); sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}"); sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}"); sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}"); sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]"); sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}"); sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}");
+        WriteLog("Diagnostics result: " + sb.ToString().Replace(Environment.NewLine, " | ").Trim());
+        return sb.ToString();
     }
 
     private void ConfigureUsbDevice(PnpDevice phone)
@@ -171,9 +217,11 @@ public sealed class ShareEngine
 
     private async Task ConfigureIcsAsync(string wifi, string phoneAdapter)
     {
+        WriteLog($"Configuring Internet Connection Sharing: {wifi} -> {phoneAdapter}");
         DisableAllIcs(); var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare") ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable."); dynamic mgr = Activator.CreateInstance(mgrType)!; dynamic? wifiCfg = null, phoneCfg = null;
         foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name == wifi) wifiCfg = mgr.INetSharingConfigurationForINetConnection(c); if ((string)props.Name == phoneAdapter) phoneCfg = mgr.INetSharingConfigurationForINetConnection(c); }
         if (wifiCfg is null || phoneCfg is null) throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters."); wifiCfg.EnableSharing(0); phoneCfg.EnableSharing(1); await Task.Delay(3000);
+        WriteLog("Internet Connection Sharing enabled.");
     }
 
     private static void DisableAllIcs()
@@ -199,7 +247,7 @@ public sealed class ShareEngine
         using var searcher = new ManagementObjectSearcher($"SELECT PNPDeviceID, Name, Status, PNPClass FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%{needle}%'"); var list = new List<PnpDevice>();
         foreach (ManagementObject m in searcher.Get()) { var id = (string?)m["PNPDeviceID"]; var name = (string?)m["Name"]; var status = (string?)m["Status"]; if (id is not null && (className is null || string.Equals(className, (string?)m["PNPClass"], StringComparison.OrdinalIgnoreCase))) list.Add(new PnpDevice(id, name ?? id, status ?? "Unknown")); } return list;
     }
-    private static async Task WaitUntil(Func<bool> test, int seconds, string what) { for (var i = 0; i < seconds; i++) { if (test()) return; await Task.Delay(1000); } throw new TimeoutException($"Timed out waiting for {what}."); }
+    private async Task WaitUntil(Func<bool> test, int seconds, string what) { for (var i = 0; i < seconds; i++) { if (test()) return; await Task.Delay(1000); } throw new TimeoutException($"Timed out waiting for {what}."); }
     private static void Run(string file, string args) { var r = RunAllowRestart(file, args); if (r.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(file)} failed ({r.ExitCode}): {r.Error}"); }
     private static (double rx, double tx) GetRates(string name) { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == name); if (nic is null) return (0, 0); var s = nic.GetIPv4Statistics(); return (s.BytesReceived / 1024d, s.BytesSent / 1024d); }
     private sealed record PnpDevice(string Id, string Name, string Status);
