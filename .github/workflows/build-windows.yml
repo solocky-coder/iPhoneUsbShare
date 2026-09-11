@@ -1,13 +1,9 @@
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main" ]
-    tags: [ "v*" ]
-
-permissions:
-  contents: read
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -19,104 +15,94 @@ jobs:
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.x"
+          dotnet-version: '8.x'
 
-      - name: Verify bundled Apple Ethernet driver files
+      - name: Verify Apple driver files
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $required = @(
-            'NetDrivers\netaapl64.inf',
-            'NetDrivers\netaapl64.sys',
-            'NetDrivers\netaapl64.cat',
-            'NetDrivers\WdfCoInstaller01009.dll'
-          )
-          foreach ($file in $required) {
-            if (-not (Test-Path $file)) { throw "Missing bundled Apple driver file: $file" }
-            Write-Host "$file : $((Get-Item $file).Length) bytes"
+          foreach ($f in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
+            $p = Join-Path 'NetDrivers' $f
+            if (-not (Test-Path $p)) { throw "Missing NetDrivers file: $p" }
+            Write-Host "$p : $((Get-Item $p).Length) bytes"
           }
 
-      - name: Enable bundled Apple Ethernet driver installation in app
+      - name: Add Apple Ethernet driver hook
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $path = 'src\ShareEngine.cs'
           $text = Get-Content $path -Raw
           $nl = [Environment]::NewLine
-          $needle = "        await EnsurePrerequisitesAsync();$nl"
-          if (-not $text.Contains($needle)) { throw 'Could not find StartAsync prerequisite call.' }
-          $replacement = "        await EnsurePrerequisitesAsync();$nl        InstallBundledAppleEthernetDriver();$nl"
-          $text = $text.Replace($needle, $replacement)
-          $method = @'
-
-    private void InstallBundledAppleEthernetDriver()
-    {
-        var inf = Path.Combine(AppDir, "netaapl64.inf");
-        var sys = Path.Combine(AppDir, "netaapl64.sys");
-        var cat = Path.Combine(AppDir, "netaapl64.cat");
-        var wdf = Path.Combine(AppDir, "WdfCoInstaller01009.dll");
-        if (!File.Exists(inf) || !File.Exists(sys) || !File.Exists(cat) || !File.Exists(wdf))
-        {
-            WriteLog("Apple Ethernet driver package is not beside the EXE; continuing without it.");
-            return;
-        }
-
-        WriteLog("Installing/staging bundled Apple Mobile Device Ethernet driver…");
-        var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
-        WriteLog($"Apple Ethernet driver pnputil exit code: {result.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(result.Output)) WriteLog($"Apple Ethernet driver output: {result.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(result.Error)) WriteLog($"Apple Ethernet driver error: {result.Error.Trim()}");
-        if (result.ExitCode != 0 && result.ExitCode != 3010)
-            throw new InvalidOperationException($"Apple Ethernet driver installation failed ({result.ExitCode}): {result.Error}");
-    }
-'@
+          $call = '        await EnsurePrerequisitesAsync();' + $nl + '        InstallBundledAppleEthernetDriver();'
+          if (-not $text.Contains('        await EnsurePrerequisitesAsync();')) { throw 'StartAsync prerequisite call not found.' }
+          $text = $text.Replace('        await EnsurePrerequisitesAsync();', $call, 1)
+          $method = @(
+            '',
+            '    private void InstallBundledAppleEthernetDriver()',
+            '    {',
+            '        var inf = Path.Combine(AppDir, "netaapl64.inf");',
+            '        var sys = Path.Combine(AppDir, "netaapl64.sys");',
+            '        var cat = Path.Combine(AppDir, "netaapl64.cat");',
+            '        var wdf = Path.Combine(AppDir, "WdfCoInstaller01009.dll");',
+            '        if (!File.Exists(inf) || !File.Exists(sys) || !File.Exists(cat) || !File.Exists(wdf))',
+            '        {',
+            '            WriteLog("Bundled Apple Ethernet driver files are missing; continuing without them.");',
+            '            return;',
+            '        }',
+            '        WriteLog("Staging bundled Apple Mobile Device Ethernet driver…");',
+            '        var result = RunAllowRestart("pnputil.exe", $"/add-driver \\\"{inf}\\\" /install");',
+            '        WriteLog($"Apple Ethernet driver pnputil exit code: {result.ExitCode}");',
+            '        if (!string.IsNullOrWhiteSpace(result.Output)) WriteLog($"Apple Ethernet driver output: {result.Output.Trim()}");',
+            '        if (!string.IsNullOrWhiteSpace(result.Error)) WriteLog($"Apple Ethernet driver error: {result.Error.Trim()}");',
+            '        if (result.ExitCode != 0 && result.ExitCode != 3010)',
+            '            throw new InvalidOperationException($"Apple Ethernet driver installation failed ({result.ExitCode}): {result.Error}");',
+            '    }',
+            ''
+          ) -join $nl
           $anchor = '    private void ConfigureUsbDevice(PnpDevice phone)'
-          if (-not $text.Contains($anchor)) { throw 'Could not find ConfigureUsbDevice insertion point.' }
-          $text = $text.Replace($anchor, $method + $nl + $anchor)
+          if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
+          $text = $text.Replace($anchor, $method + $anchor, 1)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple Ethernet driver installation hook added to build.'
+          Write-Host 'Apple Ethernet driver hook inserted.'
 
-      - name: Publish self-contained EXE
+      - name: Publish EXE
         shell: pwsh
         run: |
           dotnet restore .\src\iPhoneUsbShare.csproj
           dotnet publish .\src\iPhoneUsbShare.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o .\artifacts\publish
 
-      - name: Prepare libusb-win32 runtime DLL
+      - name: Download official libusb-win32 runtime
         shell: pwsh
         run: |
-          $url = "https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "libusb-win32-bin-1.4.0.2.zip"
-          $expected = "00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94"
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'libusb-win32.zip'
+          $expected = '00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94'
           Invoke-WebRequest -Uri $url -OutFile $zip
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "libusb-win32 SHA-256 mismatch." }
-          $extract = Join-Path $env:RUNNER_TEMP "libusb-win32"
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'libusb-win32 SHA-256 mismatch.' }
+          $extract = Join-Path $env:RUNNER_TEMP 'libusb-win32'
           Expand-Archive -Path $zip -DestinationPath $extract -Force
-          $dll = Join-Path $extract "libusb-win32-bin-1.4.0.2\bin\amd64\libusb0.dll"
-          if (-not (Test-Path $dll)) { throw "x64 libusb0.dll not found." }
+          $dll = Join-Path $extract 'libusb-win32-bin-1.4.0.2\bin\amd64\libusb0.dll'
+          if (-not (Test-Path $dll)) { throw 'x64 libusb0.dll not found.' }
           New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
           Copy-Item $dll .\artifacts\package\libusb0.dll -Force
 
-      - name: Package Apple Ethernet driver
+      - name: Package ready-to-run ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $package = '.\artifacts\package'
-          foreach ($name in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
-            Copy-Item (Join-Path 'NetDrivers' $name) (Join-Path $package $name) -Force
+          Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
+          Copy-Item .\README.md $package\README.txt -Force
+          foreach ($f in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
+            Copy-Item (Join-Path 'NetDrivers' $f) (Join-Path $package $f) -Force
           }
-          Write-Host 'Bundled Apple Ethernet driver files:'
-          Get-ChildItem $package | Select-Object Name,Length
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'libusb-win32 1.4.0.2`r`nApple Mobile Device Ethernet driver files from NetDrivers'
+          Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
+          Get-Item .\artifacts\iPhoneUsbShare-win-x64.zip | Select-Object FullName,Length
 
-      - name: Create user package
-        shell: pwsh
-        run: |
-          Copy-Item .\artifacts\publish\iPhoneUsbShare.exe .\artifacts\package\iPhoneUsbShare.exe
-          Copy-Item .\README.md .\artifacts\package\README.txt
-          Set-Content .\artifacts\package\THIRD_PARTY_NOTICES.txt "libusb-win32 1.4.0.2`nApple Mobile Device Ethernet driver (netaapl64.sys/INF/CAT, WDF coinstaller)"
-          Compress-Archive -Path .\artifacts\package\* -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
-
-      - name: Upload ready-to-run Windows package
+      - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
         with:
           name: iPhoneUsbShare-win-x64
