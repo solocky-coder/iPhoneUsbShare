@@ -120,13 +120,35 @@ public sealed class ShareEngine
             }
             if (mode is null) throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The libusb filter did not reattach; unplug/replug the iPad and try again.");
             WriteLog($"Apple USB mode: {mode}");
-            if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
-            SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
-            WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
-            var accepted = await UsbNative.SetModeAsync(3);
-            WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
-            if (!accepted) { SetConfig(phone.Id, SafeIndexValue, "0"); throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again."); }
-            WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
+
+            // iPad Air 2 can report 5:3:3 after it has already switched into
+            // CDC-NCM direct mode. In that state there is no configuration 4
+            // to select; attempting the iPhone configuration sequence again
+            // only prevents the network interface from appearing.
+            if (mode == "5:3:3:0" || mode == "5:3:3")
+            {
+                WriteLog("Apple is already in CDC-NCM direct mode (5); skipping configuration 4 and SET_MODE(3).");
+            }
+            else
+            {
+                if (mode != "3:3:3:0" && mode != "3:3:3")
+                    throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
+                SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
+                WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
+                var accepted = await UsbNative.SetModeAsync(3);
+                WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
+                if (!accepted)
+                {
+                    SetConfig(phone.Id, SafeIndexValue, "0");
+                    throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again.");
+                }
+                WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
+            }
+
+            // Windows 10 has no inbox UsbNcm.sys. Do not hide the real failure
+            // behind a generic timeout: record the PnP state so the log clearly
+            // shows whether the Apple CDC-NCM interfaces appeared and whether
+            // Windows has a network driver bound to them.
             await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 35, "USB Ethernet adapter");
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             WriteLog($"USB Ethernet adapter is up: {adapter.Name}");
@@ -243,20 +265,37 @@ public sealed class ShareEngine
         return null;
     }
 
-    private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up).Where(n => n.NetworkInterfaceType is NetworkInterfaceType.Wireless80211).OrderByDescending(n => n.Speed).FirstOrDefault();
-    private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) && n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase));
-
-    private static (double rx, double tx) GetRates(string name)
+    private static (double Rx, double Tx) GetRates(string adapterName)
     {
-        try { var n = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(x => x.Name == name); return n is null ? (0, 0) : (n.GetIPv4Statistics().BytesReceived, n.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
+        try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private static string GetApplePid(string id) => id.Contains("12AB", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
-    private static PnpDevice? FindAppleDevice() => FindPnP("VID_05AC&PID_12A").FirstOrDefault();
-    private static IEnumerable<PnpDevice> FindPnP(string idContains, string? pnpClass = null) => new ManagementObjectSearcher($"SELECT DeviceID,Name,PNPClass FROM Win32_PnPEntity WHERE DeviceID LIKE '%{idContains}%'").Get().Cast<ManagementObject>().Where(m => string.IsNullOrWhiteSpace(pnpClass) || string.Equals(m["PNPClass"]?.ToString(), pnpClass, StringComparison.OrdinalIgnoreCase)).Select(m => new PnpDevice(m["DeviceID"]?.ToString() ?? "", m["Name"]?.ToString() ?? ""));
-    private static async Task WaitUntil(Func<bool> condition, int seconds, string label) { for (var i = 0; i < seconds; i++) { if (condition()) return; await Task.Delay(1000); } throw new TimeoutException($"Timed out waiting for {label}."); }
+    private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && n.OperationalStatus == OperationalStatus.Up);
+
+    private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.OperationalStatus == OperationalStatus.Up && (n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)) && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211);
+
+    private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
+    {
+        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, Name, PNPClass FROM Win32_PnPEntity");
+        foreach (ManagementObject o in searcher.Get())
+        {
+            var id = o["PNPDeviceID"]?.ToString() ?? "";
+            var name = o["Name"]?.ToString() ?? "";
+            var cls = o["PNPClass"]?.ToString() ?? "";
+            if (id.Contains(hardwareContains, StringComparison.OrdinalIgnoreCase) && (className is null || cls.Equals(className, StringComparison.OrdinalIgnoreCase))) yield return new PnpDevice(id, name);
+        }
+    }
+
+    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_12A", null).FirstOrDefault();
+    private static string GetApplePid(string id) => id.Contains("PID_12AB", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
+
+    private static async Task WaitUntil(Func<bool> predicate, int seconds, string what)
+    {
+        for (var i = 0; i < seconds; i++) { if (predicate()) return; await Task.Delay(1000); }
+        throw new TimeoutException($"Timed out waiting for {what}.");
+    }
+
+    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
     private readonly record struct CommandResult(int ExitCode, string Output, string Error);
     private sealed record PnpDevice(string Id, string Name);
 }
-
-public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
