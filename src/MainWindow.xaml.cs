@@ -32,15 +32,15 @@ public partial class MainWindow : Window
         try
         {
             var s = await _engine.GetStatusAsync();
-            PhoneText.Text = s.Connected ? s.DeviceName : "Connect your iPhone or iPad by USB";
-            AdapterText.Text = s.Adapter is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.Adapter} ({s.AdapterStatus})";
+            PhoneText.Text = s.PhoneConnected ? s.PhoneName : "Connect your iPhone or iPad by USB";
+            AdapterText.Text = s.AdapterName is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.AdapterName} ({s.AdapterStatus})";
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                s.Connected ? (s.Sharing ? "#16A34A" : "#D97706") : "#98A2B3"));
+                s.PhoneConnected ? (s.Sharing ? "#16A34A" : "#D97706") : "#98A2B3"));
             StateText.Text = s.Sharing ? "Internet sharing is ON" : "Ready";
-            IpText.Text = s.Lease ?? "—";
-            RxText.Text = $"{s.RxKb:0.0} KB/s";
-            TxText.Text = $"{s.TxKb:0.0} KB/s";
-            if (_sharing && !s.Sharing && s.Adapter is null)
+            IpText.Text = s.PhoneIp ?? "—";
+            RxText.Text = $"{s.RxKbps:0.0} KB/s";
+            TxText.Text = $"{s.TxKbps:0.0} KB/s";
+            if (_sharing && !s.Sharing && s.AdapterName is null)
             {
                 _sharing = false;
                 StartButton.IsEnabled = true;
