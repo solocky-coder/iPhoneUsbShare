@@ -82,7 +82,6 @@ jobs:
             '            foreach (var d in apple)',
             '            {',
             '                WriteLog($"Apple interface: {d.Id} | {d.Name}");',
-            '                WriteLog($"  Class={d.Class} Service={d.Service} Manufacturer={d.Manufacturer} Status={d.Status} ConfigManagerErrorCode={d.ConfigManagerErrorCode}");',
             '                var drivers = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid {(char)34}{d.Id}{(char)34} /drivers");',
             '                WriteLog($"  PnP driver query exit code: {drivers.ExitCode}");',
             '                if (!string.IsNullOrWhiteSpace(drivers.Output)) WriteLog($"  PnP driver query: {drivers.Output.Trim().Replace(Environment.NewLine, " | ")}");',
