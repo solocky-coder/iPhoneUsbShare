@@ -59,6 +59,22 @@ jobs:
             '            foreach (var d in apple)',
             '            {',
             '                WriteLog($"Apple interface: {d.Id} | {d.Name}");',
+            '                try',
+            '                {',
+            '                    using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, PNPClass, Service, ClassGuid, Manufacturer, Status, ConfigManagerErrorCode FROM Win32_PnPEntity");',
+            '                    foreach (ManagementObject o in searcher.Get())',
+            '                    {',
+            '                        var id = o["PNPDeviceID"]?.ToString() ?? "";',
+            '                        if (!id.Equals(d.Id, StringComparison.OrdinalIgnoreCase)) continue;',
+            '                        WriteLog($"  Class={o["PNPClass"]} Service={o["Service"]} ClassGuid={o["ClassGuid"]} Manufacturer={o["Manufacturer"]} Status={o["Status"]} ConfigManagerErrorCode={o["ConfigManagerErrorCode"]}");',
+            '                        break;',
+            '                    }',
+            '                }',
+            '                catch (Exception ex) { WriteLog($"  Interface property query failed: {ex.Message}"); }',
+            '                var drivers = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid {(char)34}{d.Id}{(char)34} /drivers");',
+            '                WriteLog($"  PnP driver query exit code: {drivers.ExitCode}");',
+            '                if (!string.IsNullOrWhiteSpace(drivers.Output)) WriteLog($"  PnP driver query: {drivers.Output.Trim().Replace(Environment.NewLine, " | ")}");',
+            '                if (!string.IsNullOrWhiteSpace(drivers.Error)) WriteLog($"  PnP driver query error: {drivers.Error.Trim().Replace(Environment.NewLine, " | ")}");',
             '                if (d.Id.Contains("&MI_02", StringComparison.OrdinalIgnoreCase))',
             '                {',
             '                    WriteLog("Apple MI_02 networking interface detected; applying bundled Apple Ethernet INF.");',
@@ -78,7 +94,7 @@ jobs:
           if (-not $text.Contains($anchor)) { throw 'ConfigureUsbDevice anchor not found.' }
           $text = $text.Replace($anchor, $method + $anchor, 1)
           Set-Content -Path $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Apple MI_02 PnP rescan/diagnostic hook inserted.'
+          Write-Host 'Apple USB interface driver diagnostics hook inserted.'
 
       - name: Publish EXE
         shell: pwsh
