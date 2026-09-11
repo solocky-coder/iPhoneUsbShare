@@ -76,4 +76,7 @@ The application recognizes Apple USB PID `12AB` (in addition to iPhone PID `12A8
 
 
 ### Build package revision
-The GitHub Actions package includes the Windows compile fixes for the USB adapter detection and required .NET namespaces.
+The GitHub Actions package includes the compile fixes for USB adapter detection, required .NET namespaces, and the bundled Apple Ethernet driver path for Windows 10 testing.
+
+### Current build path
+The workflow now packages the Apple Mobile Device Ethernet driver files from `NetDrivers` for the Windows 10 iPad Air 2 test path.
