@@ -73,3 +73,7 @@ This repository includes `.github/workflows/build-windows.yml`. On GitHub, open 
 ## iPad Air 2 support
 
 The application recognizes Apple USB PID `12AB` (in addition to iPhone PID `12A8`) and uses the same CDC-NCM control path only after the Apple USB device has been detected. Your iPad Air 2 was observed as `USB\VID_05AC&PID_12AB&MI_01`. Because iPadOS 15 behavior was not directly tested here, the application reports a clear mode-switch failure rather than claiming compatibility if the device does not expose the expected control protocol.
+
+
+### Build package revision
+The GitHub Actions package includes the Windows compile fixes for the USB adapter detection and required .NET namespaces.

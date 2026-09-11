@@ -1,4 +1,5 @@
 using Microsoft.Win32;
+using System.IO;
 using System.IO.Compression;
 using System.Management;
 using System.Net;
@@ -86,7 +87,7 @@ public sealed class ShareEngine
         Log?.Invoke(this, $"Internet source: {wifi.Name}");
 
         var adapter = FindPhoneAdapter();
-        if (adapter is not null && adapter.Status == "Up")
+        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
         {
             Log?.Invoke(this, $"USB Ethernet already available: {adapter.Name}");
         }
@@ -110,7 +111,7 @@ public sealed class ShareEngine
             }
 
             Log?.Invoke(this, "Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
-            await WaitUntil(() => FindPhoneAdapter()?.Status == "Up", 35, "USB Ethernet adapter");
+            await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 35, "USB Ethernet adapter");
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             DisablePhotoInterfaces();
         }
@@ -141,7 +142,7 @@ public sealed class ShareEngine
         var sharing = a is not null && IsIcsEnabled(a.Name);
         var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
         return await Task.FromResult(new Status(
-            p is not null, p?.Name ?? "Apple device", a?.Name, a?.Status ?? "—",
+            p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—",
             sharing, lease, rx, tx));
     }
 
@@ -154,7 +155,7 @@ public sealed class ShareEngine
         sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}");
         sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}");
         sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
-        sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.Status ?? "—"}]");
+        sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]");
         sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}");
         sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}");
         return sb.ToString();
