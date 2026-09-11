@@ -17,15 +17,39 @@ $method = @'
     {
         var parent = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase));
         if (parent is null) throw new InvalidOperationException("Apple composite parent devnode was not found.");
-        var keyPath = $@"SYSTEM\CurrentControlSet\Enum\{parent.Id}\Device Parameters";
+        var parentId = parent.Id;
+        var keyPath = $@"SYSTEM\CurrentControlSet\Enum\{parentId}\Device Parameters";
         using var key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true) ?? throw new InvalidOperationException("Cannot open Apple composite Device Parameters registry key.");
         key.SetValue("OriginalConfigurationValue", original, RegistryValueKind.DWord);
         key.SetValue("AltConfigurationValue", alternate, RegistryValueKind.DWord);
-        WriteLog($"Usbccgp configuration policy: parent={parent.Id}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}");
-        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{parent.Id}\"");
+        WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}");
+
+        // SET_MODE can make the Apple device disappear briefly. PnPUtil returns 1167
+        // while the USB device is in that transition, so wait for the same composite
+        // devnode to come back before asking usbccgp to restart it.
+        PnpDevice? reappeared = null;
+        for (var i = 1; i <= 30; i++)
+        {
+            try
+            {
+                reappeared = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => string.Equals(d.Id, parentId, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { }
+            if (reappeared is not null) break;
+            if (i == 1) WriteLog("Apple composite device is temporarily disconnected after SET_MODE; waiting for PnP reappearance…");
+            Thread.Sleep(500);
+        }
+
+        var restartId = reappeared?.Id ?? parentId;
+        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{restartId}\"");
         WriteLog($"Apple composite parent restart exit code: {restart.ExitCode}");
         if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite parent restart output: {restart.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple composite parent restart error: {restart.Error.Trim()}");
+        if (restart.ExitCode == 1167)
+        {
+            WriteLog("Apple composite parent was still disconnected; continuing and allowing the device to re-enumerate normally.");
+            return;
+        }
         if (restart.ExitCode != 0 && restart.ExitCode != 3010) throw new InvalidOperationException($"Apple composite parent restart failed ({restart.ExitCode}): {restart.Error}");
     }
 
