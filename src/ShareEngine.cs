@@ -80,8 +80,18 @@ public sealed class ShareEngine
             RestartDevice(phone.Id);
             await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device to re-enumerate");
             DisablePhotoInterfaces();
-            var mode = await UsbNative.GetModeAsync();
-            if (mode != "3:3:3:0") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode ?? "unreachable"}.");
+            Log?.Invoke(this, "Waiting for Apple USB control interface…");
+            string? mode = null;
+            for (var i = 0; i < 20; i++)
+            {
+                mode = await UsbNative.GetModeAsync();
+                if (mode is not null) break;
+                await Task.Delay(1000);
+            }
+            if (mode is null)
+                throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The libusb filter did not reattach; unplug/replug the iPad and try again.");
+            Log?.Invoke(this, $"Apple USB mode: {mode}");
+            if (mode != "3:3:3:0") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
             SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
             var accepted = await UsbNative.SetModeAsync(3);
             if (!accepted)
