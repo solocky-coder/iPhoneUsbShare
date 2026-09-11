@@ -16,44 +16,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply iPad Air 2 CDC-NCM mode 5 fix
-        shell: pwsh
-        run: |
-          $path = ".\src\ShareEngine.cs"
-          $text = Get-Content $path -Raw
-          $old = @'
-            WriteLog($"Apple USB mode: {mode}");
-            if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
-            SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
-            WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
-            var accepted = await UsbNative.SetModeAsync(3);
-            WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
-            if (!accepted) { SetConfig(phone.Id, SafeIndexValue, "0"); throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again."); }
-            WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
-'@
-          $new = @'
-            WriteLog($"Apple USB mode: {mode}");
-            if (mode == "5:3:3:0" || mode == "5:3:3")
-            {
-                // iPad Air 2 can enter usbmuxd CDC-NCM direct mode 5. In this mode
-                // the device exposes one configuration directly; configuration 4
-                // from the iPhone path does not exist and must NOT be selected.
-                WriteLog("iPad is already in CDC-NCM direct mode (5); skipping configuration 4 and SET_MODE.");
-            }
-            else
-            {
-                if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
-                SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
-                WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
-                var accepted = await UsbNative.SetModeAsync(3);
-                WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
-                if (!accepted) { SetConfig(phone.Id, SafeIndexValue, "0"); throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again."); }
-                WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
-            }
-'@
-          if (-not $text.Contains($old)) { throw "Expected ShareEngine mode-switch block was not found." }
-          Set-Content -Path $path -Value $text.Replace($old,$new) -Encoding UTF8
-
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
