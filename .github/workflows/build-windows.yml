@@ -21,64 +21,26 @@ jobs:
         with:
           dotnet-version: "8.x"
 
-      - name: Install matching Windows 11 22H2 WDK
+      - name: Setup Microsoft EWDK 22621 build environment
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $wdk = Join-Path $env:RUNNER_TEMP "wdksetup-22621.exe"
-          Write-Host "Downloading Microsoft WDK 22621..."
-          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2196230" -OutFile $wdk
-          if (-not (Test-Path $wdk)) { throw "WDK installer download failed." }
-          $p = Start-Process -FilePath $wdk -ArgumentList "/features OptionId.WindowsDriverKitComplete /q /norestart" -Wait -PassThru
-          if ($p.ExitCode -notin @(0,3010)) { throw "WDK installer failed with exit code $($p.ExitCode)." }
-          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $wdkBuild = Join-Path $wdkRoot "build\10.0.22621.0"
-          $wdkInclude = Join-Path $wdkRoot "Include\10.0.22621.0"
-          if (-not (Test-Path $wdkBuild)) { throw "Matching WDK 10.0.22621.0 was not installed." }
-          if (-not (Test-Path $wdkInclude)) { throw "Matching WDK headers 10.0.22621.0 were not installed." }
-          Write-Host "Installed matching WDK 22621 successfully."
+          $iso = Join-Path $env:RUNNER_TEMP "EWDK_22621.iso"
+          $url = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/EWDK_ni_release_svc_prod1_22621_230929-1800.iso"
+          Write-Host "Downloading Microsoft EWDK 22621..."
+          Invoke-WebRequest -Uri $url -OutFile $iso
+          if (-not (Test-Path $iso)) { throw "EWDK ISO download failed." }
+          $img = Mount-DiskImage -ImagePath $iso -PassThru
+          $vol = $img | Get-Volume
+          $drive = ($vol | Where-Object DriveLetter | Select-Object -First 1).DriveLetter
+          if (-not $drive) { throw "Could not determine the EWDK mounted drive letter." }
+          $root = "${drive}:\"
+          if (-not (Test-Path (Join-Path $root "LaunchBuildEnv.cmd"))) { throw "LaunchBuildEnv.cmd was not found on the EWDK ISO." }
+          "EWDK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "EWDK mounted at $root"
+          Write-Host "The EWDK is self-contained and supplies the matching SDK, WDK and MSBuild toolchain."
 
-      - name: Fix WDK 22621 MSBuild task compatibility
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $versionedBin = Join-Path $kitRoot "build\10.0.22621.0\bin"
-          $buildRoot = Join-Path $kitRoot "build"
-          New-Item -ItemType Directory -Force $versionedBin | Out-Null
-
-          # First look for the exact task. Some WDK/Visual Studio combinations
-          # already install the 17.0 task and need no 16->17 workaround.
-          $task17 = Join-Path $versionedBin "Microsoft.DriverKit.Build.Tasks.17.0.dll"
-          $task17Candidates = @()
-          $task17Candidates += Get-ChildItem -Path $buildRoot -Filter "Microsoft.DriverKit.Build.Tasks.17.0.dll" -Recurse -File -ErrorAction SilentlyContinue
-          $existing17 = $task17Candidates | Select-Object -First 1
-          if ($existing17) {
-            if ($existing17.FullName -ne $task17) {
-              Copy-Item $existing17.FullName $task17 -Force
-            }
-            Write-Host "Using existing WDK 17.0 MSBuild task: $($existing17.FullName)"
-          }
-          else {
-            # Older WDK 22621 installations are known to ship only the 16.0 task;
-            # Microsoft Q&A documents copying it to the 17.0 filename.
-            $existing16 = Get-ChildItem -Path $buildRoot -Filter "Microsoft.DriverKit.Build.Tasks.16.0.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $existing16) {
-              throw "WDK 22621 contains neither Microsoft.DriverKit.Build.Tasks.17.0.dll nor Microsoft.DriverKit.Build.Tasks.16.0.dll."
-            }
-            Copy-Item $existing16.FullName $task17 -Force
-            Write-Host "Created 17.0 compatibility task from: $($existing16.FullName)"
-          }
-          if (-not (Test-Path $task17)) { throw "Required WDK MSBuild task was not installed at $task17" }
-
-          # Package-verifier tasks can have the same version-name mismatch.
-          $pv17 = Join-Path $versionedBin "Microsoft.DriverKit.PackageVerifier.dll"
-          $pvCandidates = Get-ChildItem -Path $buildRoot -Filter "Microsoft.DriverKit.PackageVerifier.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($pvCandidates -and -not (Test-Path $pv17)) {
-            Copy-Item $pvCandidates.FullName $pv17 -Force
-          }
-
-      - name: Build open-source Microsoft USB NCM host driver
+      - name: Build open-source Microsoft USB NCM host driver with EWDK
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -95,26 +57,14 @@ jobs:
           }
           Set-Content -Path $inf -Value $text -Encoding utf8 -NoNewline
 
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found." }
-          $vs = & $vswhere -latest -products * -property installationPath
-          if (-not $vs) { throw "Visual Studio installation not found." }
-          $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
-          if (-not (Test-Path $msbuild)) { throw "MSBuild.exe not found at $msbuild" }
-
-          $sdk = '10.0.22621.0'
-          $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $sdkInclude = Join-Path $kitRoot "Include\$sdk"
-          $sdkLib = Join-Path $kitRoot "Lib\$sdk"
-          $wdkBuild = Join-Path $kitRoot "build\$sdk"
-          if (-not (Test-Path $sdkInclude)) { throw "Windows SDK $sdk is not installed on this runner." }
-          if (-not (Test-Path $sdkLib)) { throw "Windows SDK libraries $sdk are not installed on this runner." }
-          if (-not (Test-Path $wdkBuild)) { throw "Windows WDK $sdk is not installed on this runner." }
-          Write-Host "Using matching SDK/WDK build: $sdk"
-
           $solution = Join-Path $ncm "usbncm.sln"
           if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
-          & $msbuild $solution /t:Build /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=$sdk /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal
+
+          # LaunchBuildEnv.cmd initializes the complete EWDK toolchain in the same
+          # cmd.exe process. This avoids the broken WDK/VS task-DLL combination on
+          # the hosted windows-2022 image.
+          $cmd = "call `"$($env:EWDK_ROOT)LaunchBuildEnv.cmd`" && cd /d `"$ncm`" && msbuild usbncm.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:TreatWarningsAsErrors=false /p:EnablePREfast=false /m /v:minimal"
+          cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Microsoft NCM host driver solution build failed ($LASTEXITCODE)." }
 
           $driverRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts\ncm-driver"
