@@ -21,6 +21,23 @@ jobs:
         with:
           dotnet-version: "8.x"
 
+      - name: Install matching Windows 11 22H2 WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wdk = Join-Path $env:RUNNER_TEMP "wdksetup-22621.exe"
+          Write-Host "Downloading Microsoft WDK 22621..."
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2196230" -OutFile $wdk
+          if (-not (Test-Path $wdk)) { throw "WDK installer download failed." }
+          $p = Start-Process -FilePath $wdk -ArgumentList "/features OptionId.WindowsDriverKitComplete /q /norestart" -Wait -PassThru
+          if ($p.ExitCode -notin @(0,3010)) { throw "WDK installer failed with exit code $($p.ExitCode)." }
+          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $wdkBuild = Join-Path $wdkRoot "build\10.0.22621.0"
+          $wdkInclude = Join-Path $wdkRoot "Include\10.0.22621.0"
+          if (-not (Test-Path $wdkBuild)) { throw "Matching WDK 10.0.22621.0 was not installed." }
+          if (-not (Test-Path $wdkInclude)) { throw "Matching WDK headers 10.0.22621.0 were not installed." }
+          Write-Host "Installed matching WDK 22621 successfully."
+
       - name: Build open-source Microsoft USB NCM host driver
         shell: pwsh
         run: |
@@ -32,8 +49,7 @@ jobs:
           $inf = Join-Path $ncm "host\UsbNcmSample.inf"
           if (-not (Test-Path $inf)) { throw "Microsoft NCM host INF was not found." }
 
-          # The Microsoft sample leaves the generic CDC-NCM match commented out.
-          # Enable it so the driver can bind to Apple's standard NCM interface.
+          # Enable generic CDC-NCM matching for Apple's NCM interface.
           $text = Get-Content $inf -Raw
           $needle = '; %UsbNcm.DeviceDesc%=UsbNcm_Device, USB\\Class_02&SubClass_0d&Prot_00'
           if ($text.Contains($needle)) {
@@ -43,25 +59,20 @@ jobs:
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found." }
-          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.Microsoft.Windows.DriverKit -property installationPath
-          if (-not $vs) { $vs = & $vswhere -latest -products * -property installationPath }
+          $vs = & $vswhere -latest -products * -property installationPath
           if (-not $vs) { throw "Visual Studio installation not found." }
           $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
           if (-not (Test-Path $msbuild)) { throw "MSBuild.exe not found at $msbuild" }
 
-          Write-Host "Using Visual Studio: $vs"
-          Write-Host "Using MSBuild: $msbuild"
-          Write-Host "Available Windows SDKs:"
-          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name }
-          Write-Host "Available WDK build folders:"
-          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\build" -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name }
-
           $sdk = '10.0.22621.0'
-          $sdkInclude = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$sdk"
-          $sdkLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$sdk"
+          $kitRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdkInclude = Join-Path $kitRoot "Include\$sdk"
+          $sdkLib = Join-Path $kitRoot "Lib\$sdk"
+          $wdkBuild = Join-Path $kitRoot "build\$sdk"
           if (-not (Test-Path $sdkInclude)) { throw "Windows SDK $sdk is not installed on this runner." }
           if (-not (Test-Path $sdkLib)) { throw "Windows SDK libraries $sdk are not installed on this runner." }
-          Write-Host "Pinned WindowsTargetPlatformVersion: $sdk"
+          if (-not (Test-Path $wdkBuild)) { throw "Windows WDK $sdk is not installed on this runner." }
+          Write-Host "Using matching SDK/WDK build: $sdk"
 
           $solution = Join-Path $ncm "usbncm.sln"
           if (-not (Test-Path $solution)) { throw "Microsoft NCM solution was not found." }
