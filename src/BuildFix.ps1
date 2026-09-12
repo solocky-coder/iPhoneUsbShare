@@ -50,8 +50,6 @@ $method = @'
             sw?.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
         }
         WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}, registry=hardware+Device Parameters");
-        // CM_Disable_DevNode can be vetoed by usbccgp (CR_REMOVE_VETOED=0x17).
-        // Use pnputil restart as the supported fallback instead of aborting.
         if (CM_Locate_DevNodeW(out var devInst, parentId, 0) != 0)
             throw new InvalidOperationException("Could not locate the Apple composite devnode for restart.");
         var disable = CM_Disable_DevNode(devInst, 0x00000004);
@@ -65,7 +63,7 @@ $method = @'
         }
         else
         {
-            WriteLog($"CM disable was vetoed (CR_REMOVE_VETOED={disable}); falling back to PnPUtil restart.");
+            WriteLog($"CM disable was vetoed (CM error {disable}); falling back to PnPUtil restart.");
             var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{parentId}\"");
             WriteLog($"Apple composite PnPUtil restart exit code: {restart.ExitCode}");
             if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple composite restart output: {restart.Output.Trim()}");
@@ -102,7 +100,7 @@ $method = @'
         try
         {
             var parent = FindPnP("VID_05AC&PID_12AB", null).FirstOrDefault(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase));
-            if (parent is not null && CM_Locate_DevNodeW(out var devInst, parent.Id, 0))
+            if (parent is not null && CM_Locate_DevNodeW(out var devInst, parent.Id, 0) == 0)
                 WriteLog($"CM_Reenumerate_DevNode(parent, SYNCHRONOUS) = {CM_Reenumerate_DevNode(devInst, 1)}");
         }
         catch (Exception ex) { WriteLog($"CM composite re-enumeration failed: {ex.Message}"); }
