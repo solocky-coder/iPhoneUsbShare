@@ -76,28 +76,69 @@ $method = @'
 
         WriteLog($"Usbccgp configuration policy: parent={parentId}, OriginalConfigurationValue={original}, AltConfigurationValue={alternate}, registry=hardware+Device Parameters");
 
-        if (CM_Locate_DevNodeW(out var devInst, parentId, 0) != 0)
+        if (CM_Locate_DevNodeW(out _, parentId, 0) != 0)
             throw new InvalidOperationException("Could not locate the Apple composite devnode.");
 
-        var remove = RunAllowRestart(
+        // Do NOT remove the USB devnode. PnPUtil /remove-device can leave the
+        // physical Apple device absent until a real unplug/replug. We need the
+        // existing USB device to reconnect while usbccgp rereads the registry
+        // configuration policy and selects configuration 5.
+        var restart = RunAllowRestart(
             "pnputil.exe",
-            $"/remove-device \"{parentId}\" /subtree");
+            $"/restart-device \"{parentId}\"");
 
-        WriteLog($"Apple composite subtree removal exit code: {remove.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(remove.Output))
-            WriteLog($"Apple composite removal output: {remove.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(remove.Error))
-            WriteLog($"Apple composite removal error: {remove.Error.Trim()}");
+        WriteLog($"Apple composite parent restart exit code: {restart.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(restart.Output))
+            WriteLog($"Apple composite restart output: {restart.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(restart.Error))
+            WriteLog($"Apple composite restart error: {restart.Error.Trim()}");
 
-        if (remove.ExitCode != 0 && remove.ExitCode != 3010)
+        if (restart.ExitCode != 0 && restart.ExitCode != 3010)
             throw new InvalidOperationException(
-                $"Apple composite subtree removal failed ({remove.ExitCode}): {remove.Error}");
+                $"Apple composite parent restart failed ({restart.ExitCode}): {restart.Error}");
 
-        Thread.Sleep(2000);
-
+        Thread.Sleep(2500);
         var scan = RunAllowRestart("pnputil.exe", "/scan-devices");
-        WriteLog($"PNPUTIL scan after composite removal exit code: {scan.ExitCode}");
-        Thread.Sleep(3000);
+        WriteLog($"PNPUTIL scan after composite restart exit code: {scan.ExitCode}");
+
+        for (var i = 0; i < 15; i++)
+        {
+            var found = FindPnP("VID_05AC&PID_12AB", null)
+                .Any(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase));
+            if (found)
+            {
+                WriteLog($"Apple MI_02 networking interface detected after composite restart (poll {i + 1}/15).");
+                return;
+            }
+            Thread.Sleep(1000);
+        }
+
+        // If restart did not rebuild the composite children, explicitly disable
+        // and re-enable the parent. This keeps the devnode and allows usbccgp to
+        // perform a fresh SelectConfiguration using OriginalConfigurationValue=5.
+        WriteLog("Apple MI_02 was not visible after restart; trying explicit disable/enable of the composite parent.");
+        var disable = RunAllowRestart("pnputil.exe", $"/disable-device \"{parentId}\"");
+        WriteLog($"Apple composite disable exit code: {disable.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(disable.Output))
+            WriteLog($"Apple composite disable output: {disable.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(disable.Error))
+            WriteLog($"Apple composite disable error: {disable.Error.Trim()}");
+        if (disable.ExitCode != 0 && disable.ExitCode != 3010)
+            throw new InvalidOperationException($"Apple composite disable failed ({disable.ExitCode}): {disable.Error}");
+
+        Thread.Sleep(1500);
+        var enable = RunAllowRestart("pnputil.exe", $"/enable-device \"{parentId}\"");
+        WriteLog($"Apple composite enable exit code: {enable.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(enable.Output))
+            WriteLog($"Apple composite enable output: {enable.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(enable.Error))
+            WriteLog($"Apple composite enable error: {enable.Error.Trim()}");
+        if (enable.ExitCode != 0 && enable.ExitCode != 3010)
+            throw new InvalidOperationException($"Apple composite enable failed ({enable.ExitCode}): {enable.Error}");
+
+        Thread.Sleep(2500);
+        var scan2 = RunAllowRestart("pnputil.exe", "/scan-devices");
+        WriteLog($"PNPUTIL scan after composite enable exit code: {scan2.ExitCode}");
     }
 
     private void InstallBundledAppleEthernetDriver()
