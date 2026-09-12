@@ -1,0 +1,1 @@
+RunAllowRestart pnputil.exe /add-driver usbncm.inf /install
