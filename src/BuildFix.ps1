@@ -2,6 +2,12 @@ $ErrorActionPreference = 'Stop'
 $path = Join-Path $PSScriptRoot 'ShareEngine.cs'
 $text = Get-Content -LiteralPath $path -Raw
 $nl = [Environment]::NewLine
+
+# The NCM binder uses the Win32 P/Invoke declarations below.
+if (-not $text.Contains('using System.Runtime.InteropServices;')) {
+    $text = $text.Replace('using System.Net.Http;' + $nl, 'using System.Net.Http;' + $nl + 'using System.Runtime.InteropServices;' + $nl)
+}
+
 $anchor = '            // Windows 10 has no inbox UsbNcm.sys.'
 if (-not $text.Contains($anchor)) { throw 'Windows 10 Ethernet comment anchor not found.' }
 
@@ -28,6 +34,14 @@ $method = @'
         foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
         if (controls.Count == 0) { WriteLog("No iPad NCM control interface (MI_02/MI_04) visible."); return; }
 
+        // MI_02 is currently claimed by the legacy Apple Mobile Device Ethernet
+        // driver on the user's Windows 10 machine. Prefer the unclaimed NCM
+        // control interface MI_04, which is paired with data interface MI_05.
+        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
+                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase));
+        if (target is null) return;
+        WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
+
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidates = new[] {
             Path.Combine(windows, "INF", "usbncm.inf"),
@@ -42,14 +56,31 @@ $method = @'
         WriteLog($"Windows NCM INF: {inf ?? "not found"}");
         if (inf is null) return;
 
-        foreach (var hardwareId in new[] { "USB\\Class_02&SubClass_0d&Prot_00", "USB\\MS_COMP_WINNCM" })
+        // Make sure the inbox package is registered, then bind the exact control
+        // interface. UpdateDriverForPlugAndPlayDevices can match the device's
+        // compatible NCM class IDs from UsbNcm.inf.
+        var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
+        WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
+
+        var exactId = target.Id;
+        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, exactId, inf, 0x5, out var reboot);
+        var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
+        WriteLog($"UsbNcm bind {exactId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+        if (!ok)
         {
-            var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareId, inf, 0x5, out var reboot);
-            var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-            WriteLog($"UsbNcm bind {hardwareId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
-            if (ok) break;
-            await Task.Delay(1000);
+            foreach (var hardwareId in new[] { "USB\\MS_COMP_WINNCM", "USB\\Class_02&SubClass_0d&Prot_00" })
+            {
+                ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareId, inf, 0x5, out reboot);
+                err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
+                WriteLog($"UsbNcm fallback bind {hardwareId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+                if (ok) break;
+                await Task.Delay(1000);
+            }
         }
+        await Task.Delay(1500);
+        WriteLog($"Selected NCM control state after bind: {FindPnP(target.Id, null).FirstOrDefault()?.Name ?? "not found"}");
     }
 
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -64,4 +95,4 @@ if (-not $text.Contains('private async Task BindUsbNcmDriverAsync()')) {
 }
 
 Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-Write-Host 'BuildFix completed: Windows UsbNcm binding enabled on iPad NCM control interfaces.'
+Write-Host 'BuildFix completed: iPad MI_04 is preferred and UsbNcm binding is enabled.'
