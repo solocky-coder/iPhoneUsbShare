@@ -70,13 +70,22 @@ $replacement = @'
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
 
         // UpdateDriverForPlugAndPlayDevicesW takes a HARDWARE ID, not a
-        // device-instance ID. The previous code passed the full instance ID
-        // (including the final '\\<instance>' portion), which caused Windows
-        // to reject the bind with 0xE000020B. Use the MI_02 hardware ID here.
+        // device-instance ID. Use the MI-specific hardware ID for matching.
         var targetHardwareId = target.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase)
             ? "USB\\VID_05AC&PID_12AB&MI_02"
             : "USB\\VID_05AC&PID_12AB&MI_04";
         WriteLog($"NCM target hardware ID: {targetHardwareId}");
+
+        // Capture Windows' own PnP view while the devnode is still present.
+        // This is deliberately done before any driver update/restart so that
+        // the log records the hardware IDs, compatible IDs, current driver,
+        // matching drivers, rank, and problem state that Windows sees.
+        var beforePnp = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /ids /drivers");
+        WriteLog($"NCM PnP diagnostic before bind exit code: {beforePnp.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(beforePnp.Output))
+            WriteLog("NCM PnP diagnostic before bind output: " + beforePnp.Output.Trim());
+        if (!string.IsNullOrWhiteSpace(beforePnp.Error))
+            WriteLog("NCM PnP diagnostic before bind error: " + beforePnp.Error.Trim());
 
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidates = new[]
@@ -103,6 +112,14 @@ $replacement = @'
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
+        // Capture the ranking again after usbncm.inf has been registered.
+        var rankedPnp = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /ids /drivers");
+        WriteLog($"NCM PnP diagnostic after INF registration exit code: {rankedPnp.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(rankedPnp.Output))
+            WriteLog("NCM PnP diagnostic after INF registration output: " + rankedPnp.Output.Trim());
+        if (!string.IsNullOrWhiteSpace(rankedPnp.Error))
+            WriteLog("NCM PnP diagnostic after INF registration error: " + rankedPnp.Error.Trim());
+
         var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, targetHardwareId, inf, 0x5, out var reboot);
         var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
         WriteLog($"UsbNcm exact bind {targetHardwareId} -> {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
@@ -118,8 +135,16 @@ $replacement = @'
             }
         }
 
-        // Give PnP time to apply the new driver, then explicitly restart the
-        // selected NCM control devnode if necessary.
+        // Capture the state before restarting the devnode. If binding failed,
+        // this is the last moment where Windows may still expose the original
+        // driver/ranking information for the selected interface.
+        var postBindPnp = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /ids /drivers");
+        WriteLog($"NCM PnP diagnostic after bind attempt exit code: {postBindPnp.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(postBindPnp.Output))
+            WriteLog("NCM PnP diagnostic after bind attempt output: " + postBindPnp.Output.Trim());
+        if (!string.IsNullOrWhiteSpace(postBindPnp.Error))
+            WriteLog("NCM PnP diagnostic after bind attempt error: " + postBindPnp.Error.Trim());
+
         await Task.Delay(1500);
         try
         {
