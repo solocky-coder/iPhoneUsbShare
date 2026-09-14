@@ -99,3 +99,9 @@ The first NCM control function is preferred because the iOS 16+ dual-function la
 This revision re-applies the `usbccgp` CDC enumeration policy (`EnumeratorClass = 02 00 00`) on every start before the Apple device is restarted, so machines upgraded from an earlier build cannot retain a stale composite-device enumeration policy. Microsoft documents this registry setting for CDC interface-collection enumeration.
 
 The NCM binding stage also records each NCM child's HardwareID/CompatibleIDs, current service/driver state, and the output of `pnputil /enum-devices /instanceid ... /drivers`. If an exact `usbncm.inf` entry is not returned by SetupAPI, it falls back to Windows' best-compatible-driver selection rather than treating `ERROR_NO_MORE_ITEMS (259)` as a terminal driver-binding failure.
+
+## NCM devnode driver replacement fix
+
+The current NCM binding path identifies CDC-NCM control interfaces from the live USB descriptors, maps them to their Windows `MI_xx` devnodes, and then performs a **targeted Microsoft UsbNcm driver replacement on that devnode**. It does not uninstall Apple's driver package globally. The installation path restricts SetupAPI's driver search to the staged `usbncm.inf`, selects that driver node explicitly, and uses `DiInstallDevice` for the selected devnode. This is intended to avoid normal driver ranking choosing the older Apple Netaapl package by its more-specific VID/PID/MI hardware ID.
+
+The obsolete `iPhoneUsbShare Apple NCM (Test)` package is not deleted automatically; the app only replaces the driver on the active NCM devnode. This avoids changing unrelated devices and makes the result reversible through Windows Device Manager/driver installation tooling.

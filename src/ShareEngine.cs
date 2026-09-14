@@ -376,6 +376,13 @@ public sealed class ShareEngine
 
     private bool InstallSelectedNcmDriver(string instanceId, string infPath, out uint error)
     {
+        // The previous implementation searched the normal class-driver list.
+        // That list is rank-filtered, so the installed Apple Netaapl driver
+        // won over Microsoft's generic CDC-NCM match.  Build a driver list
+        // from *only* the Microsoft INF for this exact devnode, then install
+        // the selected driver on that devnode.  This is a targeted replacement:
+        // it does not uninstall Apple's package globally and does not alter
+        // unrelated Apple devices.
         error = 0;
         var emptyGuid = Guid.Empty;
         var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
@@ -384,6 +391,7 @@ public sealed class ShareEngine
             error = (uint)Marshal.GetLastWin32Error();
             return false;
         }
+
         try
         {
             for (uint index = 0; ; index++)
@@ -396,16 +404,40 @@ public sealed class ShareEngine
                     error = (uint)e;
                     return false;
                 }
+
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
 
+                var installParams = new SP_DEVINSTALL_PARAMS { cbSize = (uint)Marshal.SizeOf<SP_DEVINSTALL_PARAMS>(), DriverPath = string.Empty };
+                if (!SetupDiGetDeviceInstallParams(h, ref devInfo, ref installParams))
+                {
+                    error = (uint)Marshal.GetLastWin32Error();
+                    WriteStaticLog($"SetupAPI: SetupDiGetDeviceInstallParams failed for {instanceId}, Win32Error={error}");
+                    return false;
+                }
+
+                installParams.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
+                installParams.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS | DI_FLAGSEX_FILTERSIMILARDRIVERS;
+                installParams.DriverPath = infPath;
+
+                if (!SetupDiSetDeviceInstallParams(h, ref devInfo, ref installParams))
+                {
+                    error = (uint)Marshal.GetLastWin32Error();
+                    WriteStaticLog($"SetupAPI: SetupDiSetDeviceInstallParams failed for {instanceId}, Win32Error={error}");
+                    return false;
+                }
+
+                WriteStaticLog($"SetupAPI: building driver list restricted to {infPath} for {instanceId}");
                 if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
                 {
                     error = (uint)Marshal.GetLastWin32Error();
+                    WriteStaticLog($"SetupAPI: restricted driver-list build failed for {instanceId}, Win32Error={error}");
                     return false;
                 }
+
                 try
                 {
+                    var found = false;
                     for (uint driverIndex = 0; ; driverIndex++)
                     {
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
@@ -416,43 +448,63 @@ public sealed class ShareEngine
                             error = (uint)e;
                             return false;
                         }
-                        var detail = GetDriverInfoDetail(h, ref devInfo, ref driver, out _);
-                        if (detail is null) continue;
-                        WriteStaticLog($"SetupAPI candidate for {instanceId}: {detail} | {driver.Description} | provider={driver.ProviderName}");
-                        if (!string.Equals(Path.GetFileName(detail), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var detail = GetDriverInfoDetail(h, ref devInfo, ref driver, out var detailError);
+                        WriteStaticLog($"SetupAPI restricted candidate for {instanceId}: inf={detail ?? "<unknown>"} | description={driver.Description} | provider={driver.ProviderName} | detailError={detailError}");
+
+                        if (detail is null || !string.Equals(Path.GetFileName(detail), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        found = true;
+                        WriteStaticLog($"SetupAPI: selecting exact Microsoft NCM driver node {Path.GetFileName(detail)} for {instanceId}");
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
+                            WriteStaticLog($"SetupAPI: SetupDiSetSelectedDriver failed for {instanceId}, Win32Error={error}");
                             return false;
                         }
-                        if (!SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, ref devInfo))
+
+                        // DiInstallDevice is the supported API for installing a
+                        // preinstalled driver node on a specific present device.
+                        // Unlike the previous DIF_SELECTBESTCOMPATDRV path, it
+                        // does not ask Windows to re-rank the Apple hardware-ID
+                        // driver after we have explicitly selected UsbNcm.
+                        if (!DiInstallDevice(IntPtr.Zero, h, ref devInfo, ref driver, 0, out var needReboot))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
+                            WriteStaticLog($"SetupAPI: DiInstallDevice(UsbNcm) failed for {instanceId}, Win32Error={error}, needReboot={needReboot}");
                             return false;
                         }
+
+                        WriteStaticLog($"SetupAPI: Microsoft UsbNcm installed on {instanceId}; needReboot={needReboot}");
                         return true;
                     }
+
+                    if (!found)
+                    {
+                        // Do not fall back to DIF_SELECTBESTCOMPATDRV here.
+                        // That was the operation that allowed Netaapl/oem25 to
+                        // remain selected.  Failure is intentionally explicit
+                        // so the log tells us whether the INF itself does not
+                        // declare compatibility with this devnode.
+                        error = ERROR_NO_MORE_ITEMS;
+                        WriteStaticLog($"SetupAPI: {Path.GetFileName(infPath)} was not exposed as a compatible driver when the search was restricted to that INF for {instanceId}");
+                        return false;
+                    }
                 }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
-                // If SetupDi's class-driver list did not expose the INF by
-                // filename, let Windows select the best compatible driver.
-                // ERROR_NO_MORE_ITEMS (259) is exactly what the previous build
-                // returned here when UsbNcm was not present in that list.
-                WriteStaticLog($"SetupAPI: no exact {Path.GetFileName(infPath)} candidate for {instanceId}; trying DIF_SELECTBESTCOMPATDRV.");
-                if (SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, h, ref devInfo))
+                finally
                 {
-                    WriteStaticLog($"SetupAPI: best compatible driver selected for {instanceId}; installing.");
-                    if (SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, ref devInfo)) return true;
-                    error = (uint)Marshal.GetLastWin32Error();
-                    return false;
+                    SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER);
                 }
-                error = (uint)Marshal.GetLastWin32Error();
-                return false;
             }
+
             error = ERROR_NO_SUCH_DEVINST;
             return false;
         }
-        finally { SetupDiDestroyDeviceInfoList(h); }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(h);
+        }
     }
 
     private static string? GetDeviceInstanceId(IntPtr h, ref SP_DEVINFO_DATA devInfo)
@@ -485,11 +537,29 @@ public sealed class ShareEngine
     private const uint DIGCF_ALLCLASSES = 0x00000004;
     private const uint SPDIT_CLASSDRIVER = 0x00000001;
     private const uint DIF_INSTALLDEVICE = 0x00000001;
-    private const uint DIF_SELECTBESTCOMPATDRV = 0x00000005;
+    private const uint DI_ENUMSINGLEINF = 0x00000002;
+    private const uint DI_QUIETINSTALL = 0x00000020;
+    private const uint DI_FLAGSEX_ALLOWEXCLUDEDDRVS = 0x00000001;
+    private const uint DI_FLAGSEX_FILTERSIMILARDRIVERS = 0x00000200;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const int ERROR_NO_SUCH_DEVINST = 433;
     private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DEVINSTALL_PARAMS
+    {
+        public uint cbSize;
+        public uint Flags;
+        public uint FlagsEx;
+        public IntPtr hwndParent;
+        public IntPtr InstallMsgHandler;
+        public IntPtr InstallMsgHandlerContext;
+        public IntPtr FileQueue;
+        public IntPtr ClassInstallReserved;
+        public IntPtr Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SP_DEVINFO_DATA { public uint cbSize; public Guid ClassGuid; public uint DevInst; public IntPtr Reserved; }
@@ -505,12 +575,15 @@ public sealed class ShareEngine
     }
 
     [DllImport("setupapi.dll", SetLastError = true)] private static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, string? enumerator, IntPtr hwndParent, uint flags);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDeviceInstallParams(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DEVINSTALL_PARAMS deviceInstallParams);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiSetDeviceInstallParams(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DEVINSTALL_PARAMS deviceInstallParams);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiEnumDeviceInfo(IntPtr deviceInfoSet, uint memberIndex, ref SP_DEVINFO_DATA deviceInfoData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDeviceInstanceId(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, StringBuilder deviceInstanceId, int deviceInstanceIdSize, out int requiredSize);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiBuildDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiEnumDriverInfo(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType, uint memberIndex, ref SP_DRVINFO_DATA driverInfoData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDriverInfoDetail(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, IntPtr driverInfoDetailData, uint driverInfoDetailDataSize, out uint requiredSize);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiSetSelectedDriver(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData);
+    [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, uint flags, out bool needReboot);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiCallClassInstaller(uint installFunction, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
