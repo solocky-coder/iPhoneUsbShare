@@ -7,12 +7,15 @@ $Patch = Join-Path $PSScriptRoot 'patches\apple-ncm-function-selection.patch'
 $Out = Join-Path $Root 'artifacts\AppleNcm'
 
 if (Test-Path $Work) { Remove-Item $Work -Recurse -Force }
+if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 git clone --depth 1 --branch $Ref --recurse-submodules $RepoUrl $Work
 Push-Location $Work
 try {
+    git apply --check --whitespace=nowarn $Patch
     git apply --whitespace=nowarn $Patch
+
     $inf = Join-Path $Work 'host\UsbNcmSample.inf'
     $text = Get-Content $inf -Raw
     $text = $text -replace 'UsbNcmSample', 'AppleNcm'
@@ -25,20 +28,33 @@ try {
     $text = $text -replace 'UsbNcm.SVCDESC', 'AppleNcm.SVCDESC'
     $text = $text -replace '(?m)^\s*%UsbNcm.DeviceDesc%=UsbNcm_Device,USB\\MS_COMP_WINNCM\s*$', '%AppleNcm.DeviceDesc%=AppleNcm_Device,USB\VID_05AC&PID_12AB&MI_02'
     $text = $text -replace '(?m)^\s*;.*USB\\Class_02&SubClass_0d&Prot_00.*$', ''
-    $text = $text -replace '\[Strings\]', '[Strings]'
     $text = $text -replace 'UsbNcm.DeviceDesc', 'AppleNcm.DeviceDesc'
     $text = $text -replace 'UsbNcm Host Device', 'Apple iPhone NCM Host Device'
     Set-Content -Path $inf -Value $text -Encoding Unicode
 
-    $sln = Join-Path $Work 'usbncm.sln'
-    if (-not (Get-Command msbuild.exe -ErrorAction SilentlyContinue)) {
-        $vswhere = '${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe'
+    $msbuild = $null
+    $cmd = Get-Command msbuild.exe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $msbuild = $cmd.Source
+    }
+
+    if (-not $msbuild) {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
         if (Test-Path $vswhere) {
             $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            if ($vs) { & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 }
+            if ($vs) {
+                $candidate = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+                if (Test-Path $candidate) { $msbuild = $candidate }
+            }
         }
     }
-    msbuild (Join-Path $Work 'projects\host\host.vcxproj') /m /p:Configuration=Release /p:Platform=x64 /p:TargetName=AppleNcm
+
+    if (-not $msbuild) {
+        throw 'MSBuild.exe was not found on the Windows runner.'
+    }
+
+    & $msbuild (Join-Path $Work 'projects\host\host.vcxproj') /m /p:Configuration=Release /p:Platform=x64 /p:TargetName=AppleNcm
+    if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
 
     $sys = Get-ChildItem -Path $Work -Filter '*.sys' -Recurse | Where-Object { $_.Name -match 'UsbNcmSample|AppleNcm' } | Select-Object -First 1
     if (-not $sys) { throw 'AppleNcm.sys was not produced.' }
