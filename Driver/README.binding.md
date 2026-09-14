@@ -5,7 +5,7 @@ Apple's `netaapl64.inf` / `Netaapl` driver and reports Code 10 instead of loadin
 `AppleNcm.sys`.
 
 The application may still contain SetupAPI selection logic, but the standalone
-installer now deliberately separates package staging from driver selection.
+installer deliberately separates package staging from driver selection.
 
 ## What the installer does
 
@@ -13,20 +13,26 @@ installer now deliberately separates package staging from driver selection.
 
 1. requires `AppleNcm.inf`, `AppleNcm.sys`, and `AppleNcm.cat` to exist together;
 2. registers the package with `pnputil /add-driver ... /install`;
-3. requires `devcon.exe` and runs `devcon update <AppleNcm.inf> <MI_02>` against
-   the exact observed PDO;
-4. enumerates that same instance with `pnputil /enum-devices ... /drivers`.
+3. requires `devcon.exe` and runs `devcon update <AppleNcm.inf> <hardware-ID>` for
+   the observed `USB\\VID_05AC&PID_12AB&MI_02` function;
+4. enumerates the resulting device with `pnputil /enum-devices ... /drivers`.
+
+The important distinction is that DevCon's `update` operation takes a **hardware
+ID**, not a full device-instance ID. The script therefore uses
+`USB\\VID_05AC&PID_12AB&MI_02` by default. `-DeviceInstanceId` is only used for
+post-update inspection when a full instance ID is supplied.
 
 A successful `pnputil /add-driver` is **not** considered proof of binding. If
 DevCon is unavailable, the script stops rather than giving a false-positive
 bring-up result.
 
-The default target is:
+The default target hardware ID is:
 
 `USB\\VID_05AC&PID_12AB&MI_02`
 
-Use `-DeviceInstanceId` for another descriptor-identified instance when testing
-a different Apple device/PID.
+Use `-HardwareId` when testing a different Apple VID/PID/function. Use
+`-DeviceInstanceId` only when you want the final `pnputil` query pinned to a
+specific PDO instance.
 
 ## Build artifact contract
 
@@ -39,8 +45,8 @@ a different Apple device/PID.
 
 The generated INF is an exact first-bring-up match for the observed MI_02
 function. It is intentionally not the project's final compatibility rule.
-The build now fails if the catalog or required INF service/hardware-id entries
-are missing, rather than emitting a package that cannot be reliably installed.
+The build fails if the catalog or required INF service/hardware-id entries are
+missing, rather than emitting a package that cannot be reliably installed.
 
 The generated INF names `AppleNcm.cat`, matching its `CatalogFile` entry. This
 keeps the staged package internally consistent for signing/installation.
