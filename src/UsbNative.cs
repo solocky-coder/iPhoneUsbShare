@@ -107,15 +107,58 @@ internal static class UsbNative
                 var cfg = new byte[total];
                 var cn = usb_get_descriptor(h, 0x02, index, cfg, cfg.Length);
                 if (cn < 9) continue;
+
                 var pos = 0;
                 while (pos + 9 <= cn)
                 {
-                    var len = cfg[pos]; var type = cfg[pos + 1];
+                    var len = cfg[pos];
+                    var type = cfg[pos + 1];
                     if (len < 2 || pos + len > cn) break;
+
                     if (type == 0x04 && len >= 9 && cfg[pos + 5] == 0x02 && cfg[pos + 6] == 0x0D)
                     {
                         var number = cfg[pos + 2];
-                        if (!result.Contains(number)) result.Add(number);
+                        var alt = cfg[pos + 3];
+                        var endpointCount = cfg[pos + 4];
+                        var hasInterruptEndpoint = false;
+
+                        // CDC-NCM has an interrupt notification endpoint on the
+                        // communication/control interface used for tethering.
+                        // The other Apple CDC-NCM-like function (RemoteXPC) does
+                        // not expose that endpoint. Both advertise class 02/subclass
+                        // 0D, so class matching alone incorrectly selected MI_04.
+                        // Inspect the endpoint descriptors belonging to this exact
+                        // interface/alternate setting and require an interrupt IN
+                        // endpoint for the tethering control function.
+                        var scan = pos + len;
+                        var seenEndpoints = 0;
+                        while (scan + 2 <= cn && seenEndpoints < endpointCount)
+                        {
+                            var slen = cfg[scan];
+                            var stype = cfg[scan + 1];
+                            if (slen < 2 || scan + slen > cn) break;
+                            if (stype == 0x04) break; // next interface
+                            if (stype == 0x05 && slen >= 7)
+                            {
+                                seenEndpoints++;
+                                var address = cfg[scan + 2];
+                                var attributes = cfg[scan + 3];
+                                var transferType = attributes & 0x03;
+                                var directionIn = (address & 0x80) != 0;
+                                if (transferType == 0x03 && directionIn) hasInterruptEndpoint = true;
+                            }
+                            scan += slen;
+                        }
+
+                        if (alt == 0 && hasInterruptEndpoint && !result.Contains(number))
+                        {
+                            result.Add(number);
+                            AppendRaw($"USB NCM selection: tethering control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn=true");
+                        }
+                        else if (alt == 0)
+                        {
+                            AppendRaw($"USB NCM selection: rejected CDC-NCM control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn={hasInterruptEndpoint}");
+                        }
                     }
                     pos += len;
                 }
