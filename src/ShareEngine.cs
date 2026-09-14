@@ -252,6 +252,34 @@ public sealed class ShareEngine
             .Cast<PnpDevice>()
             .ToList();
 
+        // EnumeratorClass is read by usbccgp when it enumerates the composite
+        // device.  Merely changing the registry value does not guarantee that
+        // the already-running composite devnode rebuilds its child PDOs.  The
+        // previous run proved this: the descriptors contained NCM interfaces
+        // 2 and 4, but Windows exposed only MI_00/01/03/05.  Force a targeted
+        // ConfigMgr re-enumeration of this exact Apple composite devnode before
+        // giving up.  This is a devnode/PnP operation only; it does not change
+        // the Apple USB mode or configuration.
+        if (targets.Count == 0)
+        {
+            WriteLog("NCM child PDOs are missing; forcing targeted usbccgp devnode re-enumeration before driver replacement.");
+            if (ReenumerateAppleCompositeDevNode(out var reenumError))
+            {
+                await Task.Delay(1500);
+                appleChildren = FindPnP("USB\\VID_05AC&PID_", null).ToList();
+                targets = controlInterfaces
+                    .Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n))
+                    .Where(d => d is not null)
+                    .Cast<PnpDevice>()
+                    .ToList();
+                WriteLog($"usbccgp targeted re-enumeration completed; NCM child targets now: {targets.Count}.");
+            }
+            else
+            {
+                WriteLog($"usbccgp targeted re-enumeration failed, ConfigMgr error={reenumError}.");
+            }
+        }
+
         foreach (var target in targets)
         {
             LogPnpDriverState(target.Id, "NCM candidate");
@@ -261,7 +289,7 @@ public sealed class ShareEngine
 
         if (targets.Count == 0)
         {
-            WriteLog("CDC-NCM descriptors were present, but Windows exposed no matching Apple MI child nodes.");
+            WriteLog("CDC-NCM descriptors were present, but Windows still exposed no matching Apple MI child nodes after targeted usbccgp re-enumeration.");
             LogAppleInterfaces();
             return;
         }
@@ -587,6 +615,55 @@ public sealed class ShareEngine
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiCallClassInstaller(uint installFunction, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
+
+    private const uint CR_SUCCESS = 0x00000000;
+    private const uint CM_REENUMERATE_NORMAL = 0x00000000;
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+
+    private static bool ReenumerateAppleCompositeDevNode(out uint error)
+    {
+        error = 0;
+        try
+        {
+            var phone = FindAppleDevice();
+            if (phone is null)
+            {
+                error = 1;
+                WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found.");
+                return false;
+            }
+
+            var cr = CM_Locate_DevNodeW(out var devInst, phone.Id, 0);
+            if (cr != CR_SUCCESS)
+            {
+                error = cr;
+                WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
+                return false;
+            }
+
+            cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
+            error = cr;
+            if (cr != CR_SUCCESS)
+            {
+                WriteStaticLog($"ConfigMgr: CM_Reenumerate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
+                return false;
+            }
+
+            WriteStaticLog($"ConfigMgr: re-enumerated Apple composite devnode {phone.Id} successfully.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = 1;
+            WriteStaticLog($"ConfigMgr re-enumeration failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
 
     private static void ConfigureUsbCgpEnumerator(string pnpId)
     {
