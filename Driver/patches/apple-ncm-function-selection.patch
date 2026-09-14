@@ -1,0 +1,115 @@
+*** Begin Patch
+*** Update File: host/device.cpp
+@@
+-    BYTE controlInterfaceNumber = 0;
+-    BYTE dataInterfaceNumber = 0;
++    // iOS 16+ can expose more than one CDC-NCM function.  The first one is
++    // the tethering function and has a CDC interrupt endpoint; the later
++    // RemoteXPC function does not.  Do not let a later data interface
++    // overwrite the data interface belonging to the selected control
++    // interface.  The CDC Union descriptor is the authoritative pairing.
++    BYTE controlInterfaceNumber = 0xff;
++    BYTE dataInterfaceNumber = 0xff;
++    BYTE unionDataInterfaceNumber = 0xff;
++    BOOLEAN selectedNcmFunction = FALSE;
+@@
+-                if ((pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_COMM) &&
+-                    (pIfDescriptor->bInterfaceSubClass == USB_CDC_INTERFACE_SUBCLASS_NCM))
++                if ((pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_COMM) &&
++                    (pIfDescriptor->bInterfaceSubClass == USB_CDC_INTERFACE_SUBCLASS_NCM))
+                 {
+-                    NCM_RETURN_NT_STATUS_IF_FALSE_MSG(pIfDescriptor->bNumEndpoints == 1,
+-                                                      STATUS_DEVICE_HARDWARE_ERROR,
+-                                                      "Bad UsbInterfaceDescriptor");
+-
+-                    controlInterfaceNumber = pIfDescriptor->bInterfaceNumber;
++                    // A CDC-NCM control interface used for tethering has an
++                    // interrupt notification endpoint.  iOS RemoteXPC's
++                    // NCM-like function has none; skip it.
++                    if (!selectedNcmFunction && pIfDescriptor->bNumEndpoints == 1)
++                    {
++                        controlInterfaceNumber = pIfDescriptor->bInterfaceNumber;
++                        selectedNcmFunction = TRUE;
++                    }
+                 }
+                 else if ((pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_DATA) &&
+                          (pIfDescriptor->bInterfaceProtocol == USB_DATA_INTERFACE_PROTOCOL_NCM) &&
+                          (pIfDescriptor->bAlternateSetting == 1))
+                 {
+-                    NCM_RETURN_NT_STATUS_IF_FALSE_MSG(pIfDescriptor->bNumEndpoints == 2,
+-                                                      STATUS_DEVICE_HARDWARE_ERROR,
+-                                                      "Bad UsbInterfaceDescriptor");
+-
+-                    dataInterfaceNumber = pIfDescriptor->bInterfaceNumber;
++                    if (pIfDescriptor->bNumEndpoints == 2 &&
++                        dataInterfaceNumber == 0xff)
++                    {
++                        dataInterfaceNumber = pIfDescriptor->bInterfaceNumber;
++                    }
+                 }
+@@
+                 switch (pCsFuncDescriptor->bDescriptorSubtype)
+                 {
++                    case USB_CS_INTF_SUBTYPE_CDC_UNION:
++                    {
++                        if (selectedNcmFunction &&
++                            pCurrDescriptor->bLength >= sizeof(USB_CDC_CS_UNION_DESCRIPTOR))
++                        {
++                            PUSB_CDC_CS_UNION_DESCRIPTOR pUnion =
++                                (PUSB_CDC_CS_UNION_DESCRIPTOR)pCsFuncDescriptor;
++
++                            if (pUnion->bMasterInterface == controlInterfaceNumber)
++                            {
++                                unionDataInterfaceNumber = pUnion->bSlaveInterfaces[0];
++                            }
++                        }
++                        break;
++                    }
++
+                     // NCM functional descriptor 
+                     case USB_CS_NCM_FUNCTIONAL_DESCR_TYPE:
+                     {
+-                        NCM_RETURN_NT_STATUS_IF_FALSE_MSG(
+-                            pCsFuncDescriptor->bFunctionLength == sizeof(USB_NCM_CS_FUNCTIONAL_DESCRIPTOR),
+-                            STATUS_DEVICE_HARDWARE_ERROR,
+-                            "Bad UsbNcmFunctionalDescriptor");
+-
+-                        pNcmFunctionalDescr = (PUSB_NCM_CS_FUNCTIONAL_DESCRIPTOR) pCsFuncDescriptor;
++                        if (selectedNcmFunction && pNcmFunctionalDescr == nullptr)
++                        {
++                            NCM_RETURN_NT_STATUS_IF_FALSE_MSG(
++                                pCsFuncDescriptor->bFunctionLength == sizeof(USB_NCM_CS_FUNCTIONAL_DESCRIPTOR),
++                                STATUS_DEVICE_HARDWARE_ERROR,
++                                "Bad UsbNcmFunctionalDescriptor");
++
++                            pNcmFunctionalDescr = (PUSB_NCM_CS_FUNCTIONAL_DESCRIPTOR) pCsFuncDescriptor;
++                        }
+ 
+                         break;
+                     }
+@@
+-                        NCM_RETURN_NT_STATUS_IF_FALSE_MSG(
+-                            pCsFuncDescriptor->bFunctionLength == sizeof(USB_ECM_CS_NET_FUNCTIONAL_DESCRIPTOR),
+-                            STATUS_DEVICE_HARDWARE_ERROR,
+-                            "Bad UsbEcmFunctionalDescriptor");
+-
+-                        pEcmFunctionalDescr = (PUSB_ECM_CS_NET_FUNCTIONAL_DESCRIPTOR) pCsFuncDescriptor;
++                        if (selectedNcmFunction && pEcmFunctionalDescr == nullptr)
++                        {
++                            NCM_RETURN_NT_STATUS_IF_FALSE_MSG(
++                                pCsFuncDescriptor->bFunctionLength == sizeof(USB_ECM_CS_NET_FUNCTIONAL_DESCRIPTOR),
++                                STATUS_DEVICE_HARDWARE_ERROR,
++                                "Bad UsbEcmFunctionalDescriptor");
++
++                            pEcmFunctionalDescr = (PUSB_ECM_CS_NET_FUNCTIONAL_DESCRIPTOR) pCsFuncDescriptor;
++                        }
+@@
+     }
++
++    if (unionDataInterfaceNumber != 0xff)
++    {
++        dataInterfaceNumber = unionDataInterfaceNumber;
++    }
+ 
+     BYTE numInterfaces = WdfUsbTargetDeviceGetNumInterfaces(m_WdfUsbTargetDevice);
+*** End Patch

@@ -1,0 +1,6 @@
+; First bring-up template. The build script converts the Microsoft NCM host INF
+; into AppleNcm.inf and binds the observed tethering function:
+; USB\VID_05AC&PID_12AB&MI_02
+;
+; This exact ID is intentionally temporary. Do not use it as the final
+; compatibility definition for the project.
