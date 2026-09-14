@@ -35,6 +35,14 @@ try {
 
     while (currDescrptorOffset < pDescriptors->wTotalLength)
     {
+        if (pCurrDescriptor->bLength == 0 ||
+            currDescrptorOffset + pCurrDescriptor->bLength > pDescriptors->wTotalLength)
+        {
+            NCM_RETURN_NT_STATUS_IF_FALSE_MSG(FALSE,
+                                              STATUS_DEVICE_HARDWARE_ERROR,
+                                              "Bad USB descriptor length");
+        }
+
         switch (pCurrDescriptor->bDescriptorType)
         {
             case USB_INTERFACE_DESCRIPTOR_TYPE:
@@ -48,23 +56,25 @@ try {
                 if ((pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_COMM) &&
                     (pIfDescriptor->bInterfaceSubClass == USB_CDC_INTERFACE_SUBCLASS_NCM))
                 {
-                    // iOS 16+ exposes two NCM-like functions.  The tethering
-                    // function has the CDC notification interrupt endpoint;
-                    // RemoteXPC does not. Select only the first such function.
+                    // iOS 16+ exposes two NCM-like CDC functions.  The actual
+                    // tethering function has one interrupt endpoint; the later
+                    // RemoteXPC function has none. Select the first interrupt-
+                    // backed control interface and never let the second one
+                    // overwrite it.
                     if (!selectedNcmFunction && pIfDescriptor->bNumEndpoints == 1)
                     {
                         controlInterfaceNumber = pIfDescriptor->bInterfaceNumber;
                         selectedNcmFunction = TRUE;
                     }
                 }
-                else if ((pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_DATA) &&
+                else if (selectedNcmFunction &&
+                         (pIfDescriptor->bInterfaceClass == USB_CDC_INTERFACE_CLASS_DATA) &&
                          (pIfDescriptor->bInterfaceProtocol == USB_DATA_INTERFACE_PROTOCOL_NCM) &&
-                         (pIfDescriptor->bAlternateSetting == 1))
+                         (pIfDescriptor->bAlternateSetting == 1) &&
+                         (pIfDescriptor->bNumEndpoints == 2) &&
+                         (dataInterfaceNumber == 0xff))
                 {
-                    if (pIfDescriptor->bNumEndpoints == 2 && dataInterfaceNumber == 0xff)
-                    {
-                        dataInterfaceNumber = pIfDescriptor->bInterfaceNumber;
-                    }
+                    dataInterfaceNumber = pIfDescriptor->bInterfaceNumber;
                 }
 
                 break;
@@ -83,9 +93,9 @@ try {
                 {
                     case USB_CS_INTF_SUBTYPE_CDC_UNION:
                     {
-                        // Union Functional Descriptor: master control interface
-                        // followed by its subordinate data interface. Parse the
-                        // first slave only; Apple exposes a one-to-one pair here.
+                        // The Union descriptor is the authoritative control ->
+                        // data relationship. Only accept the union belonging
+                        // to the control interface we selected above.
                         if (selectedNcmFunction && pCurrDescriptor->bLength >= 5)
                         {
                             const PUCHAR bytes = (PUCHAR)pCurrDescriptor;
@@ -138,6 +148,17 @@ try {
     {
         dataInterfaceNumber = unionDataInterfaceNumber;
     }
+
+    NCM_RETURN_NT_STATUS_IF_FALSE_MSG(selectedNcmFunction &&
+                                      controlInterfaceNumber != 0xff &&
+                                      dataInterfaceNumber != 0xff,
+                                      STATUS_DEVICE_HARDWARE_ERROR,
+                                      "Apple NCM function was not fully identified");
+
+    KdPrint(("AppleNcm: descriptor selection control=%u data=%u unionData=%u\n",
+             controlInterfaceNumber,
+             dataInterfaceNumber,
+             unionDataInterfaceNumber));
 
 '@
     $deviceText = $deviceText.Substring(0, $start) + $replacement + $deviceText.Substring($end)

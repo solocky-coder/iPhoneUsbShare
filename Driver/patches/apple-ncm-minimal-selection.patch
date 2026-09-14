@@ -1,0 +1,16 @@
+# Applied by Driver/build-driver.ps1 to Microsoft NCM-Driver-for-Windows
+# release_2004 host/device.cpp.
+#
+# Minimal Apple-specific change:
+#   - select the first CDC NCM communication interface with one interrupt
+#     endpoint (iOS tethering function);
+#   - associate its data interface using the CDC Union descriptor;
+#   - do not let the later iOS RemoteXPC NCM-like function overwrite the
+#     selected control/data pair;
+#   - retain Microsoft's existing WDF interface lookup and configuration
+#     lifecycle, including initial alt-setting 0 selection.
+#   - emit diagnostic information showing the WDF interface count and actual
+#     USB interface numbers/settings presented by usbccgp.
+#
+# No EvtDevicePrepareHardware replacement is performed and the data interface
+# is NOT forced to alternate setting 1 during initial configuration.

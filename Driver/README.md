@@ -1,23 +1,56 @@
-# AppleNcm.sys — first driver bring-up
+# AppleNcm.sys — minimal function-selection bring-up
 
-This is the first real kernel-mode USB CDC-NCM host driver for iPhoneUsbShare.
+This build is a deliberately small modification of Microsoft's NCM host driver
+sample (`NCM-Driver-for-Windows`, `release_2004`). It does **not** replace
+`EvtDevicePrepareHardware` or invent a new USB configuration sequence.
 
-## Design
+## What changed
 
-The driver is based on Microsoft's open-source NCM host driver sample (`NCM-Driver-for-Windows`, `release_2004`) and keeps its KMDF + NetAdapterCx + NCM datapath. The Apple-specific change fixes function selection when an iOS device exposes two CDC-NCM functions: the tethering function has a CDC interrupt endpoint and its CDC Union descriptor points to the matching data interface; the second iOS 16+ NCM function is the RemoteXPC function and has no interrupt endpoint.
+The Microsoft sample's descriptor scan can let the second iOS 16+ NCM-like
+function overwrite the first one. Apple devices observed by iPhoneUsbShare
+expose:
 
-The first bring-up INF intentionally binds only the exact interface observed in the supplied ActivityLog:
+- control interface 2, CDC NCM, one interrupt endpoint, Union 2 -> 3
+- data interface 3, alternate 1, two bulk endpoints
+- control interface 4, CDC NCM, no interrupt endpoint, Union 4 -> 5
+- data interface 5, alternate 1, two bulk endpoints
 
-`USB\\VID_05AC&PID_12AB&MI_02`
+The driver now:
 
-This is a **temporary bring-up match**, not the final compatibility policy. It is necessary to prove the kernel driver can replace `netaapl64.sys` on the observed Windows 10/iPad combination. Once the driver reaches D0 and creates a NetAdapter, the next step is to move the binding mechanism to a non-PID-based Apple CDC-NCM identification path.
+1. selects the first CDC NCM communication interface that has one interrupt
+   endpoint;
+2. uses the CDC Union descriptor to associate that control interface with its
+   subordinate data interface;
+3. records only the first NCM/ECM functional descriptor after the selected
+   function is identified;
+4. maps the resulting USB interface numbers to the actual WDF interface objects
+   using `WdfUsbInterfaceGetInterfaceNumber()`;
+5. logs the WDF interface count, actual interface numbers, and setting counts.
 
-## Build
+## What deliberately did NOT change
 
-The build script fetches the Microsoft source at a pinned commit/branch, applies the Apple function-selection change and INF, then builds the host project with the Windows WDK. The output is renamed to `AppleNcm.sys` and the package is emitted as an unsigned development package.
+- No wholesale `EvtDevicePrepareHardware` replacement.
+- No assumption that WDF interface index 1 means USB interface 3.
+- No forced alternate-setting 1 during initial configuration.
+- Microsoft's existing `SelectConfiguration()` / `SelectSetting()` lifecycle is
+  retained.
+- No registry ranking hack.
+- No unsigned companion INF.
+- No AppleLowerFilter modification.
+- The C# application remains responsible for Apple USB mode switching and ICS.
 
-For a normal Windows 10 x64 machine, install only in a test-signing/development environment until the package is signed appropriately.
+The diagnostic output we need from the next test is:
 
-## Important
+```text
+AppleNcm: descriptor selection control=2 data=3 unionData=3
+AppleNcm: WDF interface count=N
+AppleNcm: WDF interface[0] usbIf=... settings=...
+...
+```
 
-This package is intentionally a driver bring-up. It does not modify the iPhone USB mode state, registry driver ranking, or AppleLowerFilter. The existing C# application remains responsible for switching the device into NCM mode and for ICS.
+The decisive success criterion remains:
+
+`USB\\VID_05AC&PID_12AB&MI_02 -> AppleNcm.sys -> Device Started -> NetAdapter appears`
+
+The INF still uses the exact observed MI_02 hardware ID temporarily. That is
+only a first bring-up match; it is not the project's final compatibility rule.
