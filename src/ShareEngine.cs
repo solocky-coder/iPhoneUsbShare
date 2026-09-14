@@ -278,9 +278,7 @@ public sealed class ShareEngine
         {
             try
             {
-                candidatesInf = Directory.EnumerateFiles(
-                    Path.Combine(windows, "System32", "DriverStore", "FileRepository"),
-                    "usbncm.inf", SearchOption.AllDirectories).ToList();
+                candidatesInf = Directory.EnumerateFiles(Path.Combine(windows, "System32", "DriverStore", "FileRepository"), "usbncm.inf", SearchOption.AllDirectories).ToList();
             }
             catch { }
         }
@@ -324,9 +322,7 @@ public sealed class ShareEngine
     {
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                "root\\CIMV2",
-                "SELECT PNPDeviceID, Name, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
+            using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT PNPDeviceID, Name, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
             foreach (ManagementObject o in searcher.Get())
             {
                 var id = o["PNPDeviceID"]?.ToString() ?? "";
@@ -654,11 +650,8 @@ public sealed class ShareEngine
     private const uint CR_SUCCESS = 0x00000000;
     private const uint CM_REENUMERATE_NORMAL = 0x00000000;
 
-    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
-
-    [DllImport("cfgmgr32.dll")]
-    private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+    [DllImport("cfgmgr32.dll")] private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
     private static bool ReenumerateAppleCompositeDevNode(out uint error)
     {
@@ -666,38 +659,16 @@ public sealed class ShareEngine
         try
         {
             var phone = FindAppleDevice();
-            if (phone is null)
-            {
-                error = 1;
-                WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found.");
-                return false;
-            }
-
+            if (phone is null) { error = 1; WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found."); return false; }
             var cr = CM_Locate_DevNodeW(out var devInst, phone.Id, 0);
-            if (cr != CR_SUCCESS)
-            {
-                error = cr;
-                WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
-                return false;
-            }
-
+            if (cr != CR_SUCCESS) { error = cr; WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {phone.Id}, CR=0x{cr:X8}"); return false; }
             cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
             error = cr;
-            if (cr != CR_SUCCESS)
-            {
-                WriteStaticLog($"ConfigMgr: CM_Reenumerate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
-                return false;
-            }
-
+            if (cr != CR_SUCCESS) { WriteStaticLog($"ConfigMgr: CM_Reenumerate_DevNode failed for {phone.Id}, CR=0x{cr:X8}"); return false; }
             WriteStaticLog($"ConfigMgr: re-enumerated Apple composite devnode {phone.Id} successfully.");
             return true;
         }
-        catch (Exception ex)
-        {
-            error = 1;
-            WriteStaticLog($"ConfigMgr re-enumeration failed: {ex.GetType().Name}: {ex.Message}");
-            return false;
-        }
+        catch (Exception ex) { error = 1; WriteStaticLog($"ConfigMgr re-enumeration failed: {ex.GetType().Name}: {ex.Message}"); return false; }
     }
 
     private static void ConfigureUsbCgpEnumerator(string pnpId)
@@ -714,13 +685,28 @@ public sealed class ShareEngine
             if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
             {
                 var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
-                if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false);
-                else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+                if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false); else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
                 WriteStaticLog($"Removed AppleLowerFilter from {pnpId}.");
             }
             WriteStaticLog($"usbccgp EnumeratorClass set to 02 00 00 on {drv}; re-enumeration will regenerate CDC compatible IDs.");
         }
         catch (Exception ex) { WriteStaticLog($"usbccgp EnumeratorClass update failed: {ex.GetType().Name}: {ex.Message}"); throw; }
+    }
+
+    private static void ConfigureUsbDevice(PnpDevice phone)
+    {
+        using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{phone.Id}", writable: true) ?? throw new InvalidOperationException("Cannot open the Apple USB PnP registry key.");
+        var drv = baseKey.GetValue("Driver") as string;
+        if (string.IsNullOrWhiteSpace(drv)) throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
+        using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true) ?? throw new InvalidOperationException("Cannot open the usbccgp software key.");
+        sw.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
+        var lower = baseKey.GetValue("LowerFilters") as string[];
+        if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
+        {
+            var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false); else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+        }
+        SetConfig(phone.Id, SafeIndexValue, "0"); RestartDevice(phone.Id);
     }
 
     private static void SetConfig(string pnpId, string original, string alt)
@@ -785,7 +771,6 @@ public sealed class ShareEngine
     }
 
     private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && n.OperationalStatus == OperationalStatus.Up);
-
     private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.OperationalStatus == OperationalStatus.Up && (n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)) && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211);
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
@@ -800,14 +785,21 @@ public sealed class ShareEngine
         }
     }
 
-    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_", null)
-        .Where(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-        .FirstOrDefault();
+    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_", null).Where(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
+
+    private static string GetApplePid(string id)
+    {
+        var marker = "PID_";
+        var start = id.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) throw new InvalidOperationException($"Unable to determine Apple USB PID from PnP ID: {id}");
+        start += marker.Length;
+        var end = id.IndexOf('&', start);
+        return (end < 0 ? id[start..] : id[start..end]).Trim();
+    }
 
     private static void LogAppleInterfaces()
     {
-        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null))
-            WriteStaticLog($"Apple USB PnP node: {d.Id} | {d.Name}");
+        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null)) WriteStaticLog($"Apple USB PnP node: {d.Id} | {d.Name}");
     }
 
     private static bool TryGetInterfaceNumber(string id, out int number)
