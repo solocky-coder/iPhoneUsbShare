@@ -86,3 +86,9 @@ The GitHub Actions package builds the self-contained Windows 10 x64 application 
 
 ### Current build path
 The old Apple Mobile Device Ethernet driver files remain in the repository for historical/reference purposes, but the current NCM path does not select them.
+
+## Latest NCM implementation note
+
+The Windows USB stack may expose Apple's NCM union as ordinary `VID_05AC&PID_xxxx&MI_nn` child nodes rather than a PnP ID containing `CDC_0D`, especially on Windows 10. The application therefore identifies NCM from the live USB descriptors, maps the descriptor interface number to the corresponding PnP child, and selects Microsoft's `UsbNcm` driver through SetupAPI. It does not hard-code `MI_02`, `MI_04`, or an Apple PID.
+
+The first NCM control function is preferred because the iOS 16+ dual-function layout identifies the function with the interrupt endpoint as the tethering function; the second function is the RemoteXPC channel and is not expected to become a usable NIC.

@@ -215,15 +215,36 @@ public sealed class ShareEngine
 
     private async Task BindUsbNcmDriverAsync()
     {
-        // After SET_MODE(3), iOS re-enumerates the composite device. With
-        // usbccgp CDC enumeration enabled, the NCM control/data pair appears
-        // as a CDC_0D interface collection (typically with an MI_ number).
-        // Do not bind UsbNcm to an arbitrary Apple interface: wait for the
-        // actual NCM PDOs to appear.
-        var candidates = await WaitForAppleNcmInterfacesAsync(35);
-        if (candidates.Count == 0)
+        // Do not identify the NCM function from a Windows-generated CDC_0D
+        // hardware ID. Windows 10 can expose the same CDC union as plain
+        // VID/PID/MI child nodes. Identify the tethering function from the
+        // actual USB descriptors, then map its interface number to the PnP
+        // child. The first NCM control interface with an interrupt endpoint
+        // is the tethering function; the later NCM function is RemoteXPC.
+        var controlInterfaces = await UsbNative.GetNcmControlInterfacesAsync();
+        if (controlInterfaces.Length == 0)
         {
-            WriteLog("No Apple CDC_0D NCM interface collection appeared after the mode switch.");
+            WriteLog("USB descriptors expose no CDC-NCM control interface after mode 5.");
+            LogAppleInterfaces();
+            return;
+        }
+
+        foreach (var n in controlInterfaces)
+            WriteLog($"USB descriptor NCM control interface: {n}");
+
+        var appleChildren = FindPnP("USB\\VID_05AC&PID_", null).ToList();
+        var targets = controlInterfaces
+            .Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n))
+            .Where(d => d is not null)
+            .Cast<PnpDevice>()
+            .ToList();
+
+        foreach (var target in targets)
+            LogPnpDriverState(target.Id, "NCM candidate");
+
+        if (targets.Count == 0)
+        {
+            WriteLog("CDC-NCM descriptors were present, but Windows exposed no matching Apple MI child nodes.");
             LogAppleInterfaces();
             return;
         }
@@ -231,7 +252,8 @@ public sealed class ShareEngine
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidatesInf = new[]
         {
-            Path.Combine(windows, "INF", "usbncm.inf")
+            Path.Combine(windows, "INF", "usbncm.inf"),
+            Path.Combine(windows, "INF", "netncm.inf")
         }.Where(File.Exists).ToList();
         if (candidatesInf.Count == 0)
         {
@@ -243,31 +265,35 @@ public sealed class ShareEngine
             }
             catch { }
         }
+
         var inf = candidatesInf.FirstOrDefault();
         WriteLog($"Windows NCM INF: {inf ?? "not found"}");
-        if (inf is null) return;
+        if (inf is null)
+        {
+            WriteLog("No Microsoft UsbNcm INF is installed on this Windows system; leaving the existing Apple NCM driver untouched.");
+            return;
+        }
 
         var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
         WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
-        // iOS 16+ can expose two CDC-NCM functions. The first is the tethering
-        // function (it has the interrupt endpoint); the other is Apple's
-        // RemoteXPC function and may fail to start as a Windows NIC. We do not
-        // encode MI_02/MI_04: try the discovered CDC_0D collections in interface
-        // order and stop as soon as Windows creates a usable network adapter.
-        foreach (var target in candidates)
+        // Prefer the descriptor-identified tethering function. If Windows has
+        // more than one NCM child, try them in descriptor order; the RemoteXPC
+        // function normally has no interrupt endpoint and will simply fail to
+        // become a NIC, after which the tethering function is retained.
+        foreach (var target in targets)
         {
-            WriteLog($"Trying UsbNcm on Apple CDC_0D interface: {target.Id} | {target.Name}");
-            var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, target.Id, inf, 0x5, out var reboot);
-            var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-            WriteLog($"UsbNcm exact bind {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
-            if (!ok) continue;
+            WriteLog($"Selecting Microsoft UsbNcm for Apple NCM interface: {target.Id} | {target.Name}");
+            var changed = InstallSelectedNcmDriver(target.Id, inf, out var setupError);
+            WriteLog($"UsbNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
+            LogPnpDriverState(target.Id, "after UsbNcm selection");
+            if (!changed) continue;
 
-            await Task.Delay(1500);
-            var state = FindPnP(target.Id, null).FirstOrDefault();
-            WriteLog($"Selected NCM control state after bind: {state?.Name ?? "not found"}");
+            try { RestartDevice(target.Id); } catch (Exception ex) { WriteLog($"NCM child restart: {ex.Message}"); }
+            await Task.Delay(2000);
+            LogPnpDriverState(target.Id, "after NCM child restart");
 
             var adapter = FindPhoneAdapter();
             if (adapter?.OperationalStatus == OperationalStatus.Up)
@@ -275,48 +301,160 @@ public sealed class ShareEngine
                 WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}");
                 return;
             }
-
-            WriteLog("This CDC_0D function did not produce an active network adapter; trying the next discovered NCM function.");
+            WriteLog("Selected NCM function did not produce an active network adapter; trying the next descriptor-identified NCM function.");
         }
     }
 
-    private async Task<List<PnpDevice>> WaitForAppleNcmInterfacesAsync(int seconds)
+    private static void LogPnpDriverState(string instanceId, string prefix)
     {
-        var last = new List<PnpDevice>();
-        for (var i = 0; i < seconds; i++)
+        try
         {
-            last = FindAppleNcmInterfaces();
-            if (last.Count > 0)
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT PNPDeviceID, Name, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
+            foreach (ManagementObject o in searcher.Get())
             {
-                foreach (var d in last) WriteLog($"Apple CDC-NCM interface: {d.Id} | {d.Name}");
-                return last;
+                var id = o["PNPDeviceID"]?.ToString() ?? "";
+                if (!id.Equals(instanceId, StringComparison.OrdinalIgnoreCase)) continue;
+                WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | class={o["PNPClass"]} | service={o["Service"]} | driver={o["DriverVersion"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
+                return;
             }
-            await Task.Delay(1000);
         }
-        return last;
+        catch (Exception ex) { WriteStaticLog($"{prefix}: driver-state query failed: {ex.Message}"); }
     }
 
-    private static List<PnpDevice> FindAppleNcmInterfaces()
+    private static void WriteStaticLog(string message)
     {
-        return FindPnP("USB\\VID_05AC&PID_", null)
-            .Where(d => d.Id.Contains("&CDC_0D", StringComparison.OrdinalIgnoreCase) &&
-                        d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-            .OrderBy(d => GetInterfaceNumberOrMax(d.Id))
-            .ToList();
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
+        try { lock (LogFileLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), line + Environment.NewLine, new UTF8Encoding(false)); } catch { }
     }
 
-    private void LogAppleInterfaces()
+    private bool InstallSelectedNcmDriver(string instanceId, string infPath, out uint error)
     {
-        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null))
-            WriteLog($"Apple USB PnP node: {d.Id} | {d.Name}");
+        error = 0;
+        var emptyGuid = Guid.Empty;
+        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            error = (uint)Marshal.GetLastWin32Error();
+            return false;
+        }
+        try
+        {
+            for (uint index = 0; ; index++)
+            {
+                var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+                if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
+                {
+                    var e = Marshal.GetLastWin32Error();
+                    if (e == ERROR_NO_MORE_ITEMS) break;
+                    error = (uint)e;
+                    return false;
+                }
+                var id = GetDeviceInstanceId(h, ref devInfo);
+                if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
+                {
+                    error = (uint)Marshal.GetLastWin32Error();
+                    return false;
+                }
+                try
+                {
+                    for (uint driverIndex = 0; ; driverIndex++)
+                    {
+                        var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
+                        {
+                            var e = Marshal.GetLastWin32Error();
+                            if (e == ERROR_NO_MORE_ITEMS) break;
+                            error = (uint)e;
+                            return false;
+                        }
+                        var detail = GetDriverInfoDetail(h, ref devInfo, ref driver, out _);
+                        if (detail is null) continue;
+                        WriteStaticLog($"SetupAPI candidate for {instanceId}: {detail} | {driver.Description} | provider={driver.ProviderName}");
+                        if (!string.Equals(Path.GetFileName(detail), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
+                        {
+                            error = (uint)Marshal.GetLastWin32Error();
+                            return false;
+                        }
+                        if (!SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, ref devInfo))
+                        {
+                            error = (uint)Marshal.GetLastWin32Error();
+                            return false;
+                        }
+                        return true;
+                    }
+                }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
+                error = ERROR_NO_MORE_ITEMS;
+                return false;
+            }
+            error = ERROR_NO_SUCH_DEVINST;
+            return false;
+        }
+        finally { SetupDiDestroyDeviceInfoList(h); }
     }
 
-    private static int GetInterfaceNumberOrMax(string id) =>
-        TryGetInterfaceNumber(id, out var n) ? n : int.MaxValue;
+    private static string? GetDeviceInstanceId(IntPtr h, ref SP_DEVINFO_DATA devInfo)
+    {
+        var buffer = new StringBuilder(512);
+        return SetupDiGetDeviceInstanceId(h, ref devInfo, buffer, buffer.Capacity, out _) ? buffer.ToString() : null;
+    }
 
-    [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr hwndParent, string hardwareId, string fullInfPath, uint installFlags, [MarshalAs(UnmanagedType.Bool)] out bool rebootRequired);
+    private static string? GetDriverInfoDetail(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver, out int error)
+    {
+        error = 0;
+        uint requiredSize = 0;
+        SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, IntPtr.Zero, 0, out requiredSize);
+        var firstError = Marshal.GetLastWin32Error();
+        if (firstError != ERROR_INSUFFICIENT_BUFFER || requiredSize < NativeSpDrvInfoDetailSize) { error = firstError; return null; }
+        var bufferSize = checked((int)Math.Max(requiredSize, (uint)(NativeSpDrvInfoDetailSize + 2)));
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            Marshal.WriteInt32(buffer, (int)NativeSpDrvInfoDetailSize);
+            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, (uint)bufferSize, out requiredSize)) { error = Marshal.GetLastWin32Error(); return null; }
+            var infOffset = IntPtr.Size == 8 ? 536 : 532;
+            return Marshal.PtrToStringUni(IntPtr.Add(buffer, infOffset));
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static readonly int NativeSpDrvInfoDetailSize = IntPtr.Size == 8 ? 1576 : 1568;
+    private const uint DIGCF_PRESENT = 0x00000002;
+    private const uint DIGCF_ALLCLASSES = 0x00000004;
+    private const uint SPDIT_CLASSDRIVER = 0x00000001;
+    private const uint DIF_INSTALLDEVICE = 0x00000001;
+    private const int ERROR_NO_MORE_ITEMS = 259;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+    private const int ERROR_NO_SUCH_DEVINST = 433;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVINFO_DATA { public uint cbSize; public Guid ClassGuid; public uint DevInst; public IntPtr Reserved; }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DRVINFO_DATA
+    {
+        public uint cbSize; public uint DriverType; public IntPtr Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Description;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ManufacturerName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ProviderName;
+        public long DriverDate; public ulong DriverVersion;
+    }
+
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, string? enumerator, IntPtr hwndParent, uint flags);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiEnumDeviceInfo(IntPtr deviceInfoSet, uint memberIndex, ref SP_DEVINFO_DATA deviceInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDeviceInstanceId(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, StringBuilder deviceInstanceId, int deviceInstanceIdSize, out int requiredSize);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiBuildDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiEnumDriverInfo(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType, uint memberIndex, ref SP_DRVINFO_DATA driverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool SetupDiGetDriverInfoDetail(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, IntPtr driverInfoDetailData, uint driverInfoDetailDataSize, out uint requiredSize);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiSetSelectedDriver(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiCallClassInstaller(uint installFunction, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
 
     private void ConfigureUsbDevice(PnpDevice phone)
     {
@@ -423,6 +561,12 @@ public sealed class ShareEngine
         start += marker.Length;
         var end = id.IndexOf('&', start);
         return (end < 0 ? id[start..] : id[start..end]).Trim();
+    }
+
+    private static void LogAppleInterfaces()
+    {
+        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null))
+            WriteStaticLog($"Apple USB PnP node: {d.Id} | {d.Name}");
     }
 
     private static bool TryGetInterfaceNumber(string id, out int number)
