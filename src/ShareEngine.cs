@@ -147,7 +147,29 @@ public sealed class ShareEngine
             // bind Microsoft's UsbNcm driver to the unclaimed MI_04 control
             // interface instead of the MI_05 data interface.
             await BindUsbNcmDriverAsync();
-            await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 45, "USB Ethernet adapter");
+            try
+            {
+                await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 15, "USB Ethernet adapter");
+            }
+            catch
+            {
+                // A fresh iOS connection can perform a later USB reset. Re-arm
+                // the safe configuration and run the mode sequence once more.
+                WriteLog("USB Ethernet did not remain available on the first pass; restoring safe configuration and retrying the mode switch once.");
+                var current = FindAppleDevice();
+                if (current is null) throw;
+                SetConfig(current.Id, SafeIndexValue, "0");
+                RestartDevice(current.Id);
+                await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device after NCM retry reset");
+                DisablePhotoInterfaces();
+                var retryMode = await UsbNative.GetModeAsync();
+                WriteLog($"Retry GET_MODE: {retryMode ?? "unreachable"}");
+                if (retryMode != "3:3:3:0" && retryMode != "3:3:3") throw new InvalidOperationException("Apple USB device did not return to safe mode for the NCM retry.");
+                SetConfig(current.Id, NcmIndexValue, SafeIndexValue);
+                if (!await UsbNative.SetModeAsync(3)) throw new InvalidOperationException("Apple device rejected the CDC-NCM retry mode switch.");
+                await BindUsbNcmDriverAsync();
+                await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter after retry");
+            }
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             WriteLog($"USB Ethernet adapter is up: {adapter.Name}");
             DisablePhotoInterfaces();
@@ -193,55 +215,35 @@ public sealed class ShareEngine
 
     private async Task BindUsbNcmDriverAsync()
     {
-        var ncmInterfaces = await UsbNative.GetNcmControlInterfacesAsync();
-        WriteLog($"USB descriptor NCM control interfaces: {(ncmInterfaces.Length == 0 ? "none" : string.Join(", ", ncmInterfaces.Select(i => $"MI_{i:00}")))}");
-
-        var appleInterfaces = FindPnP("USB\\VID_05AC&PID_", null)
-            .Where(d => d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        foreach (var d in appleInterfaces) WriteLog($"Apple USB interface: {d.Id} | {d.Name}");
-
-        var controls = appleInterfaces
-            .Where(d => TryGetInterfaceNumber(d.Id, out var n) && ncmInterfaces.Contains(n))
-            .ToList();
-
-        // Compatibility fallback for devices whose descriptors become inaccessible
-        // while Windows is re-enumerating the composite device. These are only
-        // candidates; they are no longer tied to a particular Apple PID.
-        if (controls.Count == 0)
+        // After SET_MODE(3), iOS re-enumerates the composite device. With
+        // usbccgp CDC enumeration enabled, the NCM control/data pair appears
+        // as a CDC_0D interface collection (typically with an MI_ number).
+        // Do not bind UsbNcm to an arbitrary Apple interface: wait for the
+        // actual NCM PDOs to appear.
+        var candidates = await WaitForAppleNcmInterfacesAsync(35);
+        if (candidates.Count == 0)
         {
-            controls = appleInterfaces
-                .Where(d => d.Name.Contains("NCM", StringComparison.OrdinalIgnoreCase) ||
-                            d.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-        }
-
-        if (controls.Count == 0)
-        {
-            WriteLog("No Apple CDC-NCM control interface was visible; refusing to bind an arbitrary Apple interface.");
+            WriteLog("No Apple CDC_0D NCM interface collection appeared after the mode switch.");
+            LogAppleInterfaces();
             return;
         }
 
-        var target = controls[0];
-        WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
-
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-        var candidates = new[]
+        var candidatesInf = new[]
         {
-            Path.Combine(windows, "INF", "usbncm.inf"),
-            Path.Combine(windows, "INF", "netncm.inf")
+            Path.Combine(windows, "INF", "usbncm.inf")
         }.Where(File.Exists).ToList();
-        if (candidates.Count == 0)
+        if (candidatesInf.Count == 0)
         {
             try
             {
-                candidates = Directory.EnumerateFiles(
+                candidatesInf = Directory.EnumerateFiles(
                     Path.Combine(windows, "System32", "DriverStore", "FileRepository"),
                     "usbncm.inf", SearchOption.AllDirectories).ToList();
             }
             catch { }
         }
-        var inf = candidates.FirstOrDefault();
+        var inf = candidatesInf.FirstOrDefault();
         WriteLog($"Windows NCM INF: {inf ?? "not found"}");
         if (inf is null) return;
 
@@ -250,25 +252,67 @@ public sealed class ShareEngine
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
-        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, target.Id, inf, 0x5, out var reboot);
-        var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-        WriteLog($"UsbNcm exact bind {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
-        if (!ok)
+        // iOS 16+ can expose two CDC-NCM functions. The first is the tethering
+        // function (it has the interrupt endpoint); the other is Apple's
+        // RemoteXPC function and may fail to start as a Windows NIC. We do not
+        // encode MI_02/MI_04: try the discovered CDC_0D collections in interface
+        // order and stop as soon as Windows creates a usable network adapter.
+        foreach (var target in candidates)
         {
-            foreach (var hardwareId in new[] { "USB\\MS_COMP_WINNCM", "USB\\Class_02&SubClass_0d&Prot_00" })
-            {
-                ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareId, inf, 0x5, out reboot);
-                err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-                WriteLog($"UsbNcm fallback bind {hardwareId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
-                if (ok) break;
-                await Task.Delay(1000);
-            }
-        }
+            WriteLog($"Trying UsbNcm on Apple CDC_0D interface: {target.Id} | {target.Name}");
+            var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, target.Id, inf, 0x5, out var reboot);
+            var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
+            WriteLog($"UsbNcm exact bind {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+            if (!ok) continue;
 
-        await Task.Delay(1500);
-        var state = FindPnP(target.Id, null).FirstOrDefault();
-        WriteLog($"Selected NCM control state after bind: {state?.Name ?? "not found"}");
+            await Task.Delay(1500);
+            var state = FindPnP(target.Id, null).FirstOrDefault();
+            WriteLog($"Selected NCM control state after bind: {state?.Name ?? "not found"}");
+
+            var adapter = FindPhoneAdapter();
+            if (adapter?.OperationalStatus == OperationalStatus.Up)
+            {
+                WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}");
+                return;
+            }
+
+            WriteLog("This CDC_0D function did not produce an active network adapter; trying the next discovered NCM function.");
+        }
     }
+
+    private async Task<List<PnpDevice>> WaitForAppleNcmInterfacesAsync(int seconds)
+    {
+        var last = new List<PnpDevice>();
+        for (var i = 0; i < seconds; i++)
+        {
+            last = FindAppleNcmInterfaces();
+            if (last.Count > 0)
+            {
+                foreach (var d in last) WriteLog($"Apple CDC-NCM interface: {d.Id} | {d.Name}");
+                return last;
+            }
+            await Task.Delay(1000);
+        }
+        return last;
+    }
+
+    private static List<PnpDevice> FindAppleNcmInterfaces()
+    {
+        return FindPnP("USB\\VID_05AC&PID_", null)
+            .Where(d => d.Id.Contains("&CDC_0D", StringComparison.OrdinalIgnoreCase) &&
+                        d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(d => GetInterfaceNumberOrMax(d.Id))
+            .ToList();
+    }
+
+    private void LogAppleInterfaces()
+    {
+        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null))
+            WriteLog($"Apple USB PnP node: {d.Id} | {d.Name}");
+    }
+
+    private static int GetInterfaceNumberOrMax(string id) =>
+        TryGetInterfaceNumber(id, out var n) ? n : int.MaxValue;
 
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

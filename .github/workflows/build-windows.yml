@@ -17,16 +17,6 @@ jobs:
         with:
           dotnet-version: '8.x'
 
-      - name: Verify Apple driver files
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          foreach ($f in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
-            $p = Join-Path 'NetDrivers' $f
-            if (-not (Test-Path $p)) { throw "Missing NetDrivers file: $p" }
-            Write-Host "$p : $((Get-Item $p).Length) bytes"
-          }
-
       - name: Publish EXE
         shell: pwsh
         run: |
@@ -56,10 +46,7 @@ jobs:
           $package = '.\artifacts\package'
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
-          foreach ($f in @('netaapl64.inf','netaapl64.sys','netaapl64.cat','WdfCoInstaller01009.dll')) {
-            Copy-Item (Join-Path 'NetDrivers' $f) (Join-Path $package $f) -Force
-          }
-          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'libusb-win32 1.4.0.2`r`nApple Mobile Device Ethernet driver files from NetDrivers'
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'libusb-win32 1.4.0.2`r`nWindows UsbNcm is an in-box Windows network class driver.'
           Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
           Get-Item .\artifacts\iPhoneUsbShare-win-x64.zip | Select-Object FullName,Length
 

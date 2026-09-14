@@ -45,7 +45,7 @@ with an iPhone or iPad using a data-capable cable.
 ## Important testing note
 
 The upstream project reports testing on one iPhone / iOS / Windows combination. USB
-descriptors and PnP behavior can differ by model/iOS version. The USB discovery and NCM-interface selection are now capability-based: the Apple PID is discovered dynamically, and CDC-NCM control interfaces are selected from USB descriptors rather than hard-coded `MI_02`/`MI_04` values. The current Apple mode-switch protocol still assumes configuration values 2/4 and `SET_MODE 3`; those remain the next compatibility layer to make fully descriptor/profile driven.
+descriptors and PnP behavior can differ by model/iOS version. The USB discovery and NCM-interface selection are now capability-based: the Apple PID is discovered dynamically, and CDC-NCM is selected from the Windows PnP `CDC_0D` interface collections created by `usbccgp`, rather than hard-coded `MI_02`/`MI_04` values. The Apple mode-switch sequence intentionally follows the proven Windows path: safe configuration 2 → restart → verify `GET_MODE` → arm configuration 4 → `SET_MODE(3)`.
 
 If a model reports a different PID/configuration, the constants should be moved into a
 device-profile table rather than blindly switching it.
@@ -71,11 +71,18 @@ This repository includes `.github/workflows/build-windows.yml`. On GitHub, open 
 
 ## iPad Air 2 support
 
-The application recognizes Apple USB PID `12AB` (in addition to iPhone PID `12A8`) and uses the same CDC-NCM control path only after the Apple USB device has been detected. The iPad Air 2 observation remains useful as a test case, but it is no longer a special-case requirement in the code. Because iPadOS 15+ behavior across models has not been exhaustively tested, the application must verify the actual USB mode/control protocol instead of claiming universal compatibility from the PID alone.
+The application does not define compatibility by Apple PID. It discovers the connected Apple VID `05AC` device and only proceeds when the device exposes the required mode-switch control path and Windows subsequently enumerates a CDC-NCM (`CDC_0D`) function. The iPad Air 2 observation remains useful as a test case, but it is no longer a special-case requirement in the code. Because iPadOS 15+ behavior across models has not been exhaustively tested, the application must verify the actual USB mode/control protocol instead of claiming universal compatibility from the PID alone.
 
+
+
+### NCM / OS compatibility
+
+This transport is only available on Apple OS versions/devices that actually expose the CDC-NCM mode. The referenced upstream research documents the two-function CDC-NCM behavior beginning with iOS 16, so **iOS/iPadOS 15 is not a compatibility claim for this implementation**; an iOS/iPadOS 15 device may switch modes but still never expose a `CDC_0D` NCM function. The app therefore fails at the capability-detection step instead of treating a PID as proof of compatibility.
+
+Windows 10 supports USB NCM host operation on supported releases; Microsoft documents CDC/NCM support and the `UsbNcm.sys`/`UsbNcm.inf` driver path, while the CDC enumeration setting is required on Windows 10.
 
 ### Build package revision
-The GitHub Actions package includes the compile fixes for USB adapter detection, required .NET namespaces, and the bundled Apple Ethernet driver path for Windows 10 testing.
+The GitHub Actions package builds the self-contained Windows 10 x64 application and bundles only the libusb runtime needed for the user-space mode switch; the NCM network function is intended to use Windows’ in-box `UsbNcm` driver.
 
 ### Current build path
-The workflow now packages the Apple Mobile Device Ethernet driver files from `NetDrivers` for the Windows 10 iPad Air 2 test path.
+The old Apple Mobile Device Ethernet driver files remain in the repository for historical/reference purposes, but the current NCM path does not select them.
