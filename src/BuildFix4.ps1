@@ -8,27 +8,69 @@ if ($start -lt 0 -or $end -lt 0) { throw 'BuildFix4: BindUsbNcmDriverAsync ancho
 $replacement = @'
     private async Task BindUsbNcmDriverAsync()
     {
-        var controls = FindPnP("VID_05AC&PID_12AB", null)
-            .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
-        if (controls.Count == 0)
+        // SET_MODE(3) can be accepted before usbccgp has finished
+        // re-enumerating configuration 5. Do not give up after one PnP scan.
+        // MI_02 is the valid CDC-NCM control interface: its descriptor has
+        // exactly one interrupt endpoint. MI_04 has zero endpoints.
+        List<PnpDevice> controls = new();
+        var restartAttempted = false;
+
+        for (var attempt = 1; attempt <= 30; attempt++)
         {
-            WriteLog("No iPad NCM control interface (MI_02/MI_04) visible.");
-            return;
+            controls = FindPnP("VID_05AC&PID_12AB", null)
+                .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (controls.Count > 0)
+            {
+                foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
+                break;
+            }
+
+            if (attempt == 1 || attempt % 5 == 0)
+            {
+                WriteLog($"Waiting for iPad NCM control interfaces (attempt {attempt}/30)…");
+                WriteLog($"Current USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}; mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
+                var apple = FindAppleDevice();
+                WriteLog($"Current Apple PnP device: {apple?.Id ?? "not found"}");
+            }
+
+            // If SET_MODE was accepted but Windows has not created the
+            // configuration-5 child interfaces after ~2.5 seconds, force one
+            // PnP restart of the Apple parent and continue polling.
+            if (!restartAttempted && attempt == 6)
+            {
+                restartAttempted = true;
+                var apple = FindAppleDevice();
+                if (apple is not null)
+                {
+                    WriteLog($"NCM interfaces still absent; restarting Apple device once: {apple.Id}");
+                    try
+                    {
+                        RestartDevice(apple.Id);
+                        WriteLog("Apple device restart requested; continuing NCM interface polling.");
+                    }
+                    catch (Exception ex)
+                    {
+                        WriteLog($"Apple device restart for NCM re-enumeration failed: {ex.Message}");
+                    }
+                }
+            }
+
+            await Task.Delay(500);
         }
 
-        // Prefer MI_02: captured CDC-NCM descriptors show MI_02 has one
-        // interrupt endpoint, while MI_04 has zero endpoints.
+        if (controls.Count == 0)
+        {
+            WriteLog("No iPad NCM control interface (MI_02/MI_04) visible after re-enumeration polling.");
+            WriteLog($"Final USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}; mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
+            throw new InvalidOperationException("Apple accepted CDC-NCM mode, but Windows did not expose MI_02/MI_04. The device did not finish CDC-NCM re-enumeration.");
+        }
+
         var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase))
                      ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase));
         if (target is null) return;
-
-        var hardwareId = target.Id;
-        var lastSlash = hardwareId.LastIndexOf('\\');
-        if (lastSlash > 0) hardwareId = hardwareId[..lastSlash];
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
-        WriteLog($"NCM hardware ID for driver matching: {hardwareId}");
 
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidates = new[]
@@ -50,41 +92,27 @@ $replacement = @'
         WriteLog($"Windows NCM INF: {inf ?? "not found"}");
         if (inf is null) return;
 
-        var before = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /drivers");
-        WriteLog($"NCM driver ranking query exit code: {before.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(before.Output)) WriteLog($"NCM driver ranking: {before.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(before.Error)) WriteLog($"NCM driver ranking error: {before.Error.Trim()}");
-
         var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
         WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
-        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareId, inf, 0x5, out var reboot);
+        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, target.Id, inf, 0x5, out var reboot);
         var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-        WriteLog($"UsbNcm hardware-ID bind {hardwareId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+        WriteLog($"UsbNcm exact bind {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
         if (!ok)
         {
-            foreach (var id in new[] { "USB\\MS_COMP_WINNCM", "USB\\Class_02&SubClass_0d&Prot_00" })
+            foreach (var hardwareId in new[] { "USB\\MS_COMP_WINNCM", "USB\\Class_02&SubClass_0d&Prot_00" })
             {
-                ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, id, inf, 0x5, out reboot);
+                ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hardwareId, inf, 0x5, out reboot);
                 err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-                WriteLog($"UsbNcm fallback bind {id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+                WriteLog($"UsbNcm fallback bind {hardwareId}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
                 if (ok) break;
+                await Task.Delay(1000);
             }
         }
 
-        var restart = RunAllowRestart("pnputil.exe", $"/restart-device \"{target.Id}\"");
-        WriteLog($"NCM control restart exit code: {restart.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"NCM control restart output: {restart.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"NCM control restart error: {restart.Error.Trim()}");
-        await Task.Delay(2500);
-
-        var after = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /drivers");
-        WriteLog($"NCM driver ranking after bind exit code: {after.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(after.Output)) WriteLog($"NCM driver ranking after bind: {after.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(after.Error)) WriteLog($"NCM driver ranking after bind error: {after.Error.Trim()}");
-
+        await Task.Delay(1500);
         var state = FindPnP(target.Id, null).FirstOrDefault();
         WriteLog($"Selected NCM control state after bind: {state?.Name ?? "not found"}");
     }
