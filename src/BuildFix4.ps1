@@ -35,9 +35,6 @@ $replacement = @'
                 WriteLog($"Current Apple PnP device: {apple?.Id ?? "not found"}");
             }
 
-            // If SET_MODE was accepted but Windows has not created the
-            // configuration-5 child interfaces after ~2.5 seconds, force one
-            // PnP restart of the Apple parent and continue polling.
             if (!restartAttempted && attempt == 6)
             {
                 restartAttempted = true;
@@ -72,6 +69,15 @@ $replacement = @'
         if (target is null) return;
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
 
+        // UpdateDriverForPlugAndPlayDevicesW takes a HARDWARE ID, not a
+        // device-instance ID. The previous code passed the full instance ID
+        // (including the final '\\<instance>' portion), which caused Windows
+        // to reject the bind with 0xE000020B. Use the MI_02 hardware ID here.
+        var targetHardwareId = target.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase)
+            ? "USB\\VID_05AC&PID_12AB&MI_02"
+            : "USB\\VID_05AC&PID_12AB&MI_04";
+        WriteLog($"NCM target hardware ID: {targetHardwareId}");
+
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidates = new[]
         {
@@ -97,9 +103,9 @@ $replacement = @'
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
-        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, target.Id, inf, 0x5, out var reboot);
+        var ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, targetHardwareId, inf, 0x5, out var reboot);
         var err = ok ? 0u : (uint)Marshal.GetLastWin32Error();
-        WriteLog($"UsbNcm exact bind {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
+        WriteLog($"UsbNcm exact bind {targetHardwareId} -> {target.Id}: {(ok ? "success" : "failed")}, Win32Error={err}, rebootRequired={reboot}");
         if (!ok)
         {
             foreach (var hardwareId in new[] { "USB\\MS_COMP_WINNCM", "USB\\Class_02&SubClass_0d&Prot_00" })
@@ -110,6 +116,19 @@ $replacement = @'
                 if (ok) break;
                 await Task.Delay(1000);
             }
+        }
+
+        // Give PnP time to apply the new driver, then explicitly restart the
+        // selected NCM control devnode if necessary.
+        await Task.Delay(1500);
+        try
+        {
+            RestartDevice(target.Id);
+            WriteLog($"NCM control device restart requested: {target.Id}");
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"NCM control device restart failed: {ex.Message}");
         }
 
         await Task.Delay(1500);
