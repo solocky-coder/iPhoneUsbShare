@@ -27,14 +27,6 @@ jobs:
             Write-Host "$p : $((Get-Item $p).Length) bytes"
           }
 
-      - name: Apply safe NCM binding patch
-        shell: pwsh
-        run: .\src\BuildFix4.ps1
-
-      - name: Normalize generated C# source
-        shell: pwsh
-        run: .\src\FixGeneratedShareEngine.ps1
-
       - name: Publish EXE
         shell: pwsh
         run: |

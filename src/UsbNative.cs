@@ -8,7 +8,6 @@ internal static class UsbNative
 {
     private const string Dll = "libusb0.dll";
     private const int Vid = 0x05AC;
-    private static readonly ushort[] SupportedPids = { 0x12A8, 0x12AB };
 
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern void usb_init();
     [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_find_busses();
@@ -35,6 +34,7 @@ internal static class UsbNative
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
     public static Task<bool> SetConfigurationAsync(int configuration) => Task.Run(() => SetConfiguration(configuration));
     public static Task<int?> GetConfigurationAsync() => Task.Run(GetConfiguration);
+    public static Task<int[]> GetNcmControlInterfacesAsync() => Task.Run(GetNcmControlInterfaces);
 
     private static ModeDiagnostic GetModeDiagnostic()
     {
@@ -44,7 +44,7 @@ internal static class UsbNative
             var buses = usb_find_busses();
             var devices = usb_find_devices();
             var dev = FindDeviceAfterEnumeration(out var pid);
-            if (dev == IntPtr.Zero) return new ModeDiagnostic(buses, devices, false, null, false, 0, 4, null, $"libusb enumerated {buses} bus(es) and {devices} device(s), but no Apple 05AC device with PID 12A8/12AB was visible.");
+            if (dev == IntPtr.Zero) return new ModeDiagnostic(buses, devices, false, null, false, 0, 4, null, $"libusb enumerated {buses} bus(es) and {devices} device(s), but no Apple USB device (VID 05AC) was visible.");
             var id = $"05AC:{pid:X4}";
             var h = usb_open(dev);
             if (h == IntPtr.Zero) return new ModeDiagnostic(buses, devices, true, id, false, 0, 4, null, $"libusb sees {id}, but usb_open() failed: {GetUsbError()}");
@@ -83,6 +83,44 @@ internal static class UsbNative
             var current = GetConfiguration(h);
             AppendRaw($"USB SET_CONFIGURATION({configuration}): result={result}, current={(current?.ToString() ?? "unknown")}, error={(result < 0 ? GetUsbError() : "none")}");
             return result == 0;
+        }
+        finally { usb_close(h); }
+    }
+
+    private static int[] GetNcmControlInterfaces()
+    {
+        var h = OpenPhone();
+        if (h == IntPtr.Zero) return Array.Empty<int>();
+        try
+        {
+            var result = new List<int>();
+            var dev = new byte[18];
+            var dn = usb_get_descriptor(h, 0x01, 0, dev, dev.Length);
+            var configCount = dn >= 18 ? dev[17] : (byte)0;
+            for (byte index = 0; index < configCount; index++)
+            {
+                var head = new byte[9];
+                var hn = usb_get_descriptor(h, 0x02, index, head, head.Length);
+                if (hn < 9) continue;
+                var total = head[2] | (head[3] << 8);
+                if (total < 9 || total > 8192) continue;
+                var cfg = new byte[total];
+                var cn = usb_get_descriptor(h, 0x02, index, cfg, cfg.Length);
+                if (cn < 9) continue;
+                var pos = 0;
+                while (pos + 9 <= cn)
+                {
+                    var len = cfg[pos]; var type = cfg[pos + 1];
+                    if (len < 2 || pos + len > cn) break;
+                    if (type == 0x04 && len >= 9 && cfg[pos + 5] == 0x02 && cfg[pos + 6] == 0x0D)
+                    {
+                        var number = cfg[pos + 2];
+                        if (!result.Contains(number)) result.Add(number);
+                    }
+                    pos += len;
+                }
+            }
+            return result.ToArray();
         }
         finally { usb_close(h); }
     }
@@ -157,5 +195,5 @@ internal static class UsbNative
     private static IntPtr OpenPhone() { var dev = FindDevice(); return dev == IntPtr.Zero ? IntPtr.Zero : usb_open(dev); }
     private static IntPtr FindDevice() => FindDevice(out _);
     private static IntPtr FindDevice(out ushort foundPid) { foundPid = 0; usb_init(); usb_find_busses(); usb_find_devices(); return FindDeviceAfterEnumeration(out foundPid); }
-    private static IntPtr FindDeviceAfterEnumeration(out ushort foundPid) { foundPid = 0; var bus = usb_get_busses(); while (bus != IntPtr.Zero) { var device = Marshal.ReadIntPtr(bus, BusDevicesOffset); while (device != IntPtr.Zero) { var descriptor = device + DeviceDescriptorOffset; var vid = (ushort)Marshal.ReadInt16(descriptor, 8); var pid = (ushort)Marshal.ReadInt16(descriptor, 10); if (vid == Vid && SupportedPids.Contains(pid)) { foundPid = pid; return device; } device = Marshal.ReadIntPtr(device, 0); } bus = Marshal.ReadIntPtr(bus, 0); } return IntPtr.Zero; }
+    private static IntPtr FindDeviceAfterEnumeration(out ushort foundPid) { foundPid = 0; var bus = usb_get_busses(); while (bus != IntPtr.Zero) { var device = Marshal.ReadIntPtr(bus, BusDevicesOffset); while (device != IntPtr.Zero) { var descriptor = device + DeviceDescriptorOffset; var vid = (ushort)Marshal.ReadInt16(descriptor, 8); var pid = (ushort)Marshal.ReadInt16(descriptor, 10); if (vid == Vid) { foundPid = pid; return device; } device = Marshal.ReadIntPtr(device, 0); } bus = Marshal.ReadIntPtr(bus, 0); } return IntPtr.Zero; }
 }

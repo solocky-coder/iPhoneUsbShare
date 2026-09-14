@@ -17,8 +17,6 @@ public sealed class ShareEngine
 {
     public event EventHandler<string>? Log;
     private const string Vendor = "05AC";
-    private const string IphonePid = "12A8";
-    private const string IpadPid = "12AB";
     private const string SafeIndexValue = "2";
     private const string NcmIndexValue = "4";
     private const string Subnet = "192.168.137.";
@@ -195,19 +193,36 @@ public sealed class ShareEngine
 
     private async Task BindUsbNcmDriverAsync()
     {
-        var controls = FindPnP("VID_05AC&PID_12AB", null)
-            .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
+        var ncmInterfaces = await UsbNative.GetNcmControlInterfacesAsync();
+        WriteLog($"USB descriptor NCM control interfaces: {(ncmInterfaces.Length == 0 ? "none" : string.Join(", ", ncmInterfaces.Select(i => $"MI_{i:00}")))}");
+
+        var appleInterfaces = FindPnP("USB\\VID_05AC&PID_", null)
+            .Where(d => d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
             .ToList();
-        foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
+        foreach (var d in appleInterfaces) WriteLog($"Apple USB interface: {d.Id} | {d.Name}");
+
+        var controls = appleInterfaces
+            .Where(d => TryGetInterfaceNumber(d.Id, out var n) && ncmInterfaces.Contains(n))
+            .ToList();
+
+        // Compatibility fallback for devices whose descriptors become inaccessible
+        // while Windows is re-enumerating the composite device. These are only
+        // candidates; they are no longer tied to a particular Apple PID.
         if (controls.Count == 0)
         {
-            WriteLog("No iPad NCM control interface (MI_02/MI_04) visible.");
+            controls = appleInterfaces
+                .Where(d => d.Name.Contains("NCM", StringComparison.OrdinalIgnoreCase) ||
+                            d.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        if (controls.Count == 0)
+        {
+            WriteLog("No Apple CDC-NCM control interface was visible; refusing to bind an arbitrary Apple interface.");
             return;
         }
 
-        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
-                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase));
-        if (target is null) return;
+        var target = controls[0];
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
 
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
@@ -289,7 +304,7 @@ public sealed class ShareEngine
 
     private static void DisablePhotoInterfaces()
     {
-        foreach (var d in FindPnP("VID_05AC&PID_12A", "WPD"))
+        foreach (var d in FindPnP("VID_05AC&PID_", "WPD"))
         {
             if (!d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase)) continue;
             var r = RunAllowRestart("pnputil.exe", $"/disable-device \"{d.Id}\"");
@@ -352,8 +367,28 @@ public sealed class ShareEngine
         }
     }
 
-    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_12A", null).FirstOrDefault();
-    private static string GetApplePid(string id) => id.Contains("PID_12AB", StringComparison.OrdinalIgnoreCase) ? IpadPid : IphonePid;
+    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_", null)
+        .Where(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
+        .FirstOrDefault();
+
+    private static string GetApplePid(string id)
+    {
+        var marker = "PID_";
+        var start = id.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0) throw new InvalidOperationException($"Unable to determine Apple USB PID from PnP ID: {id}");
+        start += marker.Length;
+        var end = id.IndexOf('&', start);
+        return (end < 0 ? id[start..] : id[start..end]).Trim();
+    }
+
+    private static bool TryGetInterfaceNumber(string id, out int number)
+    {
+        number = -1;
+        var marker = "&MI_";
+        var start = id.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (start < 0 || start + marker.Length + 2 > id.Length) return false;
+        return int.TryParse(id.Substring(start + marker.Length, 2), System.Globalization.NumberStyles.HexNumber, null, out number);
+    }
 
     private static async Task WaitUntil(Func<bool> predicate, int seconds, string what)
     {
