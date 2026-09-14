@@ -119,27 +119,33 @@ $replacement = @'
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
                 WriteLog($"SetupAPI found target devnode: {id}");
-                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER))
                 {
                     error = (uint)Marshal.GetLastWin32Error();
                     return false;
                 }
                 try
                 {
+                    var candidateCount = 0;
                     for (uint driverIndex = 0; ; driverIndex++)
                     {
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
-                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_COMPATDRIVER, driverIndex, ref driver))
                         {
                             var e = Marshal.GetLastWin32Error();
                             if (e == ERROR_NO_MORE_ITEMS) break;
                             error = (uint)e;
                             return false;
                         }
+                        candidateCount++;
                         var detail = GetDriverInfoDetail(h, ref devInfo, ref driver);
-                        if (!detail.HasValue) continue;
+                        if (!detail.HasValue)
+                        {
+                            WriteLog($"SetupAPI compatible candidate {driverIndex}: detail lookup failed, Win32Error={Marshal.GetLastWin32Error()}");
+                            continue;
+                        }
                         var detailInf = detail.Value.InfFileName;
-                        WriteLog($"SetupAPI class candidate {driverIndex}: {detailInf} | {driver.Description}");
+                        WriteLog($"SetupAPI compatible candidate {driverIndex}: {detailInf} | {driver.Description}");
                         if (!string.Equals(Path.GetFileName(detailInf), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
@@ -147,18 +153,19 @@ $replacement = @'
                             return false;
                         }
                         WriteLog($"SetupAPI selected UsbNcm driver: {detailInf}");
-                        if (!SetupDiInstallDevice(h, IntPtr.Zero, ref devInfo))
+                        if (!SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, ref devInfo))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
                             return false;
                         }
-                        WriteLog("SetupAPI installed the selected UsbNcm driver on the target devnode.");
+                        WriteLog("SetupAPI class installer installed the selected UsbNcm driver on the target devnode.");
                         return true;
                     }
+                    WriteLog($"SetupAPI compatible-driver enumeration ended with {candidateCount} candidate(s).");
                     error = ERROR_NO_MORE_ITEMS;
                     return false;
                 }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER); }
             }
             error = ERROR_NO_SUCH_DEVINST;
             return false;
@@ -193,7 +200,8 @@ $replacement = @'
 
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_ALLCLASSES = 0x00000004;
-    private const uint SPDIT_CLASSDRIVER = 0x00000001;
+    private const uint SPDIT_COMPATDRIVER = 0x00000002;
+    private const uint DIF_INSTALLDEVICE = 0x00000001;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const int ERROR_NO_SUCH_DEVINST = 433;
@@ -249,7 +257,7 @@ $replacement = @'
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiSetSelectedDriver(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData);
     [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiInstallDevice(IntPtr installerHandle, IntPtr hwndParent, ref SP_DEVINFO_DATA deviceInfoData);
+    private static extern bool SetupDiCallClassInstaller(uint installFunction, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData);
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", SetLastError = true)]
