@@ -1,34 +1,75 @@
-using System.IO;
+using Microsoft.Win32;
+using System.Diagnostics;
+using System.Management;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using System.Text;
 
 namespace iPhoneUsbShare;
 
 internal static class UsbNative
 {
-    private const string Dll = "libusb0.dll";
     private const int Vid = 0x05AC;
+    private const string WinUsbInterfaceGuid = "{8D4D9C11-3B6B-4D3A-9B0B-7E8B2E2E0C51}";
+    private const uint DIGCF_PRESENT = 0x00000002;
+    private const uint DIGCF_ALLCLASSES = 0x00000004;
+    private const uint DI_ENUMSINGLEINF = 0x00000002;
+    private const uint DI_QUIETINSTALL = 0x00000020;
+    private const uint DI_FLAGSEX_ALLOWEXCLUDEDDRVS = 0x00000001;
+    private const uint SPDIT_CLASSDRIVER = 0x00000001;
+    private const uint DIF_INSTALLDEVICE = 0x00000001;
+    private const int ERROR_NO_MORE_ITEMS = 259;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+    private const int ERROR_NO_SUCH_DEVINST = 433;
+    private const int INSTALLFLAG_FORCE = 0x00000001;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+    private const int DIGCF_DEVICEINTERFACE = 0x00000010;
+    private const uint SPDRP_SERVICE = 0x00000004;
 
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern void usb_init();
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_find_busses();
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_find_devices();
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern IntPtr usb_get_busses();
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern IntPtr usb_open(IntPtr dev);
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_close(IntPtr dev);
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_control_msg(IntPtr dev, int requestType, int request, int value, int index, [Out] byte[] bytes, int size, int timeout);
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_get_descriptor(IntPtr dev, byte type, byte index, [Out] byte[] bytes, int size);
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern int usb_set_configuration(IntPtr dev, int configuration);
-    [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)] private static extern IntPtr usb_strerror();
-
-    private static readonly int Ptr = IntPtr.Size;
-    private static readonly int BusDevicesOffset = Ptr * 2 + 512;
-    private static readonly int DeviceDescriptorOffset = Ptr * 3 + 512;
+    private static readonly Guid InterfaceGuid = Guid.Parse(WinUsbInterfaceGuid);
     private static readonly object LogLock = new();
+    private static readonly object InitLock = new();
+    private static bool migrationAttempted;
 
     internal sealed record ModeDiagnostic(int BusCount, int DeviceCount, bool DeviceEnumerated, string? DeviceId, bool OpenSucceeded, int ControlReturn, int ExpectedBytes, string? Mode, string Error);
 
-    public static bool IsReachable() { try { return FindDevice() != IntPtr.Zero; } catch { return false; } }
-    public static string? GetDeviceId() { try { var device = FindDevice(out var pid); return device == IntPtr.Zero ? null : $"05AC:{pid:X4}"; } catch { return null; } }
+    public static bool IsReachable()
+    {
+        try
+        {
+            EnsureWinUsbPath();
+            return FindWinUsbDevicePath() is not null;
+        }
+        catch (Exception ex)
+        {
+            AppendRaw($"WINUSB reachability check failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    public static string? GetDeviceId()
+    {
+        try
+        {
+            var p = FindAppleCompositeId();
+            if (p is null) return null;
+            var marker = "PID_";
+            var i = p.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (i < 0) return null;
+            i += marker.Length;
+            var end = p.IndexOf('&', i);
+            return $"05AC:{(end < 0 ? p[i..] : p[i..end])}";
+        }
+        catch { return null; }
+    }
+
     public static Task<string?> GetModeAsync() => Task.Run(() => { var d = GetModeDiagnostic(); if (d.Mode is null) AppendDiagnostic(d); return d.Mode; });
     public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(GetModeDiagnostic);
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
@@ -36,207 +77,534 @@ internal static class UsbNative
     public static Task<int?> GetConfigurationAsync() => Task.Run(GetConfiguration);
     public static Task<int[]> GetNcmControlInterfacesAsync() => Task.Run(GetNcmControlInterfaces);
 
+    private static void EnsureWinUsbPath()
+    {
+        lock (InitLock)
+        {
+            if (!migrationAttempted) migrationAttempted = true;
+
+            var existing = FindWinUsbDevicePath();
+            if (existing is not null) return;
+
+            var parent = FindAppleCompositeId();
+            if (parent is null) return;
+
+            RemoveLegacyLibUsbFilter(parent);
+
+            var mi00 = FindAppleInterfaceId(parent, 0);
+            if (mi00 is null)
+            {
+                AppendRaw("WinUSB migration: MI_00 is not currently enumerated; waiting for Apple composite re-enumeration.");
+                return;
+            }
+
+            SetDeviceInterfaceGuid(mi00);
+            if (InstallWinUsbDriver(mi00))
+            {
+                AppendRaw($"WinUSB migration: installed WinUSB on {mi00}; restarting MI_00 once to publish the interface.");
+                RunAllowRestart("pnputil.exe", $"/restart-device \"{mi00}\"");
+            }
+
+            RemoveLegacyLibUsbService();
+        }
+    }
+
+    private static bool InstallWinUsbDriver(string instanceId)
+    {
+        var emptyGuid = Guid.Empty;
+        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        try
+        {
+            for (uint index = 0; ; index++)
+            {
+                var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+                if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
+                {
+                    var e = Marshal.GetLastWin32Error();
+                    if (e == ERROR_NO_MORE_ITEMS) break;
+                    return false;
+                }
+                var id = GetDeviceInstanceId(h, ref devInfo);
+                if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
+
+                var installParams = new SP_DEVINSTALL_PARAMS { cbSize = (uint)Marshal.SizeOf<SP_DEVINSTALL_PARAMS>(), DriverPath = string.Empty };
+                if (!SetupDiGetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
+                installParams.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
+                installParams.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
+                installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");
+                if (!SetupDiSetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER)) return false;
+
+                try
+                {
+                    for (uint driverIndex = 0; ; driverIndex++)
+                    {
+                        var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
+                        {
+                            var e = Marshal.GetLastWin32Error();
+                            if (e == ERROR_NO_MORE_ITEMS) break;
+                            return false;
+                        }
+
+                        var detail = GetDriverInfName(h, ref devInfo, ref driver);
+                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | inf={detail ?? "?"}");
+                        if (!string.Equals(Path.GetFileName(detail ?? ""), "winusb.inf", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
+                        {
+                            AppendRaw($"WinUSB driver selection failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}");
+                            return false;
+                        }
+                        if (!DiInstallDevice(IntPtr.Zero, h, ref devInfo, ref driver, 0, out var reboot))
+                        {
+                            AppendRaw($"WinUSB DiInstallDevice failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}, reboot={reboot}");
+                            return false;
+                        }
+                        AppendRaw($"WinUSB installed on {instanceId}; reboot={reboot}");
+                        return true;
+                    }
+                }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
+                return false;
+            }
+            return false;
+        }
+        finally { SetupDiDestroyDeviceInfoList(h); }
+    }
+
+    private static string? GetDriverInfName(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver)
+    {
+        var baseSize = Marshal.SizeOf<SP_DRVINFO_DETAIL_DATA>();
+        SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, IntPtr.Zero, 0, out var required);
+        if (required < (uint)baseSize) return null;
+        var buffer = Marshal.AllocHGlobal(checked((int)required));
+        try
+        {
+            Marshal.WriteInt32(buffer, baseSize);
+            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, required, out _)) return null;
+            var detail = Marshal.PtrToStructure<SP_DRVINFO_DETAIL_DATA>(buffer);
+            return detail.InfFileName;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static void SetDeviceInterfaceGuid(string instanceId)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{instanceId}\Device Parameters", writable: true);
+            if (key is null) return;
+            key.SetValue("DeviceInterfaceGUIDs", new[] { WinUsbInterfaceGuid }, RegistryValueKind.MultiString);
+            AppendRaw($"WinUSB migration: DeviceInterfaceGUIDs registered on {instanceId}: {WinUsbInterfaceGuid}");
+        }
+        catch (Exception ex) { AppendRaw($"WinUSB migration: failed to register DeviceInterfaceGUIDs: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static void RemoveLegacyLibUsbFilter(string parentId)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{parentId}", writable: true);
+            if (key is null) return;
+            var filters = key.GetValue("UpperFilters") as string[];
+            if (filters is null) return;
+            var remaining = filters.Where(x => !x.Equals("libusb0", StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (remaining.Length == filters.Length) return;
+            if (remaining.Length == 0) key.DeleteValue("UpperFilters", false);
+            else key.SetValue("UpperFilters", remaining, RegistryValueKind.MultiString);
+            AppendRaw($"WinUSB migration: removed libusb0 from UpperFilters on {parentId}.");
+            RunAllowRestart("pnputil.exe", $"/restart-device \"{parentId}\"");
+        }
+        catch (Exception ex) { AppendRaw($"WinUSB migration: UpperFilters cleanup failed: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static void RemoveLegacyLibUsbService()
+    {
+        try
+        {
+            RunAllowRestart("sc.exe", "stop libusb0");
+            RunAllowRestart("sc.exe", "delete libusb0");
+            var sys = Path.Combine(Environment.SystemDirectory, "drivers", "libusb0.sys");
+            try { if (File.Exists(sys)) File.Delete(sys); } catch { }
+            AppendRaw("WinUSB migration: removed legacy libusb0 service/driver artifacts where possible.");
+        }
+        catch (Exception ex) { AppendRaw($"WinUSB migration: libusb0 service cleanup failed: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
     private static ModeDiagnostic GetModeDiagnostic()
     {
         try
         {
-            usb_init();
-            var buses = usb_find_busses();
-            var devices = usb_find_devices();
-            var dev = FindDeviceAfterEnumeration(out var pid);
-            if (dev == IntPtr.Zero) return new ModeDiagnostic(buses, devices, false, null, false, 0, 4, null, $"libusb enumerated {buses} bus(es) and {devices} device(s), but no Apple USB device (VID 05AC) was visible.");
-            var id = $"05AC:{pid:X4}";
-            var h = usb_open(dev);
-            if (h == IntPtr.Zero) return new ModeDiagnostic(buses, devices, true, id, false, 0, 4, null, $"libusb sees {id}, but usb_open() failed: {GetUsbError()}");
+            var path = FindWinUsbDevicePath();
+            if (path is null) return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, "WinUSB control interface is not present.");
+            var id = GetDeviceId();
+            using var file = OpenDevice(path);
+            if (file.IsInvalid) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"CreateFile failed: {Marshal.GetLastWin32Error()}");
+            if (!WinUsb_Initialize(file, out var usb)) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"WinUsb_Initialize failed: {Marshal.GetLastWin32Error()}");
             try
             {
                 var buf = new byte[4];
-                var n = usb_control_msg(h, 0xC0, 0x45, 0, 0, buf, 4, 1000);
-                var bytes = n > 0 ? string.Join(" ", buf.Take(Math.Min(n, buf.Length)).Select(b => b.ToString("X2"))) : "";
-                if (n == 3)
+                var setup = new WINUSB_SETUP_PACKET { RequestType = 0xC0, Request = 0x45, Value = 0, Index = 0, Length = 4 };
+                if (!WinUsb_ControlTransfer(usb, setup, buf, (uint)buf.Length, out var transferred, IntPtr.Zero))
+                    return new ModeDiagnostic(0, 0, true, id, true, 0, 4, null, $"GET_MODE failed: {Marshal.GetLastWin32Error()}");
+                if (transferred == 3)
                 {
                     var mode3 = string.Join(":", buf.Take(3));
-                    if (mode3 == "5:3:3") DumpAllConfigurations(h, id);
-                    return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode3, $"GET_MODE returned 3 bytes (accepted iPad form): {bytes}");
+                    if (mode3 == "5:3:3") DumpAllConfigurations(usb, id ?? "05AC:????");
+                    return new ModeDiagnostic(0, 0, true, id, true, (int)transferred, 4, mode3, "GET_MODE returned 3 bytes via WinUSB.");
                 }
-                if (n != 4) return new ModeDiagnostic(buses, devices, true, id, true, n, 4, null, $"usb_open() succeeded for {id}, but GET_MODE (request 0x45) returned {n} byte(s): {bytes} ({GetUsbError()})");
+                if (transferred != 4) return new ModeDiagnostic(0, 0, true, id, true, (int)transferred, 4, null, $"GET_MODE returned {transferred} bytes.");
                 var mode = string.Join(":", buf);
-                if (mode == "5:3:3:0") DumpAllConfigurations(h, id);
-                return new ModeDiagnostic(buses, devices, true, id, true, n, 4, mode, $"GET_MODE succeeded: {bytes}");
+                if (mode == "5:3:3:0") DumpAllConfigurations(usb, id ?? "05AC:????");
+                return new ModeDiagnostic(0, 0, true, id, true, 4, 4, mode, "GET_MODE succeeded via WinUSB.");
             }
-            finally { usb_close(h); }
+            finally { WinUsb_Free(usb); }
         }
-        catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"libusb diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"WinUSB diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     private static bool SetConfiguration(int configuration)
     {
-        var h = OpenPhone();
-        if (h == IntPtr.Zero)
-        {
-            AppendRaw($"USB SET_CONFIGURATION({configuration}): usb_open failed: {GetUsbError()}");
-            return false;
-        }
+        var usb = OpenWinUsb(out var file);
+        if (usb == IntPtr.Zero) return false;
         try
         {
-            var result = usb_set_configuration(h, configuration);
-            var current = GetConfiguration(h);
-            AppendRaw($"USB SET_CONFIGURATION({configuration}): result={result}, current={(current?.ToString() ?? "unknown")}, error={(result < 0 ? GetUsbError() : "none")}");
-            return result == 0;
+            var setup = new WINUSB_SETUP_PACKET { RequestType = 0x00, Request = 0x09, Value = (ushort)configuration, Index = 0, Length = 0 };
+            var ok = WinUsb_ControlTransfer(usb, setup, Array.Empty<byte>(), 0, out _, IntPtr.Zero);
+            AppendRaw($"USB SET_CONFIGURATION({configuration}) via WinUSB: ok={ok}, error={(ok ? "none" : Marshal.GetLastWin32Error().ToString())}");
+            return ok;
         }
-        finally { usb_close(h); }
+        finally { WinUsb_Free(usb); file.Dispose(); }
     }
 
     private static int[] GetNcmControlInterfaces()
     {
-        var h = OpenPhone();
-        if (h == IntPtr.Zero) return Array.Empty<int>();
+        var usb = OpenWinUsb(out var file);
+        if (usb == IntPtr.Zero) return Array.Empty<int>();
         try
         {
             var result = new List<int>();
-            var dev = new byte[18];
-            var dn = usb_get_descriptor(h, 0x01, 0, dev, dev.Length);
-            var configCount = dn >= 18 ? dev[17] : (byte)0;
+            var dev = GetDescriptor(usb, 0x01, 0, 18);
+            var configCount = dev.Length >= 18 ? dev[17] : 0;
             for (byte index = 0; index < configCount; index++)
             {
-                var head = new byte[9];
-                var hn = usb_get_descriptor(h, 0x02, index, head, head.Length);
-                if (hn < 9) continue;
+                var head = GetDescriptor(usb, 0x02, index, 9);
+                if (head.Length < 9) continue;
                 var total = head[2] | (head[3] << 8);
                 if (total < 9 || total > 8192) continue;
-                var cfg = new byte[total];
-                var cn = usb_get_descriptor(h, 0x02, index, cfg, cfg.Length);
-                if (cn < 9) continue;
-
+                var cfg = GetDescriptor(usb, 0x02, index, total);
+                var cn = cfg.Length;
                 var pos = 0;
                 while (pos + 9 <= cn)
                 {
-                    var len = cfg[pos];
-                    var type = cfg[pos + 1];
+                    var len = cfg[pos]; var type = cfg[pos + 1];
                     if (len < 2 || pos + len > cn) break;
-
                     if (type == 0x04 && len >= 9 && cfg[pos + 5] == 0x02 && cfg[pos + 6] == 0x0D)
                     {
-                        var number = cfg[pos + 2];
-                        var alt = cfg[pos + 3];
-                        var endpointCount = cfg[pos + 4];
-                        var hasInterruptEndpoint = false;
-
-                        // CDC-NCM has an interrupt notification endpoint on the
-                        // communication/control interface used for tethering.
-                        // The other Apple CDC-NCM-like function (RemoteXPC) does
-                        // not expose that endpoint. Both advertise class 02/subclass
-                        // 0D, so class matching alone incorrectly selected MI_04.
-                        // Inspect the endpoint descriptors belonging to this exact
-                        // interface/alternate setting and require an interrupt IN
-                        // endpoint for the tethering control function.
-                        var scan = pos + len;
-                        var seenEndpoints = 0;
+                        var number = cfg[pos + 2]; var alt = cfg[pos + 3]; var endpointCount = cfg[pos + 4]; var hasInterruptEndpoint = false;
+                        var scan = pos + len; var seenEndpoints = 0;
                         while (scan + 2 <= cn && seenEndpoints < endpointCount)
                         {
-                            var slen = cfg[scan];
-                            var stype = cfg[scan + 1];
+                            var slen = cfg[scan]; var stype = cfg[scan + 1];
                             if (slen < 2 || scan + slen > cn) break;
-                            if (stype == 0x04) break; // next interface
+                            if (stype == 0x04) break;
                             if (stype == 0x05 && slen >= 7)
                             {
                                 seenEndpoints++;
-                                var address = cfg[scan + 2];
-                                var attributes = cfg[scan + 3];
-                                var transferType = attributes & 0x03;
-                                var directionIn = (address & 0x80) != 0;
-                                if (transferType == 0x03 && directionIn) hasInterruptEndpoint = true;
+                                var address = cfg[scan + 2]; var attributes = cfg[scan + 3];
+                                if ((attributes & 0x03) == 0x03 && (address & 0x80) != 0) hasInterruptEndpoint = true;
                             }
                             scan += slen;
                         }
-
                         if (alt == 0 && hasInterruptEndpoint && !result.Contains(number))
                         {
                             result.Add(number);
                             AppendRaw($"USB NCM selection: tethering control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn=true");
                         }
-                        else if (alt == 0)
-                        {
-                            AppendRaw($"USB NCM selection: rejected CDC-NCM control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn={hasInterruptEndpoint}");
-                        }
+                        else if (alt == 0) AppendRaw($"USB NCM selection: rejected CDC-NCM control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn={hasInterruptEndpoint}");
                     }
                     pos += len;
                 }
             }
             return result.ToArray();
         }
-        finally { usb_close(h); }
-    }
-
-    private static int? GetConfiguration(IntPtr h)
-    {
-        var buf = new byte[1];
-        var n = usb_control_msg(h, 0x80, 0x08, 0, 0, buf, 1, 1000);
-        if (n != 1) return null;
-        return buf[0];
+        finally { WinUsb_Free(usb); file.Dispose(); }
     }
 
     private static int? GetConfiguration()
     {
-        var h = OpenPhone();
-        if (h == IntPtr.Zero) return null;
-        try { return GetConfiguration(h); }
-        finally { usb_close(h); }
+        var usb = OpenWinUsb(out var file);
+        if (usb == IntPtr.Zero) return null;
+        try
+        {
+            var setup = new WINUSB_SETUP_PACKET { RequestType = 0x80, Request = 0x08, Value = 0, Index = 0, Length = 1 };
+            var buf = new byte[1];
+            return WinUsb_ControlTransfer(usb, setup, buf, 1, out var transferred, IntPtr.Zero) && transferred == 1 ? buf[0] : null;
+        }
+        finally { WinUsb_Free(usb); file.Dispose(); }
     }
 
-    private static void DumpAllConfigurations(IntPtr handle, string id)
+    private static bool SetMode(int mode)
+    {
+        var usb = OpenWinUsb(out var file);
+        if (usb == IntPtr.Zero) return false;
+        try
+        {
+            var buf = new byte[1];
+            var setup = new WINUSB_SETUP_PACKET { RequestType = 0xC0, Request = 0x52, Value = 0, Index = (ushort)mode, Length = 1 };
+            var ok = WinUsb_ControlTransfer(usb, setup, buf, 1, out var transferred, IntPtr.Zero);
+            AppendRaw($"USB SET_MODE({mode}) via WinUSB: ok={ok}, bytes={transferred}, result={(buf.Length > 0 ? buf[0].ToString() : "none")}");
+            return ok && transferred == 1 && buf[0] == 0;
+        }
+        finally { WinUsb_Free(usb); file.Dispose(); }
+    }
+
+    private static byte[] GetDescriptor(IntPtr usb, byte type, byte index, int length)
+    {
+        var buf = new byte[length];
+        var setup = new WINUSB_SETUP_PACKET { RequestType = 0x80, Request = 0x06, Value = (ushort)((type << 8) | index), Index = 0, Length = (ushort)Math.Min(length, ushort.MaxValue) };
+        if (!WinUsb_ControlTransfer(usb, setup, buf, (uint)buf.Length, out var transferred, IntPtr.Zero)) return Array.Empty<byte>();
+        return buf.Take((int)Math.Min(transferred, (uint)buf.Length)).ToArray();
+    }
+
+    private static void DumpAllConfigurations(IntPtr usb, string id)
     {
         try
         {
-            var dev = new byte[18];
-            var dn = usb_get_descriptor(handle, 0x01, 0, dev, dev.Length);
-            var configCount = dn >= 18 ? dev[17] : (byte)0;
-            AppendRaw($"USB MODE 5 DESCRIPTOR: {id}, deviceDescriptorReturn={dn}, bNumConfigurations={configCount}");
-            for (byte index = 0; index < configCount; index++) DumpConfiguration(handle, id, index);
+            var dev = GetDescriptor(usb, 0x01, 0, 18);
+            var count = dev.Length >= 18 ? dev[17] : 0;
+            AppendRaw($"USB MODE 5 DESCRIPTOR via WinUSB: {id}, bNumConfigurations={count}");
+            for (byte i = 0; i < count; i++) DumpConfiguration(usb, id, i);
         }
         catch (Exception ex) { AppendRaw($"USB MODE 5 ALL-CONFIG DUMP ERROR: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private static void DumpConfiguration(IntPtr handle, string id, byte index)
+    private static void DumpConfiguration(IntPtr usb, string id, byte index)
     {
-        var cfgHead = new byte[9];
-        var hn = usb_get_descriptor(handle, 0x02, index, cfgHead, cfgHead.Length);
-        if (hn < 9)
-        {
-            AppendRaw($"USB CONFIG {index + 1}: HEADER FAILED return={hn}, error={GetUsbError()}");
-            return;
-        }
-        var total = cfgHead[2] | (cfgHead[3] << 8);
-        var value = cfgHead[5];
-        var cfg = new byte[Math.Clamp(total, 9, 8192)];
-        var cn = usb_get_descriptor(handle, 0x02, index, cfg, cfg.Length);
-        AppendRaw($"USB CONFIG {index + 1}: descriptorIndex={index}, value={value}, return={cn}, totalLength={total}, interfaces={(cn >= 5 ? cfg[4].ToString() : "?")}, raw={Hex(cfg, cn > 0 ? Math.Min(cn, cfg.Length) : 0)}");
-        if (cn < 9) return;
+        var head = GetDescriptor(usb, 0x02, index, 9);
+        if (head.Length < 9) { AppendRaw($"USB CONFIG {index + 1}: HEADER FAILED"); return; }
+        var total = head[2] | (head[3] << 8); var value = head[5];
+        var cfg = GetDescriptor(usb, 0x02, index, Math.Clamp(total, 9, 8192));
+        AppendRaw($"USB CONFIG {index + 1}: descriptorIndex={index}, value={value}, return={cfg.Length}, totalLength={total}, interfaces={(cfg.Length >= 5 ? cfg[4].ToString() : "?")}, raw={Hex(cfg, cfg.Length)}");
         var pos = 0;
-        while (pos + 2 <= cn)
+        while (pos + 2 <= cfg.Length)
         {
-            var len = cfg[pos]; var type = cfg[pos + 1];
-            if (len < 2 || pos + len > cn) break;
-            if (type == 0x04 && len >= 9)
-                AppendRaw($"USB CONFIG {index + 1} INTERFACE: offset={pos}, if={cfg[pos+2]}, alt={cfg[pos+3]}, eps={cfg[pos+4]}, class={cfg[pos+5]:X2}, subclass={cfg[pos+6]:X2}, protocol={cfg[pos+7]:X2}, iInterface={cfg[pos+8]}");
-            else if (type == 0x05 && len >= 7)
-                AppendRaw($"USB CONFIG {index + 1} ENDPOINT: offset={pos}, addr={cfg[pos+2]:X2}, attrs={cfg[pos+3]:X2}, maxPacket={(cfg[pos+4] | (cfg[pos+5] << 8))}, interval={cfg[pos+6]}");
-            else if (type == 0x0B)
-                AppendRaw($"USB CONFIG {index + 1} IAD: offset={pos}, raw={Hex(cfg, pos, len)}");
-            else if (type == 0x24)
-                AppendRaw($"USB CONFIG {index + 1} CDC EXTRA: offset={pos}, len={len}, subtype={(len >= 3 ? cfg[pos+2].ToString("X2") : "??")}, raw={Hex(cfg, pos, len)}");
+            var len = cfg[pos]; var type = cfg[pos + 1]; if (len < 2 || pos + len > cfg.Length) break;
+            if (type == 0x04 && len >= 9) AppendRaw($"USB CONFIG {index + 1} INTERFACE: offset={pos}, if={cfg[pos+2]}, alt={cfg[pos+3]}, eps={cfg[pos+4]}, class={cfg[pos+5]:X2}, subclass={cfg[pos+6]:X2}, protocol={cfg[pos+7]:X2}, iInterface={cfg[pos+8]}");
+            else if (type == 0x05 && len >= 7) AppendRaw($"USB CONFIG {index + 1} ENDPOINT: offset={pos}, addr={cfg[pos+2]:X2}, attrs={cfg[pos+3]:X2}, maxPacket={(cfg[pos+4] | (cfg[pos+5] << 8))}, interval={cfg[pos+6]}");
+            else if (type == 0x0B) AppendRaw($"USB CONFIG {index + 1} IAD: offset={pos}, raw={Hex(cfg, pos, len)}");
+            else if (type == 0x24) AppendRaw($"USB CONFIG {index + 1} CDC EXTRA: offset={pos}, len={len}, subtype={(len >= 3 ? cfg[pos+2].ToString("X2") : "??")}, raw={Hex(cfg, pos, len)}");
             pos += len;
         }
     }
 
-    private static string Hex(byte[] data, int count) => Hex(data, 0, count);
+    private static IntPtr OpenWinUsb(out SafeFileHandle file)
+    {
+        file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+        var path = FindWinUsbDevicePath();
+        if (path is null) return IntPtr.Zero;
+        file = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+        if (file.IsInvalid) { file.Dispose(); return IntPtr.Zero; }
+        if (!WinUsb_Initialize(file, out var usb)) { file.Dispose(); return IntPtr.Zero; }
+        return usb;
+    }
+
+    private static SafeFileHandle OpenDevice(string path) => CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+
+    private static string? FindWinUsbDevicePath()
+    {
+        var h = SetupDiGetClassDevs(ref InterfaceGuid, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (h == INVALID_HANDLE_VALUE) return null;
+        try
+        {
+            for (uint i = 0; ; i++)
+            {
+                var data = new SP_DEVICE_INTERFACE_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>() };
+                if (!SetupDiEnumDeviceInterfaces(h, IntPtr.Zero, ref InterfaceGuid, i, ref data))
+                {
+                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
+                    continue;
+                }
+                SetupDiGetDeviceInterfaceDetail(h, ref data, IntPtr.Zero, 0, out var required, IntPtr.Zero);
+                if (required == 0) continue;
+                var buffer = Marshal.AllocHGlobal((int)required);
+                try
+                {
+                    Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 6);
+                    if (SetupDiGetDeviceInterfaceDetail(h, ref data, buffer, required, out _, IntPtr.Zero))
+                        return Marshal.PtrToStringUni(buffer + (IntPtr.Size == 8 ? 8 : 4));
+                }
+                finally { Marshal.FreeHGlobal(buffer); }
+            }
+            return null;
+        }
+        finally { SetupDiDestroyDeviceInfoList(h); }
+    }
+
+    private static string? FindAppleCompositeId()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity");
+            foreach (ManagementObject o in searcher.Get())
+            {
+                var id = o["PNPDeviceID"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(id) && id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)) return id;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string? FindAppleInterfaceId(string parentId, int interfaceNumber)
+    {
+        var marker = $"&MI_{interfaceNumber:X2}\\";
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity");
+            foreach (ManagementObject o in searcher.Get())
+            {
+                var id = o["PNPDeviceID"]?.ToString();
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                if (id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)) return id;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static CommandResult RunAllowRestart(string file, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            using var p = Process.Start(psi);
+            if (p is null) return new CommandResult(-1, "", "process start failed");
+            var output = p.StandardOutput.ReadToEnd(); var error = p.StandardError.ReadToEnd(); p.WaitForExit();
+            return new CommandResult(p.ExitCode, output, error);
+        }
+        catch (Exception ex) { return new CommandResult(-1, "", ex.Message); }
+    }
+
+    private static string GetDeviceInstanceId(IntPtr h, ref SP_DEVINFO_DATA devInfo)
+    {
+        var buffer = new StringBuilder(512);
+        return SetupDiGetDeviceInstanceId(h, ref devInfo, buffer, buffer.Capacity, out _) ? buffer.ToString() : "";
+    }
+
+    private static string Hex(byte[] data, int count) => count <= 0 ? "" : string.Join(" ", data.Take(count).Select(b => b.ToString("X2")));
     private static string Hex(byte[] data, int offset, int count) => count <= 0 ? "" : string.Join(" ", data.Skip(offset).Take(count).Select(b => b.ToString("X2")));
     private static void AppendRaw(string message) { try { lock (LogLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}", new UTF8Encoding(false)); } catch { } }
-    private static void AppendDiagnostic(ModeDiagnostic d) => AppendRaw($"LIBUSB GET_MODE DETAIL: buses={d.BusCount}, devices={d.DeviceCount}, enumerated={d.DeviceEnumerated}, device={d.DeviceId ?? "none"}, open={d.OpenSucceeded}, return={d.ControlReturn}/{d.ExpectedBytes}, error={d.Error}");
-    private static string GetUsbError() { try { var p = usb_strerror(); return p == IntPtr.Zero ? "unknown libusb error" : Marshal.PtrToStringAnsi(p) ?? "unknown libusb error"; } catch { return "libusb error text unavailable"; } }
-    private static bool SetMode(int mode) { var h = OpenPhone(); if (h == IntPtr.Zero) return false; try { var buf = new byte[1]; var n = usb_control_msg(h, 0xC0, 0x52, 0, mode, buf, 1, 2000); return n == 1 && buf[0] == 0; } finally { usb_close(h); } }
-    private static IntPtr OpenPhone() { var dev = FindDevice(); return dev == IntPtr.Zero ? IntPtr.Zero : usb_open(dev); }
-    private static IntPtr FindDevice() => FindDevice(out _);
-    private static IntPtr FindDevice(out ushort foundPid) { foundPid = 0; usb_init(); usb_find_busses(); usb_find_devices(); return FindDeviceAfterEnumeration(out foundPid); }
-    private static IntPtr FindDeviceAfterEnumeration(out ushort foundPid) { foundPid = 0; var bus = usb_get_busses(); while (bus != IntPtr.Zero) { var device = Marshal.ReadIntPtr(bus, BusDevicesOffset); while (device != IntPtr.Zero) { var descriptor = device + DeviceDescriptorOffset; var vid = (ushort)Marshal.ReadInt16(descriptor, 8); var pid = (ushort)Marshal.ReadInt16(descriptor, 10); if (vid == Vid) { foundPid = pid; return device; } device = Marshal.ReadIntPtr(device, 0); } bus = Marshal.ReadIntPtr(bus, 0); } return IntPtr.Zero; }
+    private static void AppendDiagnostic(ModeDiagnostic d) => AppendRaw($"WINUSB GET_MODE DETAIL: device={d.DeviceId ?? "none"}, enumerated={d.DeviceEnumerated}, open={d.OpenSucceeded}, return={d.ControlReturn}/{d.ExpectedBytes}, error={d.Error}");
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINUSB_SETUP_PACKET
+    {
+        public byte RequestType;
+        public byte Request;
+        public ushort Value;
+        public ushort Index;
+        public ushort Length;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SP_DEVICE_INTERFACE_DATA
+    {
+        public uint cbSize;
+        public Guid InterfaceClassGuid;
+        public uint Flags;
+        public IntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DEVINFO_DATA
+    {
+        public uint cbSize;
+        public Guid ClassGuid;
+        public uint DevInst;
+        public IntPtr Reserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DEVINSTALL_PARAMS
+    {
+        public uint cbSize;
+        public uint Flags;
+        public uint FlagsEx;
+        public IntPtr hwndParent;
+        public IntPtr InstallMsgHandler;
+        public IntPtr InstallMsgHandlerContext;
+        public IntPtr FileQueue;
+        public IntPtr ClassInstallReserved;
+        public IntPtr Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DRVINFO_DATA
+    {
+        public uint cbSize;
+        public uint DriverType;
+        public IntPtr Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Description;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string MfgName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ProviderName;
+        public System.Runtime.InteropServices.ComTypes.FILETIME DriverDate;
+        public ulong DriverVersion;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DRVINFO_DETAIL_DATA
+    {
+        public uint cbSize;
+        public System.Runtime.InteropServices.ComTypes.FILETIME InfDate;
+        public uint CompatIDsOffset;
+        public uint CompatIDsLength;
+        public IntPtr Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string SectionName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string InfFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DrvDescription;
+    }
+
+    private readonly record struct CommandResult(int ExitCode, string Output, string Error);
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetClassDevsW", SetLastError = true)]
+    private static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string? Enumerator, IntPtr hwndParent, uint Flags);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDeviceInfo", SetLastError = true)]
+    private static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstanceIdW", SetLastError = true)]
+    private static extern bool SetupDiGetDeviceInstanceId(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, StringBuilder DeviceInstanceId, int DeviceInstanceIdSize, out int RequiredSize);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstallParamsW", SetLastError = true)]
+    private static extern bool SetupDiGetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetDeviceInstallParamsW", SetLastError = true)]
+    private static extern bool SetupDiSetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiBuildDriverInfoList", SetLastError = true)]
+    private static extern bool SetupDiBuildDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDriverInfoW", SetLastError = true)]
+    private static extern bool SetupDiEnumDriverInfo(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType, uint MemberIndex, ref SP_DRVINFO_DATA DriverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetSelectedDriverW", SetLastError = true)]
+    private static extern bool SetupDiSetSelectedDriver(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDriverInfoDetailW", SetLastError = true)]
+    private static extern bool SetupDiGetDriverInfoDetail(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, IntPtr DriverInfoDetailData, uint DriverInfoDetailDataSize, out uint RequiredSize);
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiDestroyDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+    [DllImport("setupapi.dll", SetLastError = true)]
+    private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInterfaceDetailW", SetLastError = true)]
+    private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
+    [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "DiInstallDevice", SetLastError = true)]
+    private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, uint Flags, out bool NeedReboot);
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_Initialize(SafeFileHandle DeviceHandle, out IntPtr InterfaceHandle);
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_Free(IntPtr InterfaceHandle);
+    [DllImport("winusb.dll", SetLastError = true)]
+    private static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
+    private static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 }
