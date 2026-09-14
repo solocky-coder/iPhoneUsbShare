@@ -17,11 +17,7 @@ internal static class UsbNative
     private const uint DI_QUIETINSTALL = 0x00000020;
     private const uint DI_FLAGSEX_ALLOWEXCLUDEDDRVS = 0x00000001;
     private const uint SPDIT_CLASSDRIVER = 0x00000001;
-    private const uint DIF_INSTALLDEVICE = 0x00000001;
     private const int ERROR_NO_MORE_ITEMS = 259;
-    private const int ERROR_INSUFFICIENT_BUFFER = 122;
-    private const int ERROR_NO_SUCH_DEVINST = 433;
-    private const int INSTALLFLAG_FORCE = 0x00000001;
     private const uint GENERIC_READ = 0x80000000;
     private const uint GENERIC_WRITE = 0x40000000;
     private const uint FILE_SHARE_READ = 0x00000001;
@@ -29,9 +25,7 @@ internal static class UsbNative
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
-    private const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
     private const int DIGCF_DEVICEINTERFACE = 0x00000010;
-    private const uint SPDRP_SERVICE = 0x00000004;
 
     private static readonly Guid InterfaceGuid = Guid.Parse(WinUsbInterfaceGuid);
     private static readonly object LogLock = new();
@@ -83,8 +77,7 @@ internal static class UsbNative
         {
             if (!migrationAttempted) migrationAttempted = true;
 
-            var existing = FindWinUsbDevicePath();
-            if (existing is not null) return;
+            if (FindWinUsbDevicePath() is not null) return;
 
             var parent = FindAppleCompositeId();
             if (parent is null) return;
@@ -98,7 +91,7 @@ internal static class UsbNative
                 return;
             }
 
-            SetDeviceInterfaceGuid(mi00);
+            SetWinUsbDeviceParameters(mi00);
             if (InstallWinUsbDriver(mi00))
             {
                 AppendRaw($"WinUSB migration: installed WinUSB on {mi00}; restarting MI_00 once to publish the interface.");
@@ -121,8 +114,7 @@ internal static class UsbNative
                 var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
                 if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
                 {
-                    var e = Marshal.GetLastWin32Error();
-                    if (e == ERROR_NO_MORE_ITEMS) break;
+                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                     return false;
                 }
                 var id = GetDeviceInstanceId(h, ref devInfo);
@@ -143,8 +135,7 @@ internal static class UsbNative
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
                         if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
                         {
-                            var e = Marshal.GetLastWin32Error();
-                            if (e == ERROR_NO_MORE_ITEMS) break;
+                            if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                             return false;
                         }
 
@@ -190,16 +181,17 @@ internal static class UsbNative
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
-    private static void SetDeviceInterfaceGuid(string instanceId)
+    private static void SetWinUsbDeviceParameters(string instanceId)
     {
         try
         {
             using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{instanceId}\Device Parameters", writable: true);
             if (key is null) return;
             key.SetValue("DeviceInterfaceGUIDs", new[] { WinUsbInterfaceGuid }, RegistryValueKind.MultiString);
-            AppendRaw($"WinUSB migration: DeviceInterfaceGUIDs registered on {instanceId}: {WinUsbInterfaceGuid}");
+            key.SetValue("WinUsbCompatibleId", "USB\\MS_COMP_WINUSB", RegistryValueKind.String);
+            AppendRaw($"WinUSB migration: registered DeviceInterfaceGUIDs and USB\\MS_COMP_WINUSB hint on {instanceId}: {WinUsbInterfaceGuid}");
         }
-        catch (Exception ex) { AppendRaw($"WinUSB migration: failed to register DeviceInterfaceGUIDs: {ex.GetType().Name}: {ex.Message}"); }
+        catch (Exception ex) { AppendRaw($"WinUSB migration: failed to register WinUSB device parameters: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     private static void RemoveLegacyLibUsbFilter(string parentId)
@@ -571,40 +563,22 @@ internal static class UsbNative
     private readonly record struct CommandResult(int ExitCode, string Output, string Error);
     private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
 
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetClassDevsW", SetLastError = true)]
-    private static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string? Enumerator, IntPtr hwndParent, uint Flags);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDeviceInfo", SetLastError = true)]
-    private static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstanceIdW", SetLastError = true)]
-    private static extern bool SetupDiGetDeviceInstanceId(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, StringBuilder DeviceInstanceId, int DeviceInstanceIdSize, out int RequiredSize);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstallParamsW", SetLastError = true)]
-    private static extern bool SetupDiGetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetDeviceInstallParamsW", SetLastError = true)]
-    private static extern bool SetupDiSetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiBuildDriverInfoList", SetLastError = true)]
-    private static extern bool SetupDiBuildDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDriverInfoW", SetLastError = true)]
-    private static extern bool SetupDiEnumDriverInfo(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType, uint MemberIndex, ref SP_DRVINFO_DATA DriverInfoData);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetSelectedDriverW", SetLastError = true)]
-    private static extern bool SetupDiSetSelectedDriver(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDriverInfoDetailW", SetLastError = true)]
-    private static extern bool SetupDiGetDriverInfoDetail(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, IntPtr DriverInfoDetailData, uint DriverInfoDetailDataSize, out uint RequiredSize);
-    [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiDestroyDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
-    [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
-    [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInterfaceDetailW", SetLastError = true)]
-    private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
-    [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "DiInstallDevice", SetLastError = true)]
-    private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, uint Flags, out bool NeedReboot);
-    [DllImport("winusb.dll", SetLastError = true)]
-    private static extern bool WinUsb_Initialize(SafeFileHandle DeviceHandle, out IntPtr InterfaceHandle);
-    [DllImport("winusb.dll", SetLastError = true)]
-    private static extern bool WinUsb_Free(IntPtr InterfaceHandle);
-    [DllImport("winusb.dll", SetLastError = true)]
-    private static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")]
-    private static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetClassDevsW", SetLastError = true)] private static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string? Enumerator, IntPtr hwndParent, uint Flags);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDeviceInfo", SetLastError = true)] private static extern bool SetupDiEnumDeviceInfo(IntPtr DeviceInfoSet, uint MemberIndex, ref SP_DEVINFO_DATA DeviceInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstanceIdW", SetLastError = true)] private static extern bool SetupDiGetDeviceInstanceId(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, StringBuilder DeviceInstanceId, int DeviceInstanceIdSize, out int RequiredSize);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstallParamsW", SetLastError = true)] private static extern bool SetupDiGetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetDeviceInstallParamsW", SetLastError = true)] private static extern bool SetupDiSetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiBuildDriverInfoList", SetLastError = true)] private static extern bool SetupDiBuildDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDriverInfoW", SetLastError = true)] private static extern bool SetupDiEnumDriverInfo(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType, uint MemberIndex, ref SP_DRVINFO_DATA DriverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetSelectedDriverW", SetLastError = true)] private static extern bool SetupDiSetSelectedDriver(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDriverInfoDetailW", SetLastError = true)] private static extern bool SetupDiGetDriverInfoDetail(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, IntPtr DriverInfoDetailData, uint DriverInfoDetailDataSize, out uint RequiredSize);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+    [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInterfaceDetailW", SetLastError = true)] private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
+    [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "DiInstallDevice", SetLastError = true)] private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, uint Flags, out bool NeedReboot);
+    [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Initialize(SafeFileHandle DeviceHandle, out IntPtr InterfaceHandle);
+    [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Free(IntPtr InterfaceHandle);
+    [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateFileW")] private static extern SafeFileHandle CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 }
