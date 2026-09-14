@@ -92,3 +92,10 @@ The old Apple Mobile Device Ethernet driver files remain in the repository for h
 The Windows USB stack may expose Apple's NCM union as ordinary `VID_05AC&PID_xxxx&MI_nn` child nodes rather than a PnP ID containing `CDC_0D`, especially on Windows 10. The application therefore identifies NCM from the live USB descriptors, maps the descriptor interface number to the corresponding PnP child, and selects Microsoft's `UsbNcm` driver through SetupAPI. It does not hard-code `MI_02`, `MI_04`, or an Apple PID.
 
 The first NCM control function is preferred because the iOS 16+ dual-function layout identifies the function with the interrupt endpoint as the tethering function; the second function is the RemoteXPC channel and is not expected to become a usable NIC.
+
+
+## Driver-binding diagnostic/fix revision
+
+This revision re-applies the `usbccgp` CDC enumeration policy (`EnumeratorClass = 02 00 00`) on every start before the Apple device is restarted, so machines upgraded from an earlier build cannot retain a stale composite-device enumeration policy. Microsoft documents this registry setting for CDC interface-collection enumeration.
+
+The NCM binding stage also records each NCM child's HardwareID/CompatibleIDs, current service/driver state, and the output of `pnputil /enum-devices /instanceid ... /drivers`. If an exact `usbncm.inf` entry is not returned by SetupAPI, it falls back to Windows' best-compatible-driver selection rather than treating `ERROR_NO_MORE_ITEMS (259)` as a terminal driver-binding failure.

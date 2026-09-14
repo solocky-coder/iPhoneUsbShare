@@ -103,6 +103,13 @@ public sealed class ShareEngine
         }
         else
         {
+            // Re-apply the UsbCcgp CDC enumeration policy on every start.
+            // Older installations can have a stale usbccgp software key from
+            // before NCM support was enabled; in that case Windows creates
+            // plain MI_XX child PDOs and UsbNcm.inf has no compatible ID to match.
+            // Microsoft documents EnumeratorClass=02,00,00 as the setting that
+            // makes usbccgp enumerate CDC interface collections by their class.
+            ConfigureUsbCgpEnumerator(phone.Id);
             SetConfig(phone.Id, SafeIndexValue, "0");
             WriteLog("Set Apple USB configuration to safe mode (2).");
             RestartDevice(phone.Id);
@@ -140,12 +147,10 @@ public sealed class ShareEngine
                 WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
             }
 
-            // The iPad exposes two CDC-NCM pairs in configuration 5:
-            // control MI_02 -> data MI_03 and control MI_04 -> data MI_05.
-            // The user's Windows 10 machine has the legacy Apple Ethernet
-            // driver attached to MI_02 (with a warning icon), so deliberately
-            // bind Microsoft's UsbNcm driver to the unclaimed MI_04 control
-            // interface instead of the MI_05 data interface.
+            // The iPad exposes two CDC-NCM pairs in configuration 5.
+            // Identify the functions from their live descriptors, map them to
+            // Windows child PDOs, and let Windows select the compatible NCM
+            // driver. Do not assume MI_02/MI_04 or a particular Apple PID.
             await BindUsbNcmDriverAsync();
             try
             {
@@ -164,9 +169,17 @@ public sealed class ShareEngine
                 DisablePhotoInterfaces();
                 var retryMode = await UsbNative.GetModeAsync();
                 WriteLog($"Retry GET_MODE: {retryMode ?? "unreachable"}");
-                if (retryMode != "3:3:3:0" && retryMode != "3:3:3") throw new InvalidOperationException("Apple USB device did not return to safe mode for the NCM retry.");
-                SetConfig(current.Id, NcmIndexValue, SafeIndexValue);
-                if (!await UsbNative.SetModeAsync(3)) throw new InvalidOperationException("Apple device rejected the CDC-NCM retry mode switch.");
+                ConfigureUsbCgpEnumerator(current.Id);
+                if (retryMode == "5:3:3:0" || retryMode == "5:3:3")
+                {
+                    WriteLog("Retry device is already in CDC-NCM direct mode (5); binding NCM without another SET_MODE.");
+                }
+                else
+                {
+                    if (retryMode != "3:3:3:0" && retryMode != "3:3:3") throw new InvalidOperationException("Apple USB device did not return to a usable safe/NCM transition mode for the retry.");
+                    SetConfig(current.Id, NcmIndexValue, SafeIndexValue);
+                    if (!await UsbNative.SetModeAsync(3)) throw new InvalidOperationException("Apple device rejected the CDC-NCM retry mode switch.");
+                }
                 await BindUsbNcmDriverAsync();
                 await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter after retry");
             }
@@ -240,7 +253,11 @@ public sealed class ShareEngine
             .ToList();
 
         foreach (var target in targets)
+        {
             LogPnpDriverState(target.Id, "NCM candidate");
+            LogPnpIds(target.Id);
+            LogPnpUtilDrivers(target.Id);
+        }
 
         if (targets.Count == 0)
         {
@@ -310,6 +327,7 @@ public sealed class ShareEngine
         try
         {
             using var searcher = new ManagementObjectSearcher(
+                "root\\CIMV2",
                 "SELECT PNPDeviceID, Name, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
             foreach (ManagementObject o in searcher.Get())
             {
@@ -318,8 +336,36 @@ public sealed class ShareEngine
                 WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | class={o["PNPClass"]} | service={o["Service"]} | driver={o["DriverVersion"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
                 return;
             }
+            WriteStaticLog($"{prefix}: no Win32_PnPEntity row found");
         }
-        catch (Exception ex) { WriteStaticLog($"{prefix}: driver-state query failed: {ex.Message}"); }
+        catch (Exception ex) { WriteStaticLog($"{prefix}: driver-state query failed: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static void LogPnpIds(string instanceId)
+    {
+        try
+        {
+            using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{instanceId}");
+            if (baseKey is null) { WriteStaticLog($"PnP IDs {instanceId}: registry key not found"); return; }
+            var hw = baseKey.GetValue("HardwareID") as string[] ?? Array.Empty<string>();
+            var compat = baseKey.GetValue("CompatibleIDs") as string[] ?? Array.Empty<string>();
+            var service = baseKey.GetValue("Service")?.ToString() ?? "";
+            var driver = baseKey.GetValue("Driver")?.ToString() ?? "";
+            WriteStaticLog($"PnP IDs {instanceId}: HardwareID=[{string.Join(" | ", hw)}] | CompatibleIDs=[{string.Join(" | ", compat)}] | Service={service} | DriverKey={driver}");
+        }
+        catch (Exception ex) { WriteStaticLog($"PnP IDs {instanceId}: query failed: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    private static void LogPnpUtilDrivers(string instanceId)
+    {
+        try
+        {
+            var r = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{instanceId}\" /drivers");
+            WriteStaticLog($"pnputil driver enumeration {instanceId}: exit={r.ExitCode}");
+            if (!string.IsNullOrWhiteSpace(r.Output)) WriteStaticLog($"pnputil driver enumeration output: {r.Output.Trim()}");
+            if (!string.IsNullOrWhiteSpace(r.Error)) WriteStaticLog($"pnputil driver enumeration error: {r.Error.Trim()}");
+        }
+        catch (Exception ex) { WriteStaticLog($"pnputil driver enumeration failed: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     private static void WriteStaticLog(string message)
@@ -388,7 +434,19 @@ public sealed class ShareEngine
                     }
                 }
                 finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
-                error = ERROR_NO_MORE_ITEMS;
+                // If SetupDi's class-driver list did not expose the INF by
+                // filename, let Windows select the best compatible driver.
+                // ERROR_NO_MORE_ITEMS (259) is exactly what the previous build
+                // returned here when UsbNcm was not present in that list.
+                WriteStaticLog($"SetupAPI: no exact {Path.GetFileName(infPath)} candidate for {instanceId}; trying DIF_SELECTBESTCOMPATDRV.");
+                if (SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, h, ref devInfo))
+                {
+                    WriteStaticLog($"SetupAPI: best compatible driver selected for {instanceId}; installing.");
+                    if (SetupDiCallClassInstaller(DIF_INSTALLDEVICE, h, ref devInfo)) return true;
+                    error = (uint)Marshal.GetLastWin32Error();
+                    return false;
+                }
+                error = (uint)Marshal.GetLastWin32Error();
                 return false;
             }
             error = ERROR_NO_SUCH_DEVINST;
@@ -427,6 +485,7 @@ public sealed class ShareEngine
     private const uint DIGCF_ALLCLASSES = 0x00000004;
     private const uint SPDIT_CLASSDRIVER = 0x00000001;
     private const uint DIF_INSTALLDEVICE = 0x00000001;
+    private const uint DIF_SELECTBESTCOMPATDRV = 0x00000005;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const int ERROR_NO_SUCH_DEVINST = 433;
@@ -455,6 +514,29 @@ public sealed class ShareEngine
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiCallClassInstaller(uint installFunction, IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
+
+    private static void ConfigureUsbCgpEnumerator(string pnpId)
+    {
+        try
+        {
+            using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{pnpId}", writable: true);
+            var drv = baseKey?.GetValue("Driver") as string;
+            if (string.IsNullOrWhiteSpace(drv)) throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
+            using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true);
+            if (sw is null) throw new InvalidOperationException($"Cannot open usbccgp software key {drv}.");
+            sw.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
+            var lower = baseKey!.GetValue("LowerFilters") as string[];
+            if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
+            {
+                var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false);
+                else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
+                WriteStaticLog($"Removed AppleLowerFilter from {pnpId}.");
+            }
+            WriteStaticLog($"usbccgp EnumeratorClass set to 02 00 00 on {drv}; re-enumeration will regenerate CDC compatible IDs.");
+        }
+        catch (Exception ex) { WriteStaticLog($"usbccgp EnumeratorClass update failed: {ex.GetType().Name}: {ex.Message}"); throw; }
+    }
 
     private void ConfigureUsbDevice(PnpDevice phone)
     {
