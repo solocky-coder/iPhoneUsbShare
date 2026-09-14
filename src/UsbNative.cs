@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System.Diagnostics;
+using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
@@ -27,7 +28,7 @@ internal static class UsbNative
     private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
     private const int DIGCF_DEVICEINTERFACE = 0x00000010;
 
-    private static readonly Guid InterfaceGuid = Guid.Parse(WinUsbInterfaceGuid);
+    private static Guid InterfaceGuid = Guid.Parse(WinUsbInterfaceGuid);
     private static readonly object LogLock = new();
     private static readonly object InitLock = new();
     private static bool migrationAttempted;
@@ -76,28 +77,22 @@ internal static class UsbNative
         lock (InitLock)
         {
             if (!migrationAttempted) migrationAttempted = true;
-
             if (FindWinUsbDevicePath() is not null) return;
-
             var parent = FindAppleCompositeId();
             if (parent is null) return;
-
             RemoveLegacyLibUsbFilter(parent);
-
             var mi00 = FindAppleInterfaceId(parent, 0);
             if (mi00 is null)
             {
                 AppendRaw("WinUSB migration: MI_00 is not currently enumerated; waiting for Apple composite re-enumeration.");
                 return;
             }
-
             SetWinUsbDeviceParameters(mi00);
             if (InstallWinUsbDriver(mi00))
             {
                 AppendRaw($"WinUSB migration: installed WinUSB on {mi00}; restarting MI_00 once to publish the interface.");
                 RunAllowRestart("pnputil.exe", $"/restart-device \"{mi00}\"");
             }
-
             RemoveLegacyLibUsbService();
         }
     }
@@ -119,7 +114,6 @@ internal static class UsbNative
                 }
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-
                 var installParams = new SP_DEVINSTALL_PARAMS { cbSize = (uint)Marshal.SizeOf<SP_DEVINSTALL_PARAMS>(), DriverPath = string.Empty };
                 if (!SetupDiGetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
                 installParams.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
@@ -127,7 +121,6 @@ internal static class UsbNative
                 installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");
                 if (!SetupDiSetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
                 if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER)) return false;
-
                 try
                 {
                     for (uint driverIndex = 0; ; driverIndex++)
@@ -138,11 +131,9 @@ internal static class UsbNative
                             if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                             return false;
                         }
-
                         var detail = GetDriverInfName(h, ref devInfo, ref driver);
                         AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | inf={detail ?? "?"}");
                         if (!string.Equals(Path.GetFileName(detail ?? ""), "winusb.inf", StringComparison.OrdinalIgnoreCase)) continue;
-
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             AppendRaw($"WinUSB driver selection failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}");
@@ -407,14 +398,15 @@ internal static class UsbNative
 
     private static string? FindWinUsbDevicePath()
     {
-        var h = SetupDiGetClassDevs(ref InterfaceGuid, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        var guid = InterfaceGuid;
+        var h = SetupDiGetClassDevs(ref guid, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
         if (h == INVALID_HANDLE_VALUE) return null;
         try
         {
             for (uint i = 0; ; i++)
             {
                 var data = new SP_DEVICE_INTERFACE_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>() };
-                if (!SetupDiEnumDeviceInterfaces(h, IntPtr.Zero, ref InterfaceGuid, i, ref data))
+                if (!SetupDiEnumDeviceInterfaces(h, IntPtr.Zero, ref guid, i, ref data))
                 {
                     if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                     continue;
@@ -492,69 +484,35 @@ internal static class UsbNative
     private static void AppendDiagnostic(ModeDiagnostic d) => AppendRaw($"WINUSB GET_MODE DETAIL: device={d.DeviceId ?? "none"}, enumerated={d.DeviceEnumerated}, open={d.OpenSucceeded}, return={d.ControlReturn}/{d.ExpectedBytes}, error={d.Error}");
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct WINUSB_SETUP_PACKET
-    {
-        public byte RequestType;
-        public byte Request;
-        public ushort Value;
-        public ushort Index;
-        public ushort Length;
-    }
+    private struct WINUSB_SETUP_PACKET { public byte RequestType; public byte Request; public ushort Value; public ushort Index; public ushort Length; }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct SP_DEVICE_INTERFACE_DATA
-    {
-        public uint cbSize;
-        public Guid InterfaceClassGuid;
-        public uint Flags;
-        public IntPtr Reserved;
-    }
+    private struct SP_DEVICE_INTERFACE_DATA { public uint cbSize; public Guid InterfaceClassGuid; public uint Flags; public IntPtr Reserved; }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct SP_DEVINFO_DATA
-    {
-        public uint cbSize;
-        public Guid ClassGuid;
-        public uint DevInst;
-        public IntPtr Reserved;
-    }
+    private struct SP_DEVINFO_DATA { public uint cbSize; public Guid ClassGuid; public uint DevInst; public IntPtr Reserved; }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SP_DEVINSTALL_PARAMS
     {
-        public uint cbSize;
-        public uint Flags;
-        public uint FlagsEx;
-        public IntPtr hwndParent;
-        public IntPtr InstallMsgHandler;
-        public IntPtr InstallMsgHandlerContext;
-        public IntPtr FileQueue;
-        public IntPtr ClassInstallReserved;
-        public IntPtr Reserved;
+        public uint cbSize; public uint Flags; public uint FlagsEx; public IntPtr hwndParent; public IntPtr InstallMsgHandler; public IntPtr InstallMsgHandlerContext; public IntPtr FileQueue; public IntPtr ClassInstallReserved; public IntPtr Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SP_DRVINFO_DATA
     {
-        public uint cbSize;
-        public uint DriverType;
-        public IntPtr Reserved;
+        public uint cbSize; public uint DriverType; public IntPtr Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Description;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string MfgName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ProviderName;
-        public System.Runtime.InteropServices.ComTypes.FILETIME DriverDate;
-        public ulong DriverVersion;
+        public System.Runtime.InteropServices.ComTypes.FILETIME DriverDate; public ulong DriverVersion;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct SP_DRVINFO_DETAIL_DATA
     {
-        public uint cbSize;
-        public System.Runtime.InteropServices.ComTypes.FILETIME InfDate;
-        public uint CompatIDsOffset;
-        public uint CompatIDsLength;
-        public IntPtr Reserved;
+        public uint cbSize; public System.Runtime.InteropServices.ComTypes.FILETIME InfDate; public uint CompatIDsOffset; public uint CompatIDsLength; public IntPtr Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string SectionName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string InfFileName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DrvDescription;
