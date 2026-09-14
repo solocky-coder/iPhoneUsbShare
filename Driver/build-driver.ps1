@@ -9,6 +9,10 @@ $Out = Join-Path $Root 'artifacts\AppleNcm'
 if (Test-Path $Work) { Remove-Item $Work -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
+# Never leave a stale driver package in the generated-driver path.  In
+# particular, do not accidentally install a .sys/.inf from a previous build.
+Get-ChildItem -Path $Out -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+
 git clone --depth 1 --branch $Ref --recurse-submodules $RepoUrl $Work
 Push-Location $Work
 try {
@@ -163,6 +167,7 @@ try {
 '@
     $deviceText = $deviceText.Substring(0, $start) + $replacement + $deviceText.Substring($end)
     Set-Content -Path $deviceCpp -Value $deviceText -Encoding UTF8
+
     $inf = Join-Path $Work 'host\UsbNcmSample.inf'
     $text = Get-Content $inf -Raw
     $text = $text -replace 'UsbNcmSample', 'AppleNcm'
@@ -175,7 +180,7 @@ try {
     $text = $text -replace 'UsbNcm.SVCDESC', 'AppleNcm.SVCDESC'
     $text = $text -replace '(?m)^\s*%AppleNcm.DeviceDesc%=AppleNcm_Device,USB\\MS_COMP_WINNCM\s*$', '%AppleNcm.DeviceDesc%=AppleNcm_Device,USB\VID_05AC&PID_12AB&MI_02'
     $text = $text -replace '(?m)^\s*;.*USB\\Class_02&SubClass_0d&Prot_00.*$', ''
-    $text = $text -replace '\[Strings\]', '[Strings]'
+    $text = $text -replace 'CatalogFile=UsbNcmFnSample\.cat', 'CatalogFile=AppleNcm.cat'
     $text = $text -replace 'UsbNcm.DeviceDesc', 'AppleNcm.DeviceDesc'
     $text = $text -replace 'UsbNcm Host Device', 'Apple iPhone NCM Host Device'
     Set-Content -Path $inf -Value $text -Encoding Unicode
@@ -194,7 +199,26 @@ try {
     if (-not $sys) { throw 'AppleNcm.sys was not produced.' }
     Copy-Item $sys.FullName (Join-Path $Out 'AppleNcm.sys') -Force
     Copy-Item $inf (Join-Path $Out 'AppleNcm.inf') -Force
-    if (Test-Path (Join-Path $Work 'host\AppleNcm.cat')) { Copy-Item (Join-Path $Work 'host\AppleNcm.cat') (Join-Path $Out 'AppleNcm.cat') -Force }
+
+    # The upstream INF names its catalog explicitly.  After the INF is renamed
+    # to AppleNcm.inf we also rename that CatalogFile entry above, so the build
+    # must produce AppleNcm.cat.  Fail instead of emitting an apparently usable
+    # package with a missing catalog.
+    $cat = Get-ChildItem -Path $Work -Filter 'AppleNcm.cat' -Recurse | Select-Object -First 1
+    if (-not $cat) { throw 'AppleNcm.cat was not produced. The generated package would not be installable as a signed driver package.' }
+    Copy-Item $cat.FullName (Join-Path $Out 'AppleNcm.cat') -Force
+
+    # Validate the generated package contents before publishing the artifact.
+    $outInf = Join-Path $Out 'AppleNcm.inf'
+    $outText = Get-Content $outInf -Raw
+    foreach ($required in @('USB\VID_05AC&PID_12AB&MI_02','Service,    0, "AppleNcm"','ServiceBinary  = %12%\AppleNcm.sys','CatalogFile=AppleNcm.cat')) {
+        if ($outText -notmatch [regex]::Escape($required)) {
+            throw "Generated AppleNcm.inf is missing required package content: $required"
+        }
+    }
+    if (-not (Test-Path (Join-Path $Out 'AppleNcm.sys'))) { throw 'Generated package is missing AppleNcm.sys.' }
+    if (-not (Test-Path (Join-Path $Out 'AppleNcm.cat'))) { throw 'Generated package is missing AppleNcm.cat.' }
+
     Copy-Item (Join-Path $PSScriptRoot 'patches\README.md') (Join-Path $Out 'source-modification-notes.md') -Force
 }
 finally { Pop-Location }
