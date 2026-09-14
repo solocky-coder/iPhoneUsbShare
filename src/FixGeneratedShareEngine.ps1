@@ -136,10 +136,6 @@ if (-not $region.Contains($buildNeedle)) { throw 'FixGeneratedShareEngine: Setup
 $region = $region.Replace($buildNeedle, $buildReplacement)
 
 $structNeedle = @'
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct SP_DRVINFO_DATA
-'@
-$structReplacement = @'
     [StructLayout(LayoutKind.Sequential, Pack = 4, CharSet = CharSet.Unicode)]
     private struct SP_DEVINSTALL_PARAMS
     {
@@ -154,11 +150,27 @@ $structReplacement = @'
         public uint Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
     }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct SP_DRVINFO_DATA
 '@
-if (-not $region.Contains($structNeedle)) { throw 'FixGeneratedShareEngine: SP_DRVINFO_DATA anchor not found.' }
+$structReplacement = @'
+    // Matches the native SP_DEVINSTALL_PARAMS_W layout. Do not use Pack=4 here:
+    // on x64 the pointer fields are naturally 8-byte aligned, and SetupAPI
+    // rejects a smaller/mislaid-out buffer with ERROR_INVALID_USER_BUFFER (1784).
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DEVINSTALL_PARAMS
+    {
+        public uint cbSize;
+        public uint Flags;
+        public uint FlagsEx;
+        public IntPtr HwndParent;
+        public IntPtr InstallMsgHandler;
+        public IntPtr InstallMsgHandlerContext;
+        public IntPtr FileQueue;
+        public UIntPtr ClassInstallReserved;
+        public uint Reserved;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
+    }
+'@
+if (-not $region.Contains($structNeedle)) { throw 'FixGeneratedShareEngine: SP_DEVINSTALL_PARAMS anchor not found.' }
 $region = $region.Replace($structNeedle, $structReplacement)
 
 $constNeedle = '    private const uint DIF_INSTALLDEVICE = 0x00000001;'
