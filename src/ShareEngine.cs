@@ -228,12 +228,9 @@ public sealed class ShareEngine
 
     private async Task BindUsbNcmDriverAsync()
     {
-        // Do not identify the NCM function from a Windows-generated CDC_0D
-        // hardware ID. Windows 10 can expose the same CDC union as plain
-        // VID/PID/MI child nodes. Identify the tethering function from the
-        // actual USB descriptors, then map its interface number to the PnP
-        // child. The first NCM control interface with an interrupt endpoint
-        // is the tethering function; the later NCM function is RemoteXPC.
+        // EXPERIMENT: test whether Microsoft's USB NCM compatible ID is the
+        // missing PnP match on Windows 10.  We deliberately do NOT install a
+        // custom/unsigned INF and do NOT alter the Apple USB mode here.
         var controlInterfaces = await UsbNative.GetNcmControlInterfacesAsync();
         if (controlInterfaces.Length == 0)
         {
@@ -252,17 +249,9 @@ public sealed class ShareEngine
             .Cast<PnpDevice>()
             .ToList();
 
-        // EnumeratorClass is read by usbccgp when it enumerates the composite
-        // device.  Merely changing the registry value does not guarantee that
-        // the already-running composite devnode rebuilds its child PDOs.  The
-        // previous run proved this: the descriptors contained NCM interfaces
-        // 2 and 4, but Windows exposed only MI_00/01/03/05.  Force a targeted
-        // ConfigMgr re-enumeration of this exact Apple composite devnode before
-        // giving up.  This is a devnode/PnP operation only; it does not change
-        // the Apple USB mode or configuration.
         if (targets.Count == 0)
         {
-            WriteLog("NCM child PDOs are missing; forcing targeted usbccgp devnode re-enumeration before driver replacement.");
+            WriteLog("NCM child PDOs are missing; forcing targeted usbccgp devnode re-enumeration.");
             if (ReenumerateAppleCompositeDevNode(out var reenumError))
             {
                 await Task.Delay(1500);
@@ -280,163 +269,143 @@ public sealed class ShareEngine
             }
         }
 
-        foreach (var target in targets)
-        {
-            LogPnpDriverState(target.Id, "NCM candidate");
-            LogPnpIds(target.Id);
-            LogPnpUtilDrivers(target.Id);
-        }
-
         if (targets.Count == 0)
         {
-            WriteLog("CDC-NCM descriptors were present, but Windows still exposed no matching Apple MI child nodes after targeted usbccgp re-enumeration.");
+            WriteLog("CDC-NCM descriptors were present, but Windows exposed no matching Apple MI child nodes.");
             LogAppleInterfaces();
             return;
         }
 
-        var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
-        var candidatesInf = new[]
-        {
-            Path.Combine(windows, "INF", "usbncm.inf"),
-            Path.Combine(windows, "INF", "netncm.inf")
-        }.Where(File.Exists).ToList();
-        if (candidatesInf.Count == 0)
-        {
-            try
-            {
-                candidatesInf = Directory.EnumerateFiles(
-                    Path.Combine(windows, "System32", "DriverStore", "FileRepository"),
-                    "usbncm.inf", SearchOption.AllDirectories).ToList();
-            }
-            catch { }
-        }
+        var target = targets[0]; // first NCM function has the interrupt endpoint and is tethering.
+        LogPnpDriverState(target.Id, "Before MS_COMP_WINNCM experiment");
+        LogPnpIds(target.Id);
+        LogPnpUtilDrivers(target.Id);
 
-        var inf = candidatesInf.FirstOrDefault();
-        WriteLog($"Windows NCM INF: {inf ?? "not found"}");
-        if (inf is null)
+        var inf = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "usbncm.inf");
+        WriteLog($"Microsoft UsbNcm INF present: {File.Exists(inf)} ({inf})");
+        if (!File.Exists(inf))
         {
-            WriteLog("No Microsoft UsbNcm INF is installed on this Windows system; leaving the existing Apple NCM driver untouched.");
+            WriteLog("usbncm.inf is not present; cannot perform MS_COMP_WINNCM experiment.");
             return;
         }
 
-        // Do not try to out-rank Apple's driver through SetupAPI.  Windows' inbox
-        // UsbNcm INF normally matches USB\MS_COMP_WINNCM / CDC-NCM class IDs, while
-        // Apple's composite child also has a more-specific VID/PID/MI hardware ID.
-        // Install a tiny device-specific companion INF which maps the actual Apple
-        // NCM control-interface hardware ID to Microsoft's existing UsbNcm install
-        // sections.  The companion package does not contain or replace UsbNcm.sys.
-        var companionTargets = targets.Take(1).ToList(); // first NCM function is the tethering function; later one is RemoteXPC
-        var companionInf = CreateNcmCompanionInf(companionTargets, out var companionError);
-        if (companionInf is null)
+        // TEST ONLY: PnP normally obtains CompatibleIDs from the bus driver.
+        // Add the Microsoft NCM compatible ID to this already-enumerated
+        // devnode and ask ConfigMgr to re-enumerate it.  We preserve every
+        // existing CompatibleIDs entry and log the before/after values.
+        if (!InjectMicrosoftNcmCompatibleId(target.Id, out var injectError))
         {
-            WriteLog($"NCM companion INF creation failed: {companionError}");
+            WriteLog($"MS_COMP_WINNCM injection failed: {injectError}");
+            WriteLog("No custom INF was generated or installed.");
             return;
         }
 
-        WriteLog($"NCM companion INF: {companionInf}");
-        var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{companionInf}\" /install");
-        WriteLog($"NCM companion INF registration exit code: {add.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"NCM companion INF output: {add.Output.Trim()}");
-        if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"NCM companion INF error: {add.Error.Trim()}");
+        WriteLog("MS_COMP_WINNCM injected successfully. Re-enumerating the target NCM devnode.");
+        if (!ReenumerateDevNode(target.Id, out var devError))
+            WriteLog($"Target NCM devnode re-enumeration failed: ConfigMgr error={devError}");
 
-        if (add.ExitCode != 0)
+        await Task.Delay(2500);
+        LogPnpDriverState(target.Id, "After MS_COMP_WINNCM experiment");
+        LogPnpIds(target.Id);
+        LogPnpUtilDrivers(target.Id);
+
+        var adapter = FindPhoneAdapter();
+        if (adapter?.OperationalStatus == OperationalStatus.Up)
         {
-            WriteLog("NCM companion INF was not accepted by PnP; no SetupAPI driver-ranking fallback will be attempted.");
+            WriteLog($"SUCCESS: MS_COMP_WINNCM experiment produced a usable USB Ethernet adapter: {adapter.Name}");
             return;
         }
 
-        // Give PnP a moment to apply the newly introduced exact hardware-ID match,
-        // then restart only the targeted Apple NCM devnode.  No USB mode change is
-        // performed here and Apple's global driver package is left installed.
-        foreach (var target in companionTargets)
-        {
-            WriteLog($"Restarting Apple NCM devnode after companion-INF install: {target.Id}");
-            try { RestartDevice(target.Id); } catch (Exception ex) { WriteLog($"NCM companion devnode restart: {ex.Message}"); }
-            await Task.Delay(2500);
-            LogPnpDriverState(target.Id, "after NCM companion INF");
-            LogPnpIds(target.Id);
-            LogPnpUtilDrivers(target.Id);
-
-            var adapter = FindPhoneAdapter();
-            if (adapter?.OperationalStatus == OperationalStatus.Up)
-            {
-                WriteLog($"NCM companion INF produced a usable adapter: {adapter.Name}");
-                return;
-            }
-        }
-
-        WriteLog("NCM companion INF installed, but no active USB Ethernet adapter is visible yet.");
+        WriteLog("MS_COMP_WINNCM experiment did not produce an active USB Ethernet adapter.");
+        WriteLog("This is a diagnostic result; no unsigned companion INF was installed.");
     }
 
-    private string? CreateNcmCompanionInf(IReadOnlyList<PnpDevice> targets, out string error)
+    private static bool InjectMicrosoftNcmCompatibleId(string instanceId, out string error)
     {
         error = "";
-        if (targets.Count == 0)
-        {
-            error = "no NCM target devnode was supplied";
-            return null;
-        }
-
-        var hardwareId = targets[0].Id;
-        if (!hardwareId.StartsWith("USB\\VID_", StringComparison.OrdinalIgnoreCase) ||
-            hardwareId.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase) < 0)
-        {
-            error = $"unexpected Apple NCM instance ID: {hardwareId}";
-            return null;
-        }
-
+        const string id = "USB\\MS_COMP_WINNCM";
         try
         {
-            var dir = Path.Combine(CacheDir, "NcmCompanion");
-            Directory.CreateDirectory(dir);
-            var safeName = hardwareId.Replace('\\', '_').Replace('&', '_').Replace(':', '_');
-            var infPath = Path.Combine(dir, $"iPhoneUsbShareNcm_{safeName}.inf");
+            var subKeyPath = $@"SYSTEM\CurrentControlSet\Enum\{instanceId}";
+            using var key = Registry.LocalMachine.OpenSubKey(subKeyPath, writable: true);
+            if (key is null)
+            {
+                error = $"PnP registry key not accessible: HKLM\\{subKeyPath}";
+                return false;
+            }
 
-            // This is deliberately an INF-only wrapper.  UsbNcm.sys and its Microsoft
-            // catalog remain owned by Windows; the wrapper simply supplies an exact
-            // Apple VID/PID/MI match and delegates installation to the inbox sections.
-            var inf = $$"""
-; iPhoneUsbShare Apple USB NCM companion INF
-; Generated for the currently enumerated Apple NCM tethering interface.
-; This package does not contain UsbNcm.sys; it delegates to Microsoft's inbox INF.
+            var before = key.GetValue("CompatibleIDs") as string[] ?? Array.Empty<string>();
+            WriteStaticLog($"MS_COMP_WINNCM experiment BEFORE: CompatibleIDs=[{string.Join(" | ", before)}]");
 
-[Version]
-Signature="$WINDOWS NT$"
-Class=Net
-ClassGuid={4d36e972-e325-11ce-bfc1-08002be10318}
-Provider=%ProviderName%
-DriverVer=09/14/2026,1.0.0.0
-PnpLockdown=1
-
-[Manufacturer]
-%ManufacturerName%=DeviceList,NTamd64
-
-[DeviceList.NTamd64]
-%DeviceDesc%=AppleUsbNcm_Device, {{hardwareId}}
-
-[AppleUsbNcm_Device.NT]
-Include=usbncm.inf
-Needs=UsbNcm_Device.NT
-
-[AppleUsbNcm_Device.NT.Services]
-Include=usbncm.inf
-Needs=UsbNcm_Device.NT.Services
-
-[Strings]
-ProviderName="iPhoneUsbShare"
-ManufacturerName="iPhoneUsbShare"
-DeviceDesc="Apple USB NCM (Microsoft UsbNcm)"
-""";
-
-            File.WriteAllText(infPath, inf, new UTF8Encoding(false));
-            WriteLog($"Generated Apple NCM companion INF for exact hardware ID: {hardwareId}");
-            WriteLog($"NCM companion INF contents: Include=usbncm.inf; Needs=UsbNcm_Device.NT / UsbNcm_Device.NT.Services");
-            return infPath;
+            if (!before.Any(x => x.Equals(id, StringComparison.OrdinalIgnoreCase)))
+            {
+                var after = before.Concat(new[] { id }).ToArray();
+                key.SetValue("CompatibleIDs", after, RegistryValueKind.MultiString);
+                WriteStaticLog($"MS_COMP_WINNCM experiment AFTER: CompatibleIDs=[{string.Join(" | ", after)}]");
+            }
+            else
+            {
+                WriteStaticLog("MS_COMP_WINNCM experiment: compatible ID already present.");
+            }
+            return true;
         }
         catch (Exception ex)
         {
-            error = ex.Message;
-            return null;
+            error = $"{ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
+    }
+
+    private const uint CR_SUCCESS = 0x00000000;
+    private const uint CM_REENUMERATE_NORMAL = 0x00000000;
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+
+    private static bool ReenumerateAppleCompositeDevNode(out uint error)
+    {
+        var phone = FindAppleDevice();
+        if (phone is null)
+        {
+            error = 1;
+            WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found.");
+            return false;
+        }
+        return ReenumerateDevNode(phone.Id, out error);
+    }
+
+    private static bool ReenumerateDevNode(string instanceId, out uint error)
+    {
+        error = 0;
+        try
+        {
+            var cr = CM_Locate_DevNodeW(out var devInst, instanceId, 0);
+            if (cr != CR_SUCCESS)
+            {
+                error = cr;
+                WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {instanceId}, CR=0x{cr:X8}");
+                return false;
+            }
+
+            cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
+            error = cr;
+            if (cr != CR_SUCCESS)
+            {
+                WriteStaticLog($"ConfigMgr: CM_Reenumerate_DevNode failed for {instanceId}, CR=0x{cr:X8}");
+                return false;
+            }
+
+            WriteStaticLog($"ConfigMgr: re-enumerated devnode {instanceId} successfully.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = 1;
+            WriteStaticLog($"ConfigMgr devnode re-enumeration failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
         }
     }
 
@@ -492,207 +461,4 @@ DeviceDesc="Apple USB NCM (Microsoft UsbNcm)"
         try { lock (LogFileLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), line + Environment.NewLine, new UTF8Encoding(false)); } catch { }
     }
 
-    private const uint CR_SUCCESS = 0x00000000;
-    private const uint CM_REENUMERATE_NORMAL = 0x00000000;
 
-    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
-
-    [DllImport("cfgmgr32.dll")]
-    private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
-
-    private static bool ReenumerateAppleCompositeDevNode(out uint error)
-    {
-        error = 0;
-        try
-        {
-            var phone = FindAppleDevice();
-            if (phone is null)
-            {
-                error = 1;
-                WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found.");
-                return false;
-            }
-
-            var cr = CM_Locate_DevNodeW(out var devInst, phone.Id, 0);
-            if (cr != CR_SUCCESS)
-            {
-                error = cr;
-                WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
-                return false;
-            }
-
-            cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
-            error = cr;
-            if (cr != CR_SUCCESS)
-            {
-                WriteStaticLog($"ConfigMgr: CM_Reenumerate_DevNode failed for {phone.Id}, CR=0x{cr:X8}");
-                return false;
-            }
-
-            WriteStaticLog($"ConfigMgr: re-enumerated Apple composite devnode {phone.Id} successfully.");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            error = 1;
-            WriteStaticLog($"ConfigMgr re-enumeration failed: {ex.GetType().Name}: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static void ConfigureUsbCgpEnumerator(string pnpId)
-    {
-        try
-        {
-            using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{pnpId}", writable: true);
-            var drv = baseKey?.GetValue("Driver") as string;
-            if (string.IsNullOrWhiteSpace(drv)) throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
-            using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true);
-            if (sw is null) throw new InvalidOperationException($"Cannot open usbccgp software key {drv}.");
-            sw.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
-            var lower = baseKey!.GetValue("LowerFilters") as string[];
-            if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
-            {
-                var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
-                if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false);
-                else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
-                WriteStaticLog($"Removed AppleLowerFilter from {pnpId}.");
-            }
-            WriteStaticLog($"usbccgp EnumeratorClass set to 02 00 00 on {drv}; re-enumeration will regenerate CDC compatible IDs.");
-        }
-        catch (Exception ex) { WriteStaticLog($"usbccgp EnumeratorClass update failed: {ex.GetType().Name}: {ex.Message}"); throw; }
-    }
-
-    private void ConfigureUsbDevice(PnpDevice phone)
-    {
-        using var baseKey = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{phone.Id}", writable: true) ?? throw new InvalidOperationException("Cannot open the Apple USB PnP registry key.");
-        var drv = baseKey.GetValue("Driver") as string;
-        if (string.IsNullOrWhiteSpace(drv)) throw new InvalidOperationException("Apple USB device has no usbccgp driver key.");
-        using var sw = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Control\Class\{drv}", writable: true) ?? throw new InvalidOperationException("Cannot open the usbccgp software key.");
-        sw.SetValue("EnumeratorClass", new byte[] { 0x02, 0x00, 0x00 }, RegistryValueKind.Binary);
-        var lower = baseKey.GetValue("LowerFilters") as string[];
-        if (lower is not null && lower.Contains("AppleLowerFilter", StringComparer.OrdinalIgnoreCase))
-        {
-            var remaining = lower.Where(x => !x.Equals("AppleLowerFilter", StringComparison.OrdinalIgnoreCase)).ToArray();
-            if (remaining.Length == 0) baseKey.DeleteValue("LowerFilters", false); else baseKey.SetValue("LowerFilters", remaining, RegistryValueKind.MultiString);
-        }
-        SetConfig(phone.Id, SafeIndexValue, "0"); RestartDevice(phone.Id);
-    }
-
-    private static void SetConfig(string pnpId, string original, string alt)
-    {
-        using var k = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{pnpId}\Device Parameters", writable: true) ?? throw new InvalidOperationException("Cannot open Apple USB device parameters.");
-        k.SetValue("OriginalConfigurationValue", uint.Parse(original), RegistryValueKind.DWord); k.SetValue("AltConfigurationValue", uint.Parse(alt), RegistryValueKind.DWord);
-    }
-
-    private static void RestartDevice(string id)
-    {
-        var result = RunAllowRestart("pnputil.exe", $"/restart-device \"{id}\"");
-        if (result.ExitCode != 0 && result.ExitCode != 3010) throw new InvalidOperationException($"PNPUTIL.exe failed ({result.ExitCode}): {result.Error}");
-    }
-
-    private static void DisablePhotoInterfaces()
-    {
-        foreach (var d in FindPnP("VID_05AC&PID_", "WPD"))
-        {
-            if (!d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase)) continue;
-            var r = RunAllowRestart("pnputil.exe", $"/disable-device \"{d.Id}\"");
-            if (r.ExitCode != 0 && r.ExitCode != 3010) throw new InvalidOperationException($"PNPUTIL.exe failed ({r.ExitCode}): {r.Error}");
-        }
-    }
-
-    private static CommandResult RunAllowRestart(string file, string args)
-    {
-        var psi = new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        using var p = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {file}.");
-        var output = p.StandardOutput.ReadToEnd(); var error = p.StandardError.ReadToEnd(); p.WaitForExit(); return new CommandResult(p.ExitCode, output, error);
-    }
-
-    private async Task ConfigureIcsAsync(string wifi, string phoneAdapter)
-    {
-        WriteLog($"Configuring Internet Connection Sharing: {wifi} -> {phoneAdapter}"); DisableAllIcs();
-        var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare") ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
-        dynamic mgr = Activator.CreateInstance(mgrType)!; dynamic? wifiCfg = null, phoneCfg = null;
-        foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name == wifi) wifiCfg = mgr.INetSharingConfigurationForINetConnection(c); if ((string)props.Name == phoneAdapter) phoneCfg = mgr.INetSharingConfigurationForINetConnection(c); }
-        if (wifiCfg is null || phoneCfg is null) throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
-        wifiCfg.EnableSharing(0); phoneCfg.EnableSharing(1); await Task.Delay(3000); WriteLog("Internet Connection Sharing enabled.");
-    }
-
-    private static void DisableAllIcs()
-    {
-        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); if ((bool)cfg.SharingEnabled) cfg.DisableSharing(); } } catch { }
-    }
-
-    private static bool IsIcsEnabled(string name)
-    {
-        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return false; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name != name) continue; dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); return (bool)cfg.SharingEnabled; } } catch { }
-        return false;
-    }
-
-    private static string? FindLease(string adapterName)
-    {
-        try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); if (nic is null) return null; foreach (var ua in nic.GetIPProperties().UnicastAddresses) if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && ua.Address.ToString().StartsWith(Subnet, StringComparison.Ordinal)) return ua.Address.ToString(); } catch { }
-        return null;
-    }
-
-    private static (double Rx, double Tx) GetRates(string adapterName)
-    {
-        try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
-    }
-
-    private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && n.OperationalStatus == OperationalStatus.Up);
-
-    private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.OperationalStatus == OperationalStatus.Up && (n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)) && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211);
-
-    private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
-    {
-        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, Name, PNPClass FROM Win32_PnPEntity");
-        foreach (ManagementObject o in searcher.Get())
-        {
-            var id = o["PNPDeviceID"]?.ToString() ?? "";
-            var name = o["Name"]?.ToString() ?? "";
-            var cls = o["PNPClass"]?.ToString() ?? "";
-            if (id.Contains(hardwareContains, StringComparison.OrdinalIgnoreCase) && (className is null || cls.Equals(className, StringComparison.OrdinalIgnoreCase))) yield return new PnpDevice(id, name);
-        }
-    }
-
-    private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_", null)
-        .Where(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-        .FirstOrDefault();
-
-    private static string GetApplePid(string id)
-    {
-        var marker = "PID_";
-        var start = id.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        if (start < 0) throw new InvalidOperationException($"Unable to determine Apple USB PID from PnP ID: {id}");
-        start += marker.Length;
-        var end = id.IndexOf('&', start);
-        return (end < 0 ? id[start..] : id[start..end]).Trim();
-    }
-
-    private static void LogAppleInterfaces()
-    {
-        foreach (var d in FindPnP("USB\\VID_05AC&PID_", null))
-            WriteStaticLog($"Apple USB PnP node: {d.Id} | {d.Name}");
-    }
-
-    private static bool TryGetInterfaceNumber(string id, out int number)
-    {
-        number = -1;
-        var marker = "&MI_";
-        var start = id.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        if (start < 0 || start + marker.Length + 2 > id.Length) return false;
-        return int.TryParse(id.Substring(start + marker.Length, 2), System.Globalization.NumberStyles.HexNumber, null, out number);
-    }
-
-    private static async Task WaitUntil(Func<bool> predicate, int seconds, string what)
-    {
-        for (var i = 0; i < seconds; i++) { if (predicate()) return; await Task.Delay(1000); }
-        throw new TimeoutException($"Timed out waiting for {what}.");
-    }
-
-    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
-    private readonly record struct CommandResult(int ExitCode, string Output, string Error);
-    private sealed record PnpDevice(string Id, string Name);
-}
