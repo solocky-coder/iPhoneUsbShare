@@ -1,18 +1,118 @@
-# iPhoneUsbShare — AppleNcm driver bring-up
+# iPhone USB Share — simple Windows EXE
 
-This revision adds the first real Windows kernel-mode USB CDC-NCM host driver component.
+This is a native C#/.NET 8 WPF implementation of the Windows-side orchestration used by
+`0xbaksa/iphone-usb-reverse-tethering-windows`.
 
-The driver is based on Microsoft's open-source NCM host driver sample, using KMDF + NetAdapterCx and the NCM NTB datapath. Microsoft documents that NetAdapterCx is available to KMDF NIC drivers starting with Windows 10 version 2004, and Microsoft's NCM repository describes its host driver as the basis for the Windows 11 UsbNcm implementation.
+It is **not** a GUI wrapper around the PowerShell scripts. The app performs the PnP/registry,
+libusb control-transfer, and Internet Connection Sharing operations itself. It uses the
+libusb-win32 signed filter driver because Windows' composite USB stack does not expose the
+iPhone's vendor control request directly.
 
-The Apple-specific driver change is important for this project: iOS 16+ can expose two NCM-like functions. The tethering function has an interrupt endpoint and a CDC Union descriptor pairing control interface 2 with data interface 3; the second RemoteXPC function has no interrupt endpoint. The driver therefore selects the interrupt-bearing NCM control function and follows its Union descriptor instead of pairing the last NCM control interface with the last data interface.
+## What the finished app does
 
-## First bring-up limitation
+1. Requests administrator elevation.
+2. Detects an iPhone.
+3. On first run, downloads libusb-win32 1.4.0.2 and verifies its SHA-256.
+4. Installs the libusb-win32 filter scoped to the **currently connected Apple USB device PID** (Apple VID `05AC`); `12A8`/`12AB` are not used as the compatibility allowlist.
+5. Enables CDC enumeration in `usbccgp` and detaches `AppleLowerFilter`.
+6. Disables the PTP/photo-import interface while sharing to avoid iOS trust/reset races.
+7. Performs the ordered mode sequence:
+   - configuration index 2
+   - restart
+   - `GET_MODE` expecting `3:3:3:0`
+   - configuration index 4
+   - `SET_MODE 3`
+8. Waits for Windows `UsbNcm` to expose a USB Ethernet adapter.
+9. Enables Windows ICS from Wi-Fi → iPhone USB Ethernet.
+10. Shows the phone's `192.168.137.x` address and live connection state.
 
-The first INF deliberately matches the exact interface observed during the current hardware test (`USB\\VID_05AC&PID_12AB&MI_02`). This is a driver bring-up gate so that we can prove the kernel/data path independently of Apple's `netaapl64.sys`. It is not intended to become the project's final compatibility policy.
+## Build
 
-Run the existing iPhoneUsbShare application first so the iPad is in NCM mode, then install the generated development package. The normal Windows driver-signing requirements still apply; this first package is intended for test/development signing.
+Build target: **Windows 10 x64**. Development requires Visual Studio 2022 or the .NET 8 SDK.
 
-## Sources
+```powershell
+dotnet restore
+dotnet publish .\src\iPhoneUsbShare.csproj -c Release -r win-x64 --self-contained true
+```
 
-Microsoft NCM Driver for Windows: https://github.com/microsoft/NCM-Driver-for-Windows
-Microsoft NetAdapterCx: https://learn.microsoft.com/en-us/windows-hardware/drivers/netcx/
+The single-file executable is emitted under:
+
+`src\bin\Release\net8.0-windows\win-x64\publish\iPhoneUsbShare.exe`
+
+For a distributable build, copy that EXE to a clean Windows 10 x64 machine and test
+with an iPhone or iPad using a data-capable cable.
+
+## Important testing note
+
+The upstream project reports testing on one iPhone / iOS / Windows combination. USB
+descriptors and PnP behavior can differ by model/iOS version. The USB discovery and NCM-interface selection are now capability-based: the Apple PID is discovered dynamically, and CDC-NCM is selected from the Windows PnP `CDC_0D` interface collections created by `usbccgp`, rather than hard-coded `MI_02`/`MI_04` values. The Apple mode-switch sequence intentionally follows the proven Windows path: safe configuration 2 → restart → verify `GET_MODE` → arm configuration 4 → `SET_MODE(3)`.
+
+If a model reports a different PID/configuration, the constants should be moved into a
+device-profile table rather than blindly switching it.
+
+## License / attribution
+
+The integration logic is based on the public MIT-licensed project:
+
+https://github.com/0xbaksa/iphone-usb-reverse-tethering-windows
+
+The app also redistributes/obtains libusb-win32 under its upstream LGPL terms. Keep the
+upstream license/notice with release builds.
+
+## What is intentionally not included
+
+No Apple software, private Apple components, or kernel patches are included. The app uses
+Windows' built-in PnP/ICS functionality and the signed libusb-win32 filter driver.
+
+
+## Getting the Windows EXE without building locally
+
+This repository includes `.github/workflows/build-windows.yml`. On GitHub, open **Actions → Build Windows EXE → Run workflow**. GitHub's Windows runner compiles a self-contained x64 executable and uploads `iPhoneUsbShare-win-x64.zip` as an artifact. Extract it and run `iPhoneUsbShare.exe`; no .NET or Visual Studio installation is required on the target PC.
+
+## iPad Air 2 support
+
+The application does not define compatibility by Apple PID. It discovers the connected Apple VID `05AC` device and only proceeds when the device exposes the required mode-switch control path and Windows subsequently enumerates a CDC-NCM (`CDC_0D`) function. The iPad Air 2 observation remains useful as a test case, but it is no longer a special-case requirement in the code. Because iPadOS 15+ behavior across models has not been exhaustively tested, the application must verify the actual USB mode/control protocol instead of claiming universal compatibility from the PID alone.
+
+
+
+### NCM / OS compatibility
+
+This transport is only available on Apple OS versions/devices that actually expose the CDC-NCM mode. The referenced upstream research documents the two-function CDC-NCM behavior beginning with iOS 16, so **iOS/iPadOS 15 is not a compatibility claim for this implementation**; an iOS/iPadOS 15 device may switch modes but still never expose a `CDC_0D` NCM function. The app therefore fails at the capability-detection step instead of treating a PID as proof of compatibility.
+
+Windows 10 supports USB NCM host operation on supported releases; Microsoft documents CDC/NCM support and the `UsbNcm.sys`/`UsbNcm.inf` driver path, while the CDC enumeration setting is required on Windows 10.
+
+### Build package revision
+The GitHub Actions package builds the self-contained Windows 10 x64 application and bundles only the libusb runtime needed for the user-space mode switch; the NCM network function is intended to use Windows’ in-box `UsbNcm` driver.
+
+### Current build path
+The old Apple Mobile Device Ethernet driver files remain in the repository for historical/reference purposes, but the current NCM path does not select them.
+
+## Latest NCM implementation note
+
+The Windows USB stack may expose Apple's NCM union as ordinary `VID_05AC&PID_xxxx&MI_nn` child nodes rather than a PnP ID containing `CDC_0D`, especially on Windows 10. The application therefore identifies NCM from the live USB descriptors, maps the descriptor interface number to the corresponding PnP child, and selects Microsoft's `UsbNcm` driver through SetupAPI. It does not hard-code `MI_02`, `MI_04`, or an Apple PID.
+
+The first NCM control function is preferred because the iOS 16+ dual-function layout identifies the function with the interrupt endpoint as the tethering function; the second function is the RemoteXPC channel and is not expected to become a usable NIC.
+
+
+## Driver-binding diagnostic/fix revision
+
+This revision re-applies the `usbccgp` CDC enumeration policy (`EnumeratorClass = 02 00 00`) on every start before the Apple device is restarted, so machines upgraded from an earlier build cannot retain a stale composite-device enumeration policy. Microsoft documents this registry setting for CDC interface-collection enumeration.
+
+The NCM binding stage also records each NCM child's HardwareID/CompatibleIDs, current service/driver state, and the output of `pnputil /enum-devices /instanceid ... /drivers`. If an exact `usbncm.inf` entry is not returned by SetupAPI, it falls back to Windows' best-compatible-driver selection rather than treating `ERROR_NO_MORE_ITEMS (259)` as a terminal driver-binding failure.
+
+## NCM devnode driver replacement fix
+
+The current NCM binding path identifies CDC-NCM control interfaces from the live USB descriptors, maps them to their Windows `MI_xx` devnodes, and then performs a **targeted Microsoft UsbNcm driver replacement on that devnode**. It does not uninstall Apple's driver package globally. The installation path restricts SetupAPI's driver search to the staged `usbncm.inf`, selects that driver node explicitly, and uses `DiInstallDevice` for the selected devnode. This is intended to avoid normal driver ranking choosing the older Apple Netaapl package by its more-specific VID/PID/MI hardware ID.
+
+The obsolete `iPhoneUsbShare Apple NCM (Test)` package is not deleted automatically; the app only replaces the driver on the active NCM devnode. This avoids changing unrelated devices and makes the result reversible through Windows Device Manager/driver installation tooling.
+
+
+### NCM driver-node selection follow-up
+The devnode replacement path now selects the Windows in-box `UsbNcm Host Device` SetupAPI driver node directly. This avoids `SetupDiGetDriverInfoDetail`, which on some Windows 10 builds returns `ERROR_INVALID_USER_BUFFER` (1784) even while enumerating the correct driver list.
+
+## AppleNcm bring-up diagnostic
+
+The current bring-up can use a bundled AppleNcm function driver to test binding
+against the descriptor-identified tethering NCM child. This is intentionally a
+bring-up path and is not yet the final compatibility definition; the exact
+MI_02 hardware ID remains temporary for proving the driver path.
