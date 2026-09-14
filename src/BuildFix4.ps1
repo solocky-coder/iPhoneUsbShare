@@ -13,7 +13,7 @@ $replacement = @'
         for (var attempt = 1; attempt <= 30; attempt++)
         {
             controls = FindPnP("VID_05AC&PID_12AB", null)
-                .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
+                .Where(d => d.Id.Contains("&MI_02\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\", StringComparison.OrdinalIgnoreCase))
                 .ToList();
             if (controls.Count > 0)
             {
@@ -46,8 +46,8 @@ $replacement = @'
             throw new InvalidOperationException("Apple accepted CDC-NCM mode, but Windows did not expose MI_02/MI_04. The device did not finish CDC-NCM re-enumeration.");
         }
 
-        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase))
-                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase));
+        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_02\", StringComparison.OrdinalIgnoreCase))
+                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_04\", StringComparison.OrdinalIgnoreCase));
         if (target is null) return;
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
 
@@ -205,7 +205,7 @@ $replacement = @'
         try
         {
             Marshal.WriteInt32(buffer, (int)NativeSpDrvInfoDetailSize);
-            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, bufferSize, out requiredSize))
+            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, (uint)bufferSize, out requiredSize))
             {
                 error = Marshal.GetLastWin32Error();
                 return null;
