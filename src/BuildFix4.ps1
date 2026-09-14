@@ -119,7 +119,8 @@ $replacement = @'
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
                 WriteLog($"SetupAPI found target devnode: {id}");
-                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER))
+
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
                 {
                     error = (uint)Marshal.GetLastWin32Error();
                     return false;
@@ -130,7 +131,7 @@ $replacement = @'
                     for (uint driverIndex = 0; ; driverIndex++)
                     {
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
-                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_COMPATDRIVER, driverIndex, ref driver))
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
                         {
                             var e = Marshal.GetLastWin32Error();
                             if (e == ERROR_NO_MORE_ITEMS) break;
@@ -138,15 +139,16 @@ $replacement = @'
                             return false;
                         }
                         candidateCount++;
-                        var detail = GetDriverInfoDetail(h, ref devInfo, ref driver);
-                        if (!detail.HasValue)
+                        var detail = GetDriverInfoDetail(h, ref devInfo, ref driver, out var detailError);
+                        if (detail is null)
                         {
-                            WriteLog($"SetupAPI compatible candidate {driverIndex}: detail lookup failed, Win32Error={Marshal.GetLastWin32Error()}");
+                            WriteLog($"SetupAPI class candidate {driverIndex}: detail lookup failed, Win32Error={detailError}");
                             continue;
                         }
-                        var detailInf = detail.Value.InfFileName;
-                        WriteLog($"SetupAPI compatible candidate {driverIndex}: {detailInf} | {driver.Description}");
+                        var detailInf = detail;
+                        WriteLog($"SetupAPI class candidate {driverIndex}: {detailInf} | {driver.Description} | provider={driver.ProviderName}");
                         if (!string.Equals(Path.GetFileName(detailInf), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
+
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
@@ -161,11 +163,11 @@ $replacement = @'
                         WriteLog("SetupAPI class installer installed the selected UsbNcm driver on the target devnode.");
                         return true;
                     }
-                    WriteLog($"SetupAPI compatible-driver enumeration ended with {candidateCount} candidate(s).");
+                    WriteLog($"SetupAPI class-driver enumeration ended with {candidateCount} candidate(s).");
                     error = ERROR_NO_MORE_ITEMS;
                     return false;
                 }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER); }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
             }
             error = ERROR_NO_SUCH_DEVINST;
             return false;
@@ -180,27 +182,46 @@ $replacement = @'
         return buffer.ToString();
     }
 
-    private static SP_DRVINFO_DETAIL_DATA? GetDriverInfoDetail(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver)
+    private static string? GetDriverInfoDetail(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver, out int error)
     {
-        var detail = new SP_DRVINFO_DETAIL_DATA { cbSize = 8 };
-        var size = Marshal.SizeOf<SP_DRVINFO_DETAIL_DATA>();
-        var buffer = Marshal.AllocHGlobal(size);
+        error = 0;
+        uint requiredSize = 0;
+        var first = SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, IntPtr.Zero, 0, out requiredSize);
+        if (first)
+        {
+            error = 0;
+            return null;
+        }
+
+        var firstError = Marshal.GetLastWin32Error();
+        if (firstError != ERROR_INSUFFICIENT_BUFFER || requiredSize < NativeSpDrvInfoDetailSize)
+        {
+            error = firstError;
+            return null;
+        }
+
+        var bufferSize = checked((int)Math.Max(requiredSize, (uint)(NativeSpDrvInfoDetailSize + 2)));
+        var buffer = Marshal.AllocHGlobal(bufferSize);
         try
         {
-            Marshal.StructureToPtr(detail, buffer, false);
-            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, size, out _))
+            Marshal.WriteInt32(buffer, (int)NativeSpDrvInfoDetailSize);
+            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, bufferSize, out requiredSize))
             {
-                var e = Marshal.GetLastWin32Error();
-                if (e != ERROR_INSUFFICIENT_BUFFER) return null;
+                error = Marshal.GetLastWin32Error();
+                return null;
             }
-            return Marshal.PtrToStructure<SP_DRVINFO_DETAIL_DATA>(buffer);
+
+            var infOffset = IntPtr.Size == 8 ? 536 : 532;
+            var inf = Marshal.PtrToStringUni(IntPtr.Add(buffer, infOffset));
+            return string.IsNullOrWhiteSpace(inf) ? null : inf;
         }
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
+    private static readonly int NativeSpDrvInfoDetailSize = IntPtr.Size == 8 ? 1576 : 1568;
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_ALLCLASSES = 0x00000004;
-    private const uint SPDIT_COMPATDRIVER = 0x00000002;
+    private const uint SPDIT_CLASSDRIVER = 0x00000001;
     private const uint DIF_INSTALLDEVICE = 0x00000001;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
@@ -221,25 +242,12 @@ $replacement = @'
     {
         public uint cbSize;
         public uint DriverType;
-        public ulong Reserved;
+        public IntPtr Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Description;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ManufacturerName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ProviderName;
         public long DriverDate;
         public ulong DriverVersion;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct SP_DRVINFO_DETAIL_DATA
-    {
-        public uint cbSize;
-        public long InfDate;
-        public uint CompatIDsOffset;
-        public uint CompatIDsLength;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string SectionName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string InfFileName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DrvDescription;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 1)] public string HardwareID;
     }
 
     [DllImport("setupapi.dll", SetLastError = true)]
@@ -252,8 +260,8 @@ $replacement = @'
     private static extern bool SetupDiBuildDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetupDiEnumDriverInfo(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType, uint memberIndex, ref SP_DRVINFO_DATA driverInfoData);
-    [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiGetDriverInfoDetail(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, IntPtr driverInfoDetailData, int driverInfoDetailDataSize, out int requiredSize);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetupDiGetDriverInfoDetail(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, IntPtr driverInfoDetailData, uint driverInfoDetailDataSize, out uint requiredSize);
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiSetSelectedDriver(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData);
     [DllImport("setupapi.dll", SetLastError = true)]
