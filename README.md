@@ -105,3 +105,15 @@ The NCM binding stage also records each NCM child's HardwareID/CompatibleIDs, cu
 The current NCM binding path identifies CDC-NCM control interfaces from the live USB descriptors, maps them to their Windows `MI_xx` devnodes, and then performs a **targeted Microsoft UsbNcm driver replacement on that devnode**. It does not uninstall Apple's driver package globally. The installation path restricts SetupAPI's driver search to the staged `usbncm.inf`, selects that driver node explicitly, and uses `DiInstallDevice` for the selected devnode. This is intended to avoid normal driver ranking choosing the older Apple Netaapl package by its more-specific VID/PID/MI hardware ID.
 
 The obsolete `iPhoneUsbShare Apple NCM (Test)` package is not deleted automatically; the app only replaces the driver on the active NCM devnode. This avoids changing unrelated devices and makes the result reversible through Windows Device Manager/driver installation tooling.
+
+
+### NCM driver-node selection follow-up
+The devnode replacement path now selects the Windows in-box `UsbNcm Host Device` SetupAPI driver node directly. This avoids `SetupDiGetDriverInfoDetail`, which on some Windows 10 builds returns `ERROR_INVALID_USER_BUFFER` (1784) even while enumerating the correct driver list.
+
+## NCM companion-INF binding revision
+
+This revision stops trying to force Microsoft's `UsbNcm` driver through SetupAPI driver ranking. After descriptor-based discovery of the Apple NCM tethering control interface, the application generates a small device-specific companion INF containing an exact `USB\VID_xxxx&PID_yyyy&MI_zz` hardware-ID match. The companion INF delegates the actual installation to the Windows inbox `usbncm.inf` sections and does not ship or replace `UsbNcm.sys`.
+
+The companion package is staged with `pnputil /add-driver ... /install`, then only the targeted Apple NCM devnode is restarted. The existing Apple driver package is not globally uninstalled, and USB mode/configuration logic is unchanged by this revision.
+
+The first descriptor-discovered NCM function is used because iOS 16+ can expose a second NCM function for RemoteXPC that is not the tethering network function.
