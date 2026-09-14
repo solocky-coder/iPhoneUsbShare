@@ -1,8 +1,9 @@
 # Run elevated on the target Windows 10 x64 machine.
-# This script stages AppleNcm and then explicitly updates the observed MI_02
-# PDO. Staging alone is intentionally not treated as proof of binding.
+# This script stages AppleNcm and then explicitly updates the MI_02 hardware ID.
+# Staging alone is intentionally not treated as proof of binding.
 param(
-    [string]$DeviceInstanceId = 'USB\VID_05AC&PID_12AB&MI_02',
+    [string]$HardwareId = 'USB\VID_05AC&PID_12AB&MI_02',
+    [string]$DeviceInstanceId = '',
     [string]$DriverPackage = ''
 )
 
@@ -19,7 +20,8 @@ if (-not (Test-Path $sys)) { throw "AppleNcm.sys not found next to $inf" }
 if (-not (Test-Path $cat)) { throw "AppleNcm.cat not found next to $inf" }
 
 Write-Host "AppleNcm bring-up INF: $inf"
-Write-Host "AppleNcm target PDO: $DeviceInstanceId"
+Write-Host "AppleNcm target hardware ID: $HardwareId"
+if ($DeviceInstanceId) { Write-Host "AppleNcm target instance: $DeviceInstanceId" }
 
 # First stage/register the package. This is necessary but is NOT the forced
 # binding experiment by itself.
@@ -29,9 +31,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "pnputil /add-driver failed with exit code $LASTEXITCODE. Check driver signing/package validity before changing USB/NCM code."
 }
 
-# Prefer DevCon's UpdateDriverForPlugAndPlayDevices operation because it asks
-# Windows to update this exact PDO from this exact INF rather than merely
-# staging a package and hoping ranking selects it.
+# DevCon's update operation takes a hardware ID, not a device-instance ID.
+# Windows then applies the supplied INF to matching devices. This is the
+# explicit bring-up step intended to replace the currently selected Apple
+# Netaapl driver for MI_02.
 $devcon = $null
 $candidates = @(
     (Get-Command devcon.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
@@ -49,15 +52,23 @@ Do not interpret a successful pnputil /add-driver result as proof that AppleNcm 
 }
 
 Write-Host "Forcing driver update with: $devcon"
-& $devcon update $inf $DeviceInstanceId
+& $devcon update $inf $HardwareId
 if ($LASTEXITCODE -ne 0) {
-    throw "DevCon update failed with exit code $LASTEXITCODE for $DeviceInstanceId."
+    throw "DevCon update failed with exit code $LASTEXITCODE for hardware ID $HardwareId."
 }
 
-Write-Host "`nTarget device after forced update:`n"
-& pnputil.exe /enum-devices /instanceid $DeviceInstanceId /drivers
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "pnputil could not enumerate $DeviceInstanceId. Check Device Manager/SetupAPI logs manually."
+Write-Host "`nDriver state after forced update:`n"
+if ($DeviceInstanceId) {
+    & pnputil.exe /enum-devices /instanceid $DeviceInstanceId /drivers
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil could not enumerate $DeviceInstanceId. Check Device Manager/SetupAPI logs manually."
+    }
+} else {
+    Write-Host "No instance ID supplied; enumerating devices matching $HardwareId."
+    & pnputil.exe /enum-devices /deviceid $HardwareId /drivers
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil could not enumerate devices matching $HardwareId. Check Device Manager/SetupAPI logs manually."
+    }
 }
 
 Write-Host "`nExpected decisive state: Service=AppleNcm, selected driver AppleNcm.inf, and no Code 10."
