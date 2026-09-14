@@ -23,30 +23,15 @@ jobs:
           dotnet restore .\src\iPhoneUsbShare.csproj
           dotnet publish .\src\iPhoneUsbShare.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o .\artifacts\publish
 
-      - name: Download official libusb-win32 runtime
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/mcuee/libusb-win32/releases/download/release_1.4.0.2/libusb-win32-bin-1.4.0.2.zip'
-          $zip = Join-Path $env:RUNNER_TEMP 'libusb-win32.zip'
-          $expected = '00004c92cdb99be36e17fb2377165eb97e63b48ba895bfc04a642ea9c3e26d94'
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'libusb-win32 SHA-256 mismatch.' }
-          $extract = Join-Path $env:RUNNER_TEMP 'libusb-win32'
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
-          $dll = Join-Path $extract 'libusb-win32-bin-1.4.0.2\bin\amd64\libusb0.dll'
-          if (-not (Test-Path $dll)) { throw 'x64 libusb0.dll not found.' }
-          New-Item -ItemType Directory -Force .\artifacts\package | Out-Null
-          Copy-Item $dll .\artifacts\package\libusb0.dll -Force
-
       - name: Package ready-to-run ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $package = '.\artifacts\package'
+          New-Item -ItemType Directory -Force $package | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
-          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'libusb-win32 1.4.0.2`r`nWindows UsbNcm is an in-box Windows network class driver.'
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components.'
           Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
           Get-Item .\artifacts\iPhoneUsbShare-win-x64.zip | Select-Object FullName,Length
 
