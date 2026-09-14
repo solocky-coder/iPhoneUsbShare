@@ -31,6 +31,10 @@ jobs:
         shell: pwsh
         run: .\src\BuildFix4.ps1
 
+      - name: Normalize generated C# source
+        shell: pwsh
+        run: .\src\FixGeneratedShareEngine.ps1
+
       - name: Publish EXE
         shell: pwsh
         run: |
