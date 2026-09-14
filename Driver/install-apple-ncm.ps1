@@ -1,12 +1,12 @@
 # Run elevated on the target Windows 10 x64 machine.
 # This script stages AppleNcm and then explicitly updates the observed MI_02
 # PDO. Staging alone is intentionally not treated as proof of binding.
-$ErrorActionPreference = 'Stop'
 param(
     [string]$DeviceInstanceId = 'USB\VID_05AC&PID_12AB&MI_02',
     [string]$DriverPackage = ''
 )
 
+$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $inf = if ($DriverPackage) { $DriverPackage } else { Join-Path $root 'artifacts\AppleNcm\AppleNcm.inf' }
 if (-not (Test-Path $inf)) { $inf = Join-Path $root 'AppleNcm.inf' }
