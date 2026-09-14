@@ -395,7 +395,7 @@ public sealed class ShareEngine
             // This is deliberately an INF-only wrapper.  UsbNcm.sys and its Microsoft
             // catalog remain owned by Windows; the wrapper simply supplies an exact
             // Apple VID/PID/MI match and delegates installation to the inbox sections.
-            var inf = $"""
+            var inf = $$"""
 ; iPhoneUsbShare Apple USB NCM companion INF
 ; Generated for the currently enumerated Apple NCM tethering interface.
 ; This package does not contain UsbNcm.sys; it delegates to Microsoft's inbox INF.
@@ -403,7 +403,7 @@ public sealed class ShareEngine
 [Version]
 Signature="$WINDOWS NT$"
 Class=Net
-ClassGuid={{4d36e972-e325-11ce-bfc1-08002be10318}}
+ClassGuid={4d36e972-e325-11ce-bfc1-08002be10318}
 Provider=%ProviderName%
 DriverVer=09/14/2026,1.0.0.0
 PnpLockdown=1
@@ -412,13 +412,13 @@ PnpLockdown=1
 %ManufacturerName%=DeviceList,NTamd64
 
 [DeviceList.NTamd64]
-%DeviceDesc%=UsbNcm_Device, {hardwareId}
+%DeviceDesc%=AppleUsbNcm_Device, {{hardwareId}}
 
-[UsbNcm_Device.NT]
+[AppleUsbNcm_Device.NT]
 Include=usbncm.inf
 Needs=UsbNcm_Device.NT
 
-[UsbNcm_Device.NT.Services]
+[AppleUsbNcm_Device.NT.Services]
 Include=usbncm.inf
 Needs=UsbNcm_Device.NT.Services
 
