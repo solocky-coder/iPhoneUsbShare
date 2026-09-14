@@ -9,7 +9,7 @@ $replacement = @'
     private async Task BindUsbNcmDriverAsync()
     {
         var controls = FindPnP("VID_05AC&PID_12AB", null)
-            .Where(d => d.Id.Contains("&MI_02\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\", StringComparison.OrdinalIgnoreCase))
+            .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
             .ToList();
         foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
         if (controls.Count == 0)
@@ -20,8 +20,8 @@ $replacement = @'
 
         // Prefer MI_02: captured CDC-NCM descriptors show MI_02 has one
         // interrupt endpoint, while MI_04 has zero endpoints.
-        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_02\", StringComparison.OrdinalIgnoreCase))
-                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_04\", StringComparison.OrdinalIgnoreCase));
+        var target = controls.FirstOrDefault(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase))
+                     ?? controls.FirstOrDefault(d => d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase));
         if (target is null) return;
 
         var hardwareId = target.Id;
