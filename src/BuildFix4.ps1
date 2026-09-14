@@ -119,7 +119,7 @@ $replacement = @'
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
                 WriteLog($"SetupAPI found target devnode: {id}");
-                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER))
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
                 {
                     error = (uint)Marshal.GetLastWin32Error();
                     return false;
@@ -129,7 +129,7 @@ $replacement = @'
                     for (uint driverIndex = 0; ; driverIndex++)
                     {
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
-                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_COMPATDRIVER, driverIndex, ref driver))
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
                         {
                             var e = Marshal.GetLastWin32Error();
                             if (e == ERROR_NO_MORE_ITEMS) break;
@@ -139,7 +139,7 @@ $replacement = @'
                         var detail = GetDriverInfoDetail(h, ref devInfo, ref driver);
                         if (!detail.HasValue) continue;
                         var detailInf = detail.Value.InfFileName;
-                        WriteLog($"SetupAPI candidate {driverIndex}: {detailInf} | {driver.Description}");
+                        WriteLog($"SetupAPI class candidate {driverIndex}: {detailInf} | {driver.Description}");
                         if (!string.Equals(Path.GetFileName(detailInf), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
@@ -158,7 +158,7 @@ $replacement = @'
                     error = ERROR_NO_MORE_ITEMS;
                     return false;
                 }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER); }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
             }
             error = ERROR_NO_SUCH_DEVINST;
             return false;
@@ -193,7 +193,7 @@ $replacement = @'
 
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_ALLCLASSES = 0x00000004;
-    private const uint SPDIT_COMPATDRIVER = 0x00000002;
+    private const uint SPDIT_CLASSDRIVER = 0x00000001;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
     private const int ERROR_NO_SUCH_DEVINST = 433;
