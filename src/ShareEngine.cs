@@ -544,23 +544,39 @@ public sealed class ShareEngine
     private static string? GetDriverInfoDetail(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver, out int error)
     {
         error = 0;
+        // SP_DRVINFO_DETAIL_DATA_W has a fixed header followed by variable-length
+        // hardware/compatible IDs.  The previous implementation used an incorrect
+        // x64 size and INF-file offset, which caused ERROR_INVALID_USER_BUFFER (1784)
+        // and made SetupAPI enumerate unrelated NICs instead of usbncm.inf.
+        var baseSize = Marshal.SizeOf<SP_DRVINFO_DETAIL_DATA>();
         uint requiredSize = 0;
         SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, IntPtr.Zero, 0, out requiredSize);
         var firstError = Marshal.GetLastWin32Error();
-        if (firstError != ERROR_INSUFFICIENT_BUFFER || requiredSize < NativeSpDrvInfoDetailSize) { error = firstError; return null; }
-        var bufferSize = checked((int)Math.Max(requiredSize, (uint)(NativeSpDrvInfoDetailSize + 2)));
+        if (requiredSize < (uint)baseSize)
+        {
+            error = firstError;
+            return null;
+        }
+
+        var bufferSize = checked((int)Math.Max(requiredSize, (uint)baseSize));
         var buffer = Marshal.AllocHGlobal(bufferSize);
         try
         {
-            Marshal.WriteInt32(buffer, (int)NativeSpDrvInfoDetailSize);
-            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, (uint)bufferSize, out requiredSize)) { error = Marshal.GetLastWin32Error(); return null; }
-            var infOffset = IntPtr.Size == 8 ? 536 : 532;
-            return Marshal.PtrToStringUni(IntPtr.Add(buffer, infOffset));
+            // The API requires cbSize to be the size of the fixed structure header,
+            // not the total allocation including the trailing variable IDs.
+            Marshal.WriteInt32(buffer, baseSize);
+            if (!SetupDiGetDriverInfoDetail(h, ref devInfo, ref driver, buffer, (uint)bufferSize, out requiredSize))
+            {
+                error = Marshal.GetLastWin32Error();
+                return null;
+            }
+
+            var detail = Marshal.PtrToStructure<SP_DRVINFO_DETAIL_DATA>(buffer);
+            return detail.InfFileName;
         }
         finally { Marshal.FreeHGlobal(buffer); }
     }
 
-    private static readonly int NativeSpDrvInfoDetailSize = IntPtr.Size == 8 ? 1576 : 1568;
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_ALLCLASSES = 0x00000004;
     private const uint SPDIT_CLASSDRIVER = 0x00000001;
@@ -587,6 +603,16 @@ public sealed class ShareEngine
         public IntPtr ClassInstallReserved;
         public IntPtr Reserved;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DriverPath;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct SP_DRVINFO_DETAIL_DATA
+    {
+        public uint cbSize;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string InfFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string SectionName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DrvDescription;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 1)] public string HardwareID;
     }
 
     [StructLayout(LayoutKind.Sequential)]
