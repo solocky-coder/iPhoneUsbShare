@@ -14,7 +14,7 @@ This is a **temporary bring-up match**, not the final compatibility policy. It i
 
 ## Build
 
-The build script fetches the Microsoft source at a pinned commit/branch, applies the Apple function-selection patch and INF, then builds the host project with the Windows WDK. The output is renamed to `AppleNcm.sys` and the package is emitted as an unsigned development package.
+The build script fetches the Microsoft source at a pinned commit/branch, applies the Apple function-selection change and INF, then builds the host project with the Windows WDK. The output is renamed to `AppleNcm.sys` and the package is emitted as an unsigned development package.
 
 For a normal Windows 10 x64 machine, install only in a test-signing/development environment until the package is signed appropriately.
 
