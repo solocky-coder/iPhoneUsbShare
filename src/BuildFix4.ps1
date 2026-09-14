@@ -8,33 +8,24 @@ if ($start -lt 0 -or $end -lt 0) { throw 'BuildFix4: BindUsbNcmDriverAsync ancho
 $replacement = @'
     private async Task BindUsbNcmDriverAsync()
     {
-        // SET_MODE(3) can be accepted before usbccgp has finished
-        // re-enumerating configuration 5. Do not give up after one PnP scan.
-        // MI_02 is the valid CDC-NCM control interface: its descriptor has
-        // exactly one interrupt endpoint. MI_04 has zero endpoints.
         List<PnpDevice> controls = new();
         var restartAttempted = false;
-
         for (var attempt = 1; attempt <= 30; attempt++)
         {
             controls = FindPnP("VID_05AC&PID_12AB", null)
                 .Where(d => d.Id.Contains("&MI_02\\", StringComparison.OrdinalIgnoreCase) || d.Id.Contains("&MI_04\\", StringComparison.OrdinalIgnoreCase))
                 .ToList();
-
             if (controls.Count > 0)
             {
                 foreach (var d in controls) WriteLog($"NCM control interface: {d.Id} | {d.Name}");
                 break;
             }
-
             if (attempt == 1 || attempt % 5 == 0)
             {
                 WriteLog($"Waiting for iPad NCM control interfaces (attempt {attempt}/30)…");
                 WriteLog($"Current USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}; mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
-                var apple = FindAppleDevice();
-                WriteLog($"Current Apple PnP device: {apple?.Id ?? "not found"}");
+                WriteLog($"Current Apple PnP device: {FindAppleDevice()?.Id ?? "not found"}");
             }
-
             if (!restartAttempted && attempt == 6)
             {
                 restartAttempted = true;
@@ -42,21 +33,12 @@ $replacement = @'
                 if (apple is not null)
                 {
                     WriteLog($"NCM interfaces still absent; restarting Apple device once: {apple.Id}");
-                    try
-                    {
-                        RestartDevice(apple.Id);
-                        WriteLog("Apple device restart requested; continuing NCM interface polling.");
-                    }
-                    catch (Exception ex)
-                    {
-                        WriteLog($"Apple device restart for NCM re-enumeration failed: {ex.Message}");
-                    }
+                    try { RestartDevice(apple.Id); WriteLog("Apple device restart requested; continuing NCM interface polling."); }
+                    catch (Exception ex) { WriteLog($"Apple device restart for NCM re-enumeration failed: {ex.Message}"); }
                 }
             }
-
             await Task.Delay(500);
         }
-
         if (controls.Count == 0)
         {
             WriteLog("No iPad NCM control interface (MI_02/MI_04) visible after re-enumeration polling.");
@@ -69,11 +51,6 @@ $replacement = @'
         if (target is null) return;
         WriteLog($"Selected NCM control interface for UsbNcm: {target.Id} | {target.Name}");
 
-        // The Apple netaapl64 driver is currently the best-ranked driver for
-        // MI_02 and fails to start (Code 10). Do not remove Apple's package
-        // globally. Instead, use SetupAPI against this exact devnode and
-        // select the Microsoft UsbNcm driver from the driver list, then ask
-        // PnP to install that selected driver on this one interface.
         var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var candidates = new[]
         {
@@ -82,12 +59,7 @@ $replacement = @'
         }.Where(File.Exists).ToList();
         if (candidates.Count == 0)
         {
-            try
-            {
-                candidates = Directory.EnumerateFiles(
-                    Path.Combine(windows, "System32", "DriverStore", "FileRepository"),
-                    "usbncm.inf", SearchOption.AllDirectories).ToList();
-            }
+            try { candidates = Directory.EnumerateFiles(Path.Combine(windows, "System32", "DriverStore", "FileRepository"), "usbncm.inf", SearchOption.AllDirectories).ToList(); }
             catch { }
         }
         var inf = candidates.FirstOrDefault();
@@ -96,43 +68,27 @@ $replacement = @'
 
         var beforePnp = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /ids /drivers");
         WriteLog($"NCM PnP diagnostic before ownership change exit code: {beforePnp.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(beforePnp.Output))
-            WriteLog("NCM PnP diagnostic before ownership change output: " + beforePnp.Output.Trim());
-        if (!string.IsNullOrWhiteSpace(beforePnp.Error))
-            WriteLog("NCM PnP diagnostic before ownership change error: " + beforePnp.Error.Trim());
+        if (!string.IsNullOrWhiteSpace(beforePnp.Output)) WriteLog("NCM PnP diagnostic before ownership change output: " + beforePnp.Output.Trim());
+        if (!string.IsNullOrWhiteSpace(beforePnp.Error)) WriteLog("NCM PnP diagnostic before ownership change error: " + beforePnp.Error.Trim());
 
         var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
         WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm package error: {add.Error.Trim()}");
 
-        // PnPUtil /install is intentionally not relied upon here: it will not
-        // replace a higher-ranked Apple package. SetupAPI selection below is
-        // the per-devnode ownership operation.
         var ownershipChanged = InstallSelectedNcmDriver(target.Id, inf, out var setupError);
         WriteLog($"UsbNcm SetupAPI ownership change {target.Id}: {(ownershipChanged ? "success" : "failed")}, Win32Error={setupError}");
 
         var postPnp = RunAllowRestart("pnputil.exe", $"/enum-devices /instanceid \"{target.Id}\" /ids /drivers");
         WriteLog($"NCM PnP diagnostic after ownership change exit code: {postPnp.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(postPnp.Output))
-            WriteLog("NCM PnP diagnostic after ownership change output: " + postPnp.Output.Trim());
-        if (!string.IsNullOrWhiteSpace(postPnp.Error))
-            WriteLog("NCM PnP diagnostic after ownership change error: " + postPnp.Error.Trim());
+        if (!string.IsNullOrWhiteSpace(postPnp.Output)) WriteLog("NCM PnP diagnostic after ownership change output: " + postPnp.Output.Trim());
+        if (!string.IsNullOrWhiteSpace(postPnp.Error)) WriteLog("NCM PnP diagnostic after ownership change error: " + postPnp.Error.Trim());
 
-        if (!ownershipChanged)
-            throw new InvalidOperationException($"Windows did not install UsbNcm on MI_02 (SetupAPI error {setupError}).");
+        if (!ownershipChanged) throw new InvalidOperationException($"Windows did not install UsbNcm on MI_02 (SetupAPI error {setupError}).");
 
         await Task.Delay(1500);
-        try
-        {
-            RestartDevice(target.Id);
-            WriteLog($"NCM control device restart requested: {target.Id}");
-        }
-        catch (Exception ex)
-        {
-            WriteLog($"NCM control device restart failed: {ex.Message}");
-        }
-
+        try { RestartDevice(target.Id); WriteLog($"NCM control device restart requested: {target.Id}"); }
+        catch (Exception ex) { WriteLog($"NCM control device restart failed: {ex.Message}"); }
         await Task.Delay(1500);
         var state = FindPnP(target.Id, null).FirstOrDefault();
         WriteLog($"Selected NCM control state after ownership change: {state?.Name ?? "not found"}");
@@ -141,15 +97,13 @@ $replacement = @'
     private bool InstallSelectedNcmDriver(string instanceId, string infPath, out uint error)
     {
         error = 0;
-        var hwnd = IntPtr.Zero;
-        var flags = DIGCF_ALLCLASSES | DIGCF_PRESENT;
-        var h = SetupDiGetClassDevs(ref Guid.Empty, null, hwnd, flags);
+        var emptyGuid = Guid.Empty;
+        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
         if (h == INVALID_HANDLE_VALUE)
         {
             error = (uint)Marshal.GetLastWin32Error();
             return false;
         }
-
         try
         {
             for (uint index = 0; ; index++)
@@ -162,17 +116,14 @@ $replacement = @'
                     error = (uint)e;
                     return false;
                 }
-
                 var id = GetDeviceInstanceId(h, ref devInfo);
                 if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-
                 WriteLog($"SetupAPI found target devnode: {id}");
                 if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER))
                 {
                     error = (uint)Marshal.GetLastWin32Error();
                     return false;
                 }
-
                 try
                 {
                     for (uint driverIndex = 0; ; driverIndex++)
@@ -185,47 +136,34 @@ $replacement = @'
                             error = (uint)e;
                             return false;
                         }
-
                         var detail = GetDriverInfoDetail(h, ref devInfo, ref driver);
-                        if (detail is null) continue;
-
-                        var detailInf = detail.InfFileName;
+                        if (!detail.HasValue) continue;
+                        var detailInf = detail.Value.InfFileName;
                         WriteLog($"SetupAPI candidate {driverIndex}: {detailInf} | {driver.Description}");
                         if (!string.Equals(Path.GetFileName(detailInf), Path.GetFileName(infPath), StringComparison.OrdinalIgnoreCase)) continue;
-
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
                             return false;
                         }
-
                         WriteLog($"SetupAPI selected UsbNcm driver: {detailInf}");
                         if (!SetupDiInstallDevice(h, IntPtr.Zero, ref devInfo))
                         {
                             error = (uint)Marshal.GetLastWin32Error();
                             return false;
                         }
-
                         WriteLog("SetupAPI installed the selected UsbNcm driver on the target devnode.");
                         return true;
                     }
-
                     error = ERROR_NO_MORE_ITEMS;
                     return false;
                 }
-                finally
-                {
-                    SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER);
-                }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
             }
-
             error = ERROR_NO_SUCH_DEVINST;
             return false;
         }
-        finally
-        {
-            SetupDiDestroyDeviceInfoList(h);
-        }
+        finally { SetupDiDestroyDeviceInfoList(h); }
     }
 
     private static string? GetDeviceInstanceId(IntPtr h, ref SP_DEVINFO_DATA devInfo)
@@ -237,7 +175,7 @@ $replacement = @'
 
     private static SP_DRVINFO_DETAIL_DATA? GetDriverInfoDetail(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver)
     {
-        var detail = new SP_DRVINFO_DETAIL_DATA { cbSize = (uint)(IntPtr.Size == 8 ? 8 : 6) };
+        var detail = new SP_DRVINFO_DETAIL_DATA { cbSize = 8 };
         var size = Marshal.SizeOf<SP_DRVINFO_DETAIL_DATA>();
         var buffer = Marshal.AllocHGlobal(size);
         try
@@ -287,42 +225,33 @@ $replacement = @'
     private struct SP_DRVINFO_DETAIL_DATA
     {
         public uint cbSize;
-        public Guid InfDate;
+        public long InfDate;
         public uint CompatIDsOffset;
         public uint CompatIDsLength;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string SectionName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string InfFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string InfFileName;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DrvDescription;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string HardwareID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 1)] public string HardwareID;
     }
 
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid, string? enumerator, IntPtr hwndParent, uint flags);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiEnumDeviceInfo(IntPtr deviceInfoSet, uint memberIndex, ref SP_DEVINFO_DATA deviceInfoData);
-
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetupDiGetDeviceInstanceId(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, StringBuilder deviceInstanceId, int deviceInstanceIdSize, out int requiredSize);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiBuildDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
-
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetupDiEnumDriverInfo(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType, uint memberIndex, ref SP_DRVINFO_DATA driverInfoData);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiGetDriverInfoDetail(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData, IntPtr driverInfoDetailData, int driverInfoDetailDataSize, out int requiredSize);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiSetSelectedDriver(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, ref SP_DRVINFO_DATA driverInfoData);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiInstallDevice(IntPtr installerHandle, IntPtr hwndParent, ref SP_DEVINFO_DATA deviceInfoData);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiDestroyDriverInfoList(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint driverType);
-
     [DllImport("setupapi.dll", SetLastError = true)]
     private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
 
