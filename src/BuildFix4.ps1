@@ -272,5 +272,9 @@ $replacement = @'
     private static extern bool SetupDiDestroyDeviceInfoList(IntPtr deviceInfoSet);
 
 '@
+# The replacement is a single-quoted here-string, so C# double quotes do not need
+# PowerShell escaping. Normalize any accidental backslash-quote pairs before
+# writing the generated C# source.
+$replacement = $replacement.Replace('\"', '"')
 $text = $text.Substring(0, $start) + $replacement + $text.Substring($end)
 Set-Content -LiteralPath $path -Value $text -Encoding UTF8
