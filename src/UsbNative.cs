@@ -264,56 +264,87 @@ internal static class UsbNative
 
     private static int[] GetNcmControlInterfaces()
     {
+        // The WinUSB MI_00 handle belongs to the pre-switch Apple control
+        // interface. After SET_MODE(3), Apple re-enumerates the USB composite
+        // device and that interface disappears. Therefore descriptor discovery
+        // through OpenWinUsb is only valid while that handle still exists.
         var usb = OpenWinUsb(out var file);
-        if (usb == IntPtr.Zero) return Array.Empty<int>();
-        try
+        if (usb != IntPtr.Zero)
         {
-            var result = new List<int>();
-            var dev = GetDescriptor(usb, 0x01, 0, 18);
-            var configCount = dev.Length >= 18 ? dev[17] : 0;
-            for (byte index = 0; index < configCount; index++)
+            try
             {
-                var head = GetDescriptor(usb, 0x02, index, 9);
-                if (head.Length < 9) continue;
-                var total = head[2] | (head[3] << 8);
-                if (total < 9 || total > 8192) continue;
-                var cfg = GetDescriptor(usb, 0x02, index, total);
-                var cn = cfg.Length;
-                var pos = 0;
-                while (pos + 9 <= cn)
+                var result = new List<int>();
+                var dev = GetDescriptor(usb, 0x01, 0, 18);
+                var configCount = dev.Length >= 18 ? dev[17] : 0;
+                for (byte index = 0; index < configCount; index++)
                 {
-                    var len = cfg[pos]; var type = cfg[pos + 1];
-                    if (len < 2 || pos + len > cn) break;
-                    if (type == 0x04 && len >= 9 && cfg[pos + 5] == 0x02 && cfg[pos + 6] == 0x0D)
+                    var head = GetDescriptor(usb, 0x02, index, 9);
+                    if (head.Length < 9) continue;
+                    var total = head[2] | (head[3] << 8);
+                    if (total < 9 || total > 8192) continue;
+                    var cfg = GetDescriptor(usb, 0x02, index, total);
+                    var cn = cfg.Length;
+                    var pos = 0;
+                    while (pos + 9 <= cn)
                     {
-                        var number = cfg[pos + 2]; var alt = cfg[pos + 3]; var endpointCount = cfg[pos + 4]; var hasInterruptEndpoint = false;
-                        var scan = pos + len; var seenEndpoints = 0;
-                        while (scan + 2 <= cn && seenEndpoints < endpointCount)
+                        var len = cfg[pos]; var type = cfg[pos + 1];
+                        if (len < 2 || pos + len > cn) break;
+                        if (type == 0x04 && len >= 9 && cfg[pos + 5] == 0x02 && cfg[pos + 6] == 0x0D)
                         {
-                            var slen = cfg[scan]; var stype = cfg[scan + 1];
-                            if (slen < 2 || scan + slen > cn) break;
-                            if (stype == 0x04) break;
-                            if (stype == 0x05 && slen >= 7)
+                            var number = cfg[pos + 2]; var alt = cfg[pos + 3]; var endpointCount = cfg[pos + 4]; var hasInterruptEndpoint = false;
+                            var scan = pos + len; var seenEndpoints = 0;
+                            while (scan + 2 <= cn && seenEndpoints < endpointCount)
                             {
-                                seenEndpoints++;
-                                var address = cfg[scan + 2]; var attributes = cfg[scan + 3];
-                                if ((attributes & 0x03) == 0x03 && (address & 0x80) != 0) hasInterruptEndpoint = true;
+                                var slen = cfg[scan]; var stype = cfg[scan + 1];
+                                if (slen < 2 || scan + slen > cn) break;
+                                if (stype == 0x04) break;
+                                if (stype == 0x05 && slen >= 7)
+                                {
+                                    seenEndpoints++;
+                                    var address = cfg[scan + 2]; var attributes = cfg[scan + 3];
+                                    if ((attributes & 0x03) == 0x03 && (address & 0x80) != 0) hasInterruptEndpoint = true;
+                                }
+                                scan += slen;
                             }
-                            scan += slen;
+                            if (alt == 0 && hasInterruptEndpoint && !result.Contains(number))
+                            {
+                                result.Add(number);
+                                AppendRaw($"USB NCM selection: tethering control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn=true");
+                            }
+                            else if (alt == 0) AppendRaw($"USB NCM selection: rejected CDC-NCM control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn={hasInterruptEndpoint}");
                         }
-                        if (alt == 0 && hasInterruptEndpoint && !result.Contains(number))
-                        {
-                            result.Add(number);
-                            AppendRaw($"USB NCM selection: tethering control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn=true");
-                        }
-                        else if (alt == 0) AppendRaw($"USB NCM selection: rejected CDC-NCM control interface={number}, alt={alt}, endpoints={endpointCount}, interruptIn={hasInterruptEndpoint}");
+                        pos += len;
                     }
-                    pos += len;
                 }
+                if (result.Count > 0) return result.ToArray();
             }
-            return result.ToArray();
+            finally { WinUsb_Free(usb); file.Dispose(); }
         }
-        finally { WinUsb_Free(usb); file.Dispose(); }
+        else
+        {
+            file.Dispose();
+        }
+
+        // In the known Apple 05AC:12AB tethering topology, MI_02 is the
+        // CDC-NCM control interface and MI_03 is its data interface. MI_04 is
+        // a separate NCM-like RemoteXPC function without the tethering
+        // interrupt endpoint. Once mode 5 is active, use the re-enumerated
+        // Windows child PDO as the source of truth instead of the old WinUSB
+        // handle. Poll briefly because usbccgp creates the children asynchronously.
+        var parent = FindAppleCompositeId();
+        if (parent is null) return Array.Empty<int>();
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            var ncm = FindAppleInterfaceId(parent, 2);
+            if (ncm is not null)
+            {
+                AppendRaw($"USB NCM selection: discovered re-enumerated Apple CDC-NCM control PDO MI_02: {ncm}");
+                return new[] { 2 };
+            }
+            if (attempt < 19) Thread.Sleep(250);
+        }
+        AppendRaw("USB NCM selection: mode-5 WinUSB handle is gone and Apple MI_02 was not published by usbccgp within 5 seconds.");
+        return Array.Empty<int>();
     }
 
     private static int? GetConfiguration()
