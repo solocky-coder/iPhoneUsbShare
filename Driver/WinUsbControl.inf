@@ -5,16 +5,17 @@
 [Version]
 Signature   = "$Windows NT$"
 Class       = USBDevice
-ClassGUID   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+ClassGUID   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
 Provider    = %ManufacturerName%
 CatalogFile = WinUsbControl.cat
-DriverVer   = 09/15/2026,1.0.0.0
+DriverVer   = 09/15/2026,1.0.0.1
 PnpLockdown = 1
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
 
 [Standard.NTamd64]
+%DeviceName% = USB_Install, USB\VID_05AC&PID_12AB&REV_0503&MI_00
 %DeviceName% = USB_Install, USB\VID_05AC&PID_12AB&MI_00
 
 [USB_Install]
