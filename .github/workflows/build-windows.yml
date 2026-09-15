@@ -12,46 +12,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate Windows Driver Kit
+      - name: Acquire Windows Driver Kit tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $roots = @(
-            "$env:ProgramFiles(x86)\Windows Kits\10\bin",
-            "$env:ProgramFiles\Windows Kits\10\bin"
-          ) | Where-Object { Test-Path $_ }
-          if (-not $roots) {
-            throw 'Windows Kits bin directory was not found on the windows-2022 runner.'
-          }
-          $inf2cat = $roots |
-            ForEach-Object { Get-ChildItem $_ -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue } |
+          $wdkVersion = '10.0.26100.6584'
+          $nupkgUrl = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/$($wdkVersion.ToLowerInvariant())/microsoft.windows.wdk.x64.$($wdkVersion.ToLowerInvariant()).nupkg"
+          $wdkRoot = Join-Path $env:RUNNER_TEMP 'wdk'
+          $nupkg = Join-Path $env:RUNNER_TEMP 'wdk.nupkg'
+          if (Test-Path $wdkRoot) { Remove-Item $wdkRoot -Recurse -Force }
+          New-Item -ItemType Directory -Force $wdkRoot | Out-Null
+          Write-Host "Downloading Microsoft WDK $wdkVersion from NuGet..."
+          Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkg
+          Expand-Archive -Path $nupkg -DestinationPath $wdkRoot -Force
+          $inf2cat = Get-ChildItem $wdkRoot -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue |
             Sort-Object FullName -Descending |
             Select-Object -First 1
           if (-not $inf2cat) {
-            Write-Host 'Windows Kits directories found:'
-            $roots | ForEach-Object { Write-Host "  $_" }
-            throw 'Inf2Cat.exe was not found in the preinstalled Windows Driver Kit.'
+            throw "Inf2Cat.exe was not found in Microsoft.Windows.WDK.x64 $wdkVersion."
           }
           Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
+          "INF2CAT=$($inf2cat.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & $inf2cat.FullName /? | Select-Object -First 8
 
       - name: Generate WinUSB control catalog
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $roots = @(
-            "$env:ProgramFiles(x86)\Windows Kits\10\bin",
-            "$env:ProgramFiles\Windows Kits\10\bin"
-          ) | Where-Object { Test-Path $_ }
-          $inf2cat = $roots |
-            ForEach-Object { Get-ChildItem $_ -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $inf2cat) {
-            throw 'Inf2Cat.exe was not found in the preinstalled Windows Driver Kit.'
+          if (-not $env:INF2CAT -or -not (Test-Path $env:INF2CAT)) {
+            throw 'INF2CAT environment variable does not point to a valid Inf2Cat.exe.'
           }
-          Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
-          & $inf2cat.FullName /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
+          Write-Host "Using Inf2Cat: $env:INF2CAT"
+          & $env:INF2CAT /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
           if ($LASTEXITCODE -ne 0) {
             throw "Inf2Cat failed with exit code $LASTEXITCODE."
           }
