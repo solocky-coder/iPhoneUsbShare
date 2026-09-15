@@ -11,7 +11,7 @@ internal static class NcmConfigurationRecovery
     private const uint SafeConfiguration = 2;
     private const uint NcmConfiguration = 5;
 
-    internal static void ArmDirectNcm(Action<string> log)
+    internal static bool ArmDirectNcm(Action<string> log)
     {
         try
         {
@@ -19,11 +19,10 @@ internal static class NcmConfigurationRecovery
             if (phoneId is null)
             {
                 log("NCM configuration recovery: Apple composite parent was not found.");
-                return;
+                return false;
             }
 
             log($"NCM configuration recovery: composite parent={phoneId}.");
-            LogParentDriver(phoneId, log, "before configuration selection");
 
             var compositeInf = FindCompositeInf();
             if (compositeInf is null)
@@ -44,7 +43,7 @@ internal static class NcmConfigurationRecovery
             if (parameters is null)
             {
                 log($"NCM configuration recovery: cannot open {parametersPath}.");
-                return;
+                return false;
             }
 
             var oldOriginal = parameters.GetValue("OriginalConfigurationValue");
@@ -58,24 +57,32 @@ internal static class NcmConfigurationRecovery
             if (!string.IsNullOrWhiteSpace(restart.Output)) log($"NCM configuration recovery: restart output: {restart.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(restart.Error)) log($"NCM configuration recovery: restart error: {restart.Error.Trim()}");
 
-            Thread.Sleep(2500);
-            LogParentDriver(phoneId, log, "after usbccgp restart");
+            if (restart.Output.Contains("pending system reboot", StringComparison.OrdinalIgnoreCase) ||
+                restart.Output.Contains("pending reboot", StringComparison.OrdinalIgnoreCase))
+            {
+                log("NCM configuration recovery: Windows reports the composite device is pending a system reboot; refusing further PnP resets in this session.");
+                return false;
+            }
+
+            Thread.Sleep(1500);
 
             for (var i = 0; i < 30; i++)
             {
                 if (FindAppleInterface(2) && FindAppleInterface(3))
                 {
                     log("NCM configuration recovery: MI_02 and MI_03 are now enumerated.");
-                    return;
+                    return true;
                 }
                 Thread.Sleep(500);
             }
 
-            log("NCM configuration recovery: usbccgp restart completed, but MI_02/MI_03 are still not visible.");
+            log("NCM configuration recovery: composite restart completed, but MI_02/MI_03 are still not visible.");
+            return false;
         }
         catch (Exception ex)
         {
             log($"NCM configuration recovery failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
         }
     }
 
@@ -89,26 +96,6 @@ internal static class NcmConfigurationRecovery
             Path.Combine(appDir, "Driver", "artifacts", "AppleUsbCompositeConfiguration.inf")
         };
         return candidates.FirstOrDefault(File.Exists);
-    }
-
-    private static void LogParentDriver(string instanceId, Action<string> log, string phase)
-    {
-        try
-        {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT PNPDeviceID, Name, Description, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status FROM Win32_PnPEntity");
-            foreach (ManagementObject o in searcher.Get())
-            {
-                var id = o["PNPDeviceID"]?.ToString();
-                if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-                log($"NCM configuration recovery: parent driver {phase}: name={o["Name"] ?? "?"} | description={o["Description"] ?? "?"} | service={o["Service"] ?? "?"} | driver_version={o["DriverVersion"] ?? "?"} | manufacturer={o["Manufacturer"] ?? "?"} | cm_error={o["ConfigManagerErrorCode"] ?? "?"} | status={o["Status"] ?? "?"}");
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            log($"NCM configuration recovery: parent driver inspection failed: {ex.GetType().Name}: {ex.Message}");
-        }
     }
 
     private static string? FindAppleCompositeId()
