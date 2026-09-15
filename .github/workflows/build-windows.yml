@@ -28,10 +28,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $package = '.\artifacts\package'
-          New-Item -ItemType Directory -Force $package | Out-Null
+          $driver = Join-Path $package 'Driver'
+          New-Item -ItemType Directory -Force $driver | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
-          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components.'
+          Copy-Item .\Driver\WinUsbControl.inf $driver\WinUsbControl.inf -Force
+          Copy-Item .\Driver\install-winusb-control.ps1 $driver\install-winusb-control.ps1 -Force
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components. The WinUSB control package targets Apple USB VID_05AC/PID_12AB MI_00 and contains no Apple driver binary.'
           Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
           Get-Item .\artifacts\iPhoneUsbShare-win-x64.zip | Select-Object FullName,Length
 
