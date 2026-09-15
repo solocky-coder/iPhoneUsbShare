@@ -12,22 +12,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Windows Driver Kit
+      - name: Locate Windows Driver Kit
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --silent
-          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --silent
+          $roots = @(
+            "$env:ProgramFiles(x86)\Windows Kits\10\bin",
+            "$env:ProgramFiles\Windows Kits\10\bin"
+          ) | Where-Object { Test-Path $_ }
+          if (-not $roots) {
+            throw 'Windows Kits bin directory was not found on the windows-2022 runner.'
+          }
+          $inf2cat = $roots |
+            ForEach-Object { Get-ChildItem $_ -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $inf2cat) {
+            Write-Host 'Windows Kits directories found:'
+            $roots | ForEach-Object { Write-Host "  $_" }
+            throw 'Inf2Cat.exe was not found in the preinstalled Windows Driver Kit.'
+          }
+          Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
+          & $inf2cat.FullName /? | Select-Object -First 8
 
       - name: Generate WinUSB control catalog
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $inf2cat = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin" -Filter Inf2Cat.exe -Recurse -ErrorAction SilentlyContinue |
+          $roots = @(
+            "$env:ProgramFiles(x86)\Windows Kits\10\bin",
+            "$env:ProgramFiles\Windows Kits\10\bin"
+          ) | Where-Object { Test-Path $_ }
+          $inf2cat = $roots |
+            ForEach-Object { Get-ChildItem $_ -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
           if (-not $inf2cat) {
-            throw 'Inf2Cat.exe was not found after WDK installation.'
+            throw 'Inf2Cat.exe was not found in the preinstalled Windows Driver Kit.'
           }
           Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
           & $inf2cat.FullName /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
