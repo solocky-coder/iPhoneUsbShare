@@ -84,9 +84,12 @@ internal static class UsbNative
             var mi00 = FindAppleInterfaceId(parent, 0);
             if (mi00 is null)
             {
-                AppendRaw("WinUSB migration: MI_00 is not currently enumerated; waiting for Apple composite re-enumeration.");
+                AppendRaw("WinUSB migration: MI_00 hardware child is not currently enumerated; waiting for Apple composite re-enumeration.");
                 return;
             }
+
+            AppendRaw($"WinUSB migration: MI_00 hardware child is present: {mi00}");
+            AppendRaw("WinUSB migration: the custom WinUSB device-interface GUID is not yet published; forcing driver selection on the existing MI_00 PDO.");
             SetWinUsbDeviceParameters(mi00);
             if (InstallWinUsbDriver(mi00))
             {
@@ -264,10 +267,6 @@ internal static class UsbNative
 
     private static int[] GetNcmControlInterfaces()
     {
-        // The WinUSB MI_00 handle belongs to the pre-switch Apple control
-        // interface. After SET_MODE(3), Apple re-enumerates the USB composite
-        // device and that interface disappears. Therefore descriptor discovery
-        // through OpenWinUsb is only valid while that handle still exists.
         var usb = OpenWinUsb(out var file);
         if (usb != IntPtr.Zero)
         {
@@ -325,12 +324,6 @@ internal static class UsbNative
             file.Dispose();
         }
 
-        // In the known Apple 05AC:12AB tethering topology, MI_02 is the
-        // CDC-NCM control interface and MI_03 is its data interface. MI_04 is
-        // a separate NCM-like RemoteXPC function without the tethering
-        // interrupt endpoint. Once mode 5 is active, use the re-enumerated
-        // Windows child PDO as the source of truth instead of the old WinUSB
-        // handle. Poll briefly because usbccgp creates the children asynchronously.
         var parent = FindAppleCompositeId();
         if (parent is null) return Array.Empty<int>();
         for (var attempt = 0; attempt < 20; attempt++)
@@ -447,10 +440,6 @@ internal static class UsbNative
                 var buffer = Marshal.AllocHGlobal((int)required);
                 try
                 {
-                    // SP_DEVICE_INTERFACE_DETAIL_DATA.cbSize is 8 on x64, but
-                    // the variable-length WCHAR DevicePath starts at byte 4.
-                    // Using +8 here skips the first four characters and produces
-                    // an invalid CreateFile name (ERROR_INVALID_NAME / 123).
                     Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 5);
                     if (SetupDiGetDeviceInterfaceDetail(h, ref data, buffer, required, out _, IntPtr.Zero))
                         return Marshal.PtrToStringUni(buffer + 4);
@@ -487,10 +476,21 @@ internal static class UsbNative
             {
                 var id = o["PNPDeviceID"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id)) continue;
-                if (id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)) return id;
+                // Apple child instance IDs contain REV_xxxx between PID and MI.
+                // Match the real child PDO identity instead of assuming that the
+                // parent instance string is a literal prefix of the child ID.
+                if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) &&
+                    id.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                {
+                    AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2}: {id}");
+                    return id;
+                }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            AppendRaw($"Apple USB child discovery: WMI lookup for MI_{interfaceNumber:X2} failed: {ex.GetType().Name}: {ex.Message}");
+        }
         return null;
     }
 
