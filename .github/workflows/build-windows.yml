@@ -12,10 +12,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.x'
+      - name: Install Windows Driver Kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          winget install --id Microsoft.WindowsSDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --silent
+          winget install --id Microsoft.WindowsWDK.10.0.26100 --exact --accept-source-agreements --accept-package-agreements --silent
 
       - name: Generate WinUSB control catalog
         shell: pwsh
@@ -25,7 +27,7 @@ jobs:
             Sort-Object FullName -Descending |
             Select-Object -First 1
           if (-not $inf2cat) {
-            throw 'Inf2Cat.exe was not found in the installed Windows Driver Kit.'
+            throw 'Inf2Cat.exe was not found after WDK installation.'
           }
           Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
           & $inf2cat.FullName /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
@@ -36,6 +38,11 @@ jobs:
             throw 'Inf2Cat completed but WinUsbControl.cat was not generated.'
           }
           Get-Item .\Driver\WinUsbControl.cat | Select-Object FullName,Length
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
 
       - name: Publish EXE
         shell: pwsh
