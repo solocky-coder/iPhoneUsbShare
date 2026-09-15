@@ -1,0 +1,36 @@
+; iPhoneUsbShare WinUSB control-interface driver package
+; Targets the observed Apple composite control child MI_00.
+; Microsoft winusb.inf supplies the inbox WinUSB function driver.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGUID   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ManufacturerName%
+CatalogFile = WinUsbControl.cat
+DriverVer   = 09/15/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = USB_Install, USB\VID_05AC&PID_12AB&MI_00
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = USB_Install_AddReg
+
+[USB_Install_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{8D4D9C11-3B6B-4D3A-9B0B-7E8B2E2E0C51}"
+
+[Strings]
+ManufacturerName = "iPhoneUsbShare"
+DeviceName = "iPhoneUsbShare Apple USB Control Interface"
