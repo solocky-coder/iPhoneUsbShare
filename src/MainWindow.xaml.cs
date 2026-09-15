@@ -63,6 +63,15 @@ public partial class MainWindow : Window
         try
         {
             Log("Starting…");
+
+            // If Apple is already physically in configuration 5, repair usbccgp's
+            // persistent configuration selection BEFORE ShareEngine performs any
+            // safe-configuration reset. This avoids creating a second pending PnP
+            // operation on an already-correct NCM USB mode.
+            var ncmReady = NcmConfigurationRecovery.ArmDirectNcm(Log);
+            if (ncmReady)
+                Log("NCM configuration recovery completed before USB mode startup.");
+
             await _engine.StartAsync();
             _sharing = true;
             StopButton.IsEnabled = true;
