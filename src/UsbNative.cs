@@ -416,9 +416,13 @@ internal static class UsbNative
                 var buffer = Marshal.AllocHGlobal((int)required);
                 try
                 {
-                    Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 6);
+                    // SP_DEVICE_INTERFACE_DETAIL_DATA.cbSize is 8 on x64, but
+                    // the variable-length WCHAR DevicePath starts at byte 4.
+                    // Using +8 here skips the first four characters and produces
+                    // an invalid CreateFile name (ERROR_INVALID_NAME / 123).
+                    Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 5);
                     if (SetupDiGetDeviceInterfaceDetail(h, ref data, buffer, required, out _, IntPtr.Zero))
-                        return Marshal.PtrToStringUni(buffer + (IntPtr.Size == 8 ? 8 : 4));
+                        return Marshal.PtrToStringUni(buffer + 4);
                 }
                 finally { Marshal.FreeHGlobal(buffer); }
             }
