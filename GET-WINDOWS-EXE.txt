@@ -1,25 +1,39 @@
 GET THE WINDOWS EXE — NO LOCAL BUILD REQUIRED
 
-1. Create a new empty GitHub repository.
-2. Upload the contents of this folder to that repository (keep the .github folder).
-3. On GitHub open: Actions -> Build Windows EXE.
-4. Click Run workflow -> Run workflow.
-5. Wait for the green check.
-6. Open the completed run and download the artifact:
-   iPhoneUsbShare-win-x64
-7. Extract the ZIP. Run iPhoneUsbShare.exe on Windows.
+1. Open this repository on GitHub.
+2. Open Actions -> Build Windows EXE.
+3. Use the newest green workflow run on the main branch.
+4. Open that run and download the artifact whose name is:
+   iPhoneUsbShare-win-x64-<full-commit-sha>
+5. Extract the ZIP.
+6. Before running it, open BUILD-INFO.txt and verify the commit matches the workflow run you just downloaded.
+7. Run iPhoneUsbShare.exe as Administrator.
+
+IMPORTANT BUILD SAFETY
+- Do not use an older artifact with the generic name iPhoneUsbShare-win-x64.
+- The current workflow embeds the exact Git commit and workflow run ID in BUILD-INFO.txt.
+- The current workflow fails the build if legacy libusb0/libusb-win32 filter runtime files or installer references enter the application/package inputs.
+- BUILD-INFO.txt explicitly states that the legacy libusb runtime is NOT INCLUDED.
 
 The GitHub workflow uses a Windows runner and produces a self-contained
-Windows x64 EXE. You do NOT need .NET, Visual Studio, Python, or any
+Windows x64 EXE. You do NOT need .NET, Visual Studio, Python, or other
 developer tools on the Windows PC where you run the EXE.
 
 DEVICE TARGET
 - iPhone: Apple VID 05AC / PID 12A8
 - iPad Air 2: Apple VID 05AC / PID 12AB
-- Your iPad was observed as: USB\VID_05AC&PID_12AB&MI_01
+- Observed iPad Air 2 USB control function: VID_05AC&PID_12AB&MI_00
+
+CURRENT CONTROL ARCHITECTURE
+- Apple MI_00 -> Microsoft WinUSB -> iPhoneUsbShare control transfers
+- Apple CDC-NCM tethering function -> Microsoft UsbNcm -> Windows USB Ethernet
+- No libusb0.sys
+- No libusb-win32 upper filter
+- No install-filter.exe
 
 IMPORTANT
-The iPad Air 2 / iPadOS 15 USB mode-switch path has not been physically
-tested in this environment. The app will detect the iPad profile and
-report a clear failure if its firmware does not accept the expected
-CDC-NCM control sequence. It will not silently claim success.
+The iPad Air 2 / iPadOS 15 USB mode-switch path has been physically tested
+successfully on this project. Two successful reverse-tethering connections
+were established before the legacy libusb-based implementation later
+produced a WDF_VIOLATION crash. Future validation should therefore use only
+the current WinUSB-only package and should not reintroduce the old filter.
