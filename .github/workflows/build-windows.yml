@@ -72,7 +72,7 @@ jobs:
           "INF2CAT=$($inf2cat.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           & $inf2cat.FullName /? | Select-Object -First 8
 
-      - name: Generate WinUSB control catalog
+      - name: Generate USB driver catalogs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -84,10 +84,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Inf2Cat failed with exit code $LASTEXITCODE."
           }
-          if (-not (Test-Path .\Driver\WinUsbControl.cat)) {
-            throw 'Inf2Cat completed but WinUsbControl.cat was not generated.'
+          foreach ($catalog in @('AppleUsbCompositeConfiguration.cat','WinUsbControl.cat')) {
+            if (-not (Test-Path (Join-Path '.\Driver' $catalog))) {
+              throw "Inf2Cat completed but $catalog was not generated."
+            }
           }
-          Get-Item .\Driver\WinUsbControl.cat | Select-Object FullName,Length
+          Get-ChildItem .\Driver\*.cat | Select-Object Name,Length
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
@@ -110,6 +112,8 @@ jobs:
           New-Item -ItemType Directory -Force $driver | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
+          Copy-Item .\Driver\AppleUsbCompositeConfiguration.inf $driver\AppleUsbCompositeConfiguration.inf -Force
+          Copy-Item .\Driver\AppleUsbCompositeConfiguration.cat $driver\AppleUsbCompositeConfiguration.cat -Force
           Copy-Item .\Driver\WinUsbControl.inf $driver\WinUsbControl.inf -Force
           Copy-Item .\Driver\WinUsbControl.cat $driver\WinUsbControl.cat -Force
           Copy-Item .\Driver\install-winusb-control.ps1 $driver\install-winusb-control.ps1 -Force
@@ -120,10 +124,11 @@ jobs:
             "Workflow run: ${{ github.run_id }}",
             "Built: $((Get-Date).ToUniversalTime().ToString('o'))",
             'Control driver: Microsoft WinUSB on Apple USB MI_00',
+            'USB composite configuration: Microsoft Usbccgp selects OriginalConfigurationValue=5',
             'Network driver: Microsoft UsbNcm inbox driver',
             'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
           ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
-          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components. The WinUSB control package targets Apple USB VID_05AC/PID_12AB MI_00 and contains no Apple driver binary.'
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows Usbccgp, WinUSB, and UsbNcm are Microsoft-provided inbox components. The package contains only configuration metadata and an INF for the Apple USB parent plus the WinUSB control INF; it contains no Apple driver binary.'
           $zip = ".\\artifacts\\iPhoneUsbShare-win-x64-$shortSha.zip"
           Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
           Get-Item $zip | Select-Object FullName,Length
