@@ -1,0 +1,41 @@
+; iPhoneUsbShare Apple USB composite-parent configuration override
+; Configures Microsoft's Usbccgp.sys to select USB configuration value 5.
+; This is the configuration documented by Microsoft for non-default
+; Usbccgp configuration selection. It writes OriginalConfigurationValue
+; to the composite device hardware key and does not install a custom
+; kernel-mode USB function driver.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USB
+ClassGUID   = {36FC9E60-C465-11CF-8056-444553540000}
+Provider    = %ManufacturerName%
+CatalogFile = AppleUsbCompositeConfiguration.cat
+DriverVer   = 09/15/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = Composite_Install, USB\VID_05AC&PID_12AB
+
+[Composite_Install]
+Include = usb.inf
+Needs   = Composite.Dev.NT
+
+[Composite_Install.Services]
+Include = usb.inf
+Needs   = Composite.Dev.NT.Services
+
+[Composite_Install.HW]
+AddReg = Composite_Install_AddReg
+
+[Composite_Install_AddReg]
+; Microsoft Usbccgp.sys reads this value from the composite device
+; hardware key and uses it as the first configuration-selection value.
+HKR,,OriginalConfigurationValue,0x00010001,5
+
+[Strings]
+ManufacturerName = "iPhoneUsbShare"
+DeviceName = "iPhoneUsbShare Apple USB Composite Configuration"
