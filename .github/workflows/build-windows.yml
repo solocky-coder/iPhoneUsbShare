@@ -22,7 +22,11 @@ jobs:
           # Remove legacy libusb cleanup calls and methods from the build copy.
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
-          $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?\r?\n    private static ModeDiagnostic GetModeDiagnostic\(\)', "`r`n    private static ModeDiagnostic GetModeDiagnostic()")
+          # Remove each legacy method independently. The lookahead stops at the
+          # next private static method, so nested braces inside the method body
+          # do not accidentally delete unrelated methods such as MI discovery.
+          $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?(?=\r?\n    private static )', "`r`n")
+          $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbService\(\).*?(?=\r?\n    private static )', "`r`n")
 
           # Real Apple child instance IDs contain REV_xxxx before MI_xx.
           # The source must match the actual child PDO rather than assuming
