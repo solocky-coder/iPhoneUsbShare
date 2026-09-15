@@ -13,8 +13,16 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _engine.Log += (_, e) => Dispatcher.Invoke(() =>
-            LogText.Text = $"[{DateTime.Now:HH:mm:ss}] {e}\n" + LogText.Text);
+        _engine.Log += (_, e) =>
+        {
+            if (e.Contains("Apple is already in CDC-NCM direct mode (5)", StringComparison.OrdinalIgnoreCase))
+            {
+                NcmConfigurationRecovery.ArmDirectNcm(_engine.WriteLog);
+            }
+
+            Dispatcher.Invoke(() =>
+                LogText.Text = $"[{DateTime.Now:HH:mm:ss}] {e}\n" + LogText.Text);
+        };
 
         _timer.Tick += async (_, _) => await RefreshAsync();
         Loaded += async (_, _) =>
