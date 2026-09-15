@@ -1,110 +1,55 @@
-using Microsoft.Win32;
-using System.Diagnostics;
-using System.IO;
 using System.Management;
 
 namespace iPhoneUsbShare;
 
 internal static class NcmConfigurationRecovery
 {
-    private const string VendorProduct = "USB\\VID_05AC&PID_";
-    private const uint SafeConfiguration = 2;
-    private const uint NcmConfiguration = 5;
+    private const int NcmConfiguration = 5;
 
     internal static void ArmDirectNcm(Action<string> log)
     {
         try
         {
-            var phoneId = FindAppleCompositeId();
-            if (phoneId is null) { log("NCM configuration recovery: Apple composite parent was not found."); return; }
-            log($"NCM configuration recovery: composite parent={phoneId}.");
-            LogParentDriver(phoneId, log, "before usbccgp binding");
-            var compositeInf = FindCompositeInf();
-            if (compositeInf is null) log("NCM configuration recovery: Apple composite configuration INF is not bundled; cannot force usbccgp.");
-            else
-            {
-                log($"NCM configuration recovery: installing Apple composite configuration INF: {compositeInf}");
-                var add = RunPnpUtil($"/add-driver \"{compositeInf}\" /install");
-                log($"NCM configuration recovery: composite INF pnputil exit code={add.ExitCode}.");
-                if (!string.IsNullOrWhiteSpace(add.Output)) log($"NCM configuration recovery: pnputil output: {add.Output.Trim()}");
-                if (!string.IsNullOrWhiteSpace(add.Error)) log($"NCM configuration recovery: pnputil error: {add.Error.Trim()}");
-            }
-            var parametersPath = $@"SYSTEM\CurrentControlSet\Enum\{phoneId}\Device Parameters";
-            using var parameters = Registry.LocalMachine.OpenSubKey(parametersPath, writable: true);
-            if (parameters is null) { log($"NCM configuration recovery: cannot open {parametersPath}."); return; }
-            var oldOriginal = parameters.GetValue("OriginalConfigurationValue");
-            var oldAlternate = parameters.GetValue("AltConfigurationValue");
-            parameters.SetValue("OriginalConfigurationValue", NcmConfiguration, RegistryValueKind.DWord);
-            parameters.SetValue("AltConfigurationValue", SafeConfiguration, RegistryValueKind.DWord);
-            log($"NCM configuration recovery: selected usbccgp configuration {NcmConfiguration} (alternate {SafeConfiguration}); previous Original={oldOriginal ?? "none"}, Alt={oldAlternate ?? "none"}.");
-            var restart = RunPnpUtil($"/restart-device \"{phoneId}\"");
-            log($"NCM configuration recovery: composite parent restart exit code={restart.ExitCode}.");
-            if (!string.IsNullOrWhiteSpace(restart.Output)) log($"NCM configuration recovery: restart output: {restart.Output.Trim()}");
-            if (!string.IsNullOrWhiteSpace(restart.Error)) log($"NCM configuration recovery: restart error: {restart.Error.Trim()}");
-            Thread.Sleep(2500);
-            LogParentDriver(phoneId, log, "after usbccgp binding/restart");
-            for (var i = 0; i < 30; i++)
-            {
-                if (FindAppleInterface(2) && FindAppleInterface(3)) { log("NCM configuration recovery: MI_02 and MI_03 are now enumerated."); return; }
-                Thread.Sleep(500);
-            }
-            log("NCM configuration recovery: usbccgp restart completed, but MI_02/MI_03 are still not visible.");
-        }
-        catch (Exception ex) { log($"NCM configuration recovery failed: {ex.GetType().Name}: {ex.Message}"); }
-    }
+            log("NCM activation: Apple reported direct NCM mode 5; selecting USB configuration value 5 through WinUSB.");
 
-    private static string? FindCompositeInf()
-    {
-        var appDir = AppContext.BaseDirectory;
-        var candidates = new[] { Path.Combine(appDir, "Driver", "AppleUsbCompositeConfiguration.inf"), Path.Combine(appDir, "AppleUsbCompositeConfiguration.inf"), Path.Combine(appDir, "Driver", "artifacts", "AppleUsbCompositeConfiguration.inf") };
-        return candidates.FirstOrDefault(File.Exists);
-    }
-
-    private static void LogParentDriver(string instanceId, Action<string> log, string phase)
-    {
-        try
-        {
-            using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, Name, Description, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status FROM Win32_PnPEntity");
-            foreach (ManagementObject o in searcher.Get())
+            var selected = UsbNative.SetConfigurationAsync(NcmConfiguration).GetAwaiter().GetResult();
+            log($"NCM activation: SET_CONFIGURATION(5) result={(selected ? "accepted" : "failed")}.");
+            if (!selected)
             {
-                var id = o["PNPDeviceID"]?.ToString();
-                if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-                log($"NCM configuration recovery: parent driver {phase}: name={o["Name"] ?? "?"} | description={o["Description"] ?? "?"} | service={o["Service"] ?? "?"} | driver_version={o["DriverVersion"] ?? "?"} | manufacturer={o["Manufacturer"] ?? "?"} | cm_error={o["ConfigManagerErrorCode"] ?? "?"} | status={o["Status"] ?? "?"}");
+                log("NCM activation: Windows did not accept USB configuration 5; leaving the existing USB stack untouched.");
                 return;
             }
-        }
-        catch (Exception ex) { log($"NCM configuration recovery: parent driver inspection failed: {ex.GetType().Name}: {ex.Message}"); }
-    }
 
-    private static string? FindAppleCompositeId()
-    {
-        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
-        foreach (ManagementObject o in searcher.Get())
-        {
-            var id = o["PNPDeviceID"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(id) && id.Contains(VendorProduct, StringComparison.OrdinalIgnoreCase) && !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)) return id;
+            for (var i = 0; i < 30; i++)
+            {
+                if (FindAppleInterface(2) && FindAppleInterface(3))
+                {
+                    log("NCM activation: Apple MI_02 and MI_03 are now enumerated.");
+                    return;
+                }
+                Thread.Sleep(250);
+            }
+
+            log("NCM activation: USB configuration 5 was selected, but MI_02/MI_03 are not yet visible to Windows.");
         }
-        return null;
+        catch (Exception ex)
+        {
+            log($"NCM activation failed: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static bool FindAppleInterface(int interfaceNumber)
     {
         var marker = $"&MI_{interfaceNumber:X2}";
-        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
-        foreach (ManagementObject o in searcher.Get()) if ((o["PNPDeviceID"]?.ToString() ?? string.Empty).Contains(marker, StringComparison.OrdinalIgnoreCase)) return true;
+        using var searcher = new ManagementObjectSearcher(
+            "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
+
+        foreach (ManagementObject o in searcher.Get())
+        {
+            var id = o["PNPDeviceID"]?.ToString() ?? string.Empty;
+            if (id.Contains(marker, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+
         return false;
     }
-
-    private static ProcessResult RunPnpUtil(string arguments)
-    {
-        try
-        {
-            using var process = new Process { StartInfo = new ProcessStartInfo { FileName = "pnputil.exe", Arguments = arguments, UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true } };
-            process.Start(); var output = process.StandardOutput.ReadToEnd(); var error = process.StandardError.ReadToEnd(); process.WaitForExit();
-            return new ProcessResult(process.ExitCode, output, error);
-        }
-        catch (Exception ex) { return new ProcessResult(-1, string.Empty, ex.Message); }
-    }
-
-    private sealed record ProcessResult(int ExitCode, string Output, string Error);
 }
