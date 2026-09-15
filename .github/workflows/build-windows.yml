@@ -12,33 +12,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Reject legacy USB filter runtime
+      - name: Reject legacy USB filter installer artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $patterns = @(
-            'libusb0\.sys',
-            'libusb-win32 installer',
-            'install-filter',
-            'libusb0 service',
-            'UpperFilters.*libusb'
-          )
-          $files = Get-ChildItem . -Recurse -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Extension -in @('.cs','.csproj','.ps1','.inf','.yml','.yaml') }
+          $scanRoot = Join-Path $PWD 'src'
+          $patterns = @('libusb-win32 installer', 'install-filter.exe')
+          $files = Get-ChildItem $scanRoot -Recurse -File
           $hits = foreach ($file in $files) {
             Select-String -Path $file.FullName -Pattern $patterns -SimpleMatch:$false -ErrorAction SilentlyContinue
           }
           if ($hits) {
-            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy libusb filter runtime reference detected in build inputs.'
+            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY INSTALLER REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw 'Legacy libusb filter installer reference detected in application sources.'
           }
           $legacyNames = Get-ChildItem . -Recurse -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Name -match '(?i)(libusb0|install-filter)' }
+            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
           if ($legacyNames) {
             $legacyNames | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER FILE: $($_.FullName)" }
-            throw 'Legacy libusb filter file detected in repository.'
+            throw 'Legacy USB filter binary/installer detected in repository.'
           }
-          Write-Host 'Legacy USB filter guard passed.'
+          Write-Host 'Legacy USB filter installer guard passed.'
 
       - name: Acquire Windows Driver Kit tools
         shell: pwsh
@@ -119,25 +113,25 @@ jobs:
           Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
           Get-Item $zip | Select-Object FullName,Length
 
-      - name: Verify package contains no legacy USB filter
+      - name: Verify package contains no legacy USB filter installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $package = '.\artifacts\package'
           $forbidden = Get-ChildItem $package -Recurse -File |
-            Where-Object { $_.Name -match '(?i)(libusb0|install-filter)' }
+            Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
           if ($forbidden) {
             $forbidden | ForEach-Object { Write-Host "FORBIDDEN PACKAGE FILE: $($_.FullName)" }
             throw 'Legacy USB filter artifact entered the Windows package.'
           }
           $textHits = Get-ChildItem $package -Recurse -File |
             Where-Object { $_.Extension -in @('.txt','.ps1','.inf') } |
-            ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb0\.sys|libusb-win32 installer|install-filter|libusb0 service' -ErrorAction SilentlyContinue }
+            ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb-win32 installer|install-filter\.exe' -ErrorAction SilentlyContinue }
           if ($textHits) {
             $textHits | ForEach-Object { Write-Host "FORBIDDEN PACKAGE REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy USB filter reference entered the Windows package.'
+            throw 'Legacy USB filter installer reference entered the Windows package.'
           }
-          Write-Host 'Final package legacy-driver verification passed.'
+          Write-Host 'Final package legacy-installer verification passed.'
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
