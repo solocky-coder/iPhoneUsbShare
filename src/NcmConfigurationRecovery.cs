@@ -24,6 +24,12 @@ internal static class NcmConfigurationRecovery
 
             log($"NCM configuration recovery: composite parent={phoneId}.");
 
+            if (FindAppleInterface(2) && FindAppleInterface(3))
+            {
+                log("NCM configuration recovery: MI_02 and MI_03 are already enumerated; no composite restart required.");
+                return true;
+            }
+
             var compositeInf = FindCompositeInf();
             if (compositeInf is null)
             {
