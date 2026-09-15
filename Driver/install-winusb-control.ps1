@@ -28,12 +28,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "pnputil /add-driver failed with exit code $LASTEXITCODE. Check catalog signing and Windows driver policy."
 }
 
-# PnPUtil will not force a lower-ranked package. On this Windows 10 target,
-# Microsoft's signed WPD driver is a compatible match for MI_00 and therefore
-# outranks an unsigned development catalog even though our INF has the exact
-# MI_00 hardware ID. Use SetupAPI to explicitly select the staged iPhoneUsbShare
-# package for this exact devnode. Once the catalog is Microsoft-signed, normal
-# PnP ranking will select the package automatically.
+# PnPUtil will not force a lower-ranked package. Microsoft's signed WPD driver
+# is a compatible match for MI_00 and can outrank an unsigned development
+# catalog even though our INF has the exact MI_00 hardware ID. Use SetupAPI to
+# explicitly select the staged iPhoneUsbShare package for this exact devnode.
+# Once the catalog is Microsoft-signed, normal PnP ranking will select it.
 Write-Host "Selecting iPhoneUsbShare WinUSB driver explicitly for MI_00..."
 
 if (-not ('IPhoneUsbShare_SetupApi' -as [type])) {
@@ -46,7 +45,6 @@ public static class IPhoneUsbShare_SetupApi
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_ALLCLASSES = 0x00000004;
     private const uint SPDIT_COMPATDRIVER = 0x00000002;
-    private const uint DIF_INSTALLDEVICE = 0x00000002;
     private const uint ERROR_NO_MORE_ITEMS = 259;
     private const int LINE_LEN = 256;
 
@@ -108,8 +106,7 @@ public static class IPhoneUsbShare_SetupApi
         ref SP_DRVINFO_DATA DriverInfoData);
 
     [DllImport("setupapi.dll", SetLastError = true)]
-    private static extern bool SetupDiCallClassInstaller(
-        uint InstallFunction,
+    private static extern bool SetupDiInstallDevice(
         IntPtr DeviceInfoSet,
         ref SP_DEVINFO_DATA DeviceInfoData);
 
@@ -162,8 +159,11 @@ public static class IPhoneUsbShare_SetupApi
 
             Console.WriteLine("Selected: " + selected.ProviderName + " | " + selected.Description);
 
-            if (!SetupDiCallClassInstaller(DIF_INSTALLDEVICE, set, ref device))
-                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SetupDiCallClassInstaller(DIF_INSTALLDEVICE) failed");
+            // Call the default device-install handler directly. This avoids
+            // routing DIF_INSTALLDEVICE through the current WPD class installer
+            // while the selected package changes the device's setup class.
+            if (!SetupDiInstallDevice(set, ref device))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "SetupDiInstallDevice failed");
         }
         finally
         {
