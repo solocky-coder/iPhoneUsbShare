@@ -1,7 +1,6 @@
 using Microsoft.Win32;
-using System.Diagnostics;
 using System.Management;
-using System.Text;
+using System.Runtime.InteropServices;
 
 namespace iPhoneUsbShare;
 
@@ -10,6 +9,9 @@ internal static class NcmConfigurationRecovery
     private const string VendorProduct = "USB\\VID_05AC&PID_";
     private const uint SafeConfiguration = 2;
     private const uint NcmConfiguration = 5;
+    private const uint CM_LOCATE_DEVNODE_NORMAL = 0x00000000;
+    private const uint CR_SUCCESS = 0x00000000;
+    private const uint CM_DISABLE_UI_NOT_OK = 0x00000000;
 
     internal static void ArmDirectNcm(Action<string> log)
     {
@@ -30,17 +32,33 @@ internal static class NcmConfigurationRecovery
                 return;
             }
 
+            var oldOriginal = parameters.GetValue("OriginalConfigurationValue");
+            var oldAlternate = parameters.GetValue("AltConfigurationValue");
             parameters.SetValue("OriginalConfigurationValue", NcmConfiguration, RegistryValueKind.DWord);
             parameters.SetValue("AltConfigurationValue", SafeConfiguration, RegistryValueKind.DWord);
-            log($"NCM configuration recovery: armed usbccgp for configuration {NcmConfiguration} (alternate {SafeConfiguration}) on {phoneId}.");
+            log($"NCM configuration recovery: armed usbccgp for configuration {NcmConfiguration} (alternate {SafeConfiguration}) on {phoneId}; previous Original={oldOriginal ?? "none"}, Alt={oldAlternate ?? "none"}.");
 
-            var restart = Run("pnputil.exe", $"/restart-device \"{phoneId}\"");
-            log($"NCM configuration recovery: composite restart exit={restart.ExitCode}.");
-            if (!string.IsNullOrWhiteSpace(restart.Output)) log($"NCM configuration recovery: {restart.Output.Trim()}");
-            if (!string.IsNullOrWhiteSpace(restart.Error)) log($"NCM configuration recovery error: {restart.Error.Trim()}");
-            if (restart.ExitCode != 0 && restart.ExitCode != 3010) return;
+            if (!LocateDevNode(phoneId, out var devInst, out var locateCr))
+            {
+                log($"NCM configuration recovery: CM_Locate_DevNode failed, ConfigMgr error={locateCr:X8}.");
+                return;
+            }
 
-            for (var i = 0; i < 12; i++)
+            // Do not use pnputil /restart-device here. A prior driver install can leave
+            // pnputil reporting "pending system reboot" even though ConfigMgr can still
+            // disable/enable the composite devnode immediately. usbccgp must rebuild its
+            // child PDOs after the configuration-selection registry values are changed.
+            var disableCr = CM_Disable_DevNode(devInst, CM_DISABLE_UI_NOT_OK);
+            log($"NCM configuration recovery: CM_Disable_DevNode result={disableCr:X8}.");
+            if (disableCr != CR_SUCCESS) return;
+
+            Thread.Sleep(500);
+
+            var enableCr = CM_Enable_DevNode(devInst, 0);
+            log($"NCM configuration recovery: CM_Enable_DevNode result={enableCr:X8}.");
+            if (enableCr != CR_SUCCESS) return;
+
+            for (var i = 0; i < 24; i++)
             {
                 if (FindAppleInterface(2) && FindAppleInterface(3))
                 {
@@ -50,7 +68,7 @@ internal static class NcmConfigurationRecovery
                 Thread.Sleep(500);
             }
 
-            log("NCM configuration recovery: restart completed, but MI_02/MI_03 are not yet visible.");
+            log("NCM configuration recovery: ConfigMgr disable/enable completed, but MI_02/MI_03 are still not visible.");
         }
         catch (Exception ex)
         {
@@ -84,23 +102,19 @@ internal static class NcmConfigurationRecovery
         return false;
     }
 
-    private static CommandResult Run(string file, string args)
+    private static bool LocateDevNode(string instanceId, out uint devInst, out uint cr)
     {
-        var psi = new ProcessStartInfo(file, args)
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8
-        };
-        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"Could not start {file}.");
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return new CommandResult(process.ExitCode, output, error);
+        devInst = 0;
+        cr = CM_Locate_DevNodeW(out devInst, instanceId, CM_LOCATE_DEVNODE_NORMAL);
+        return cr == CR_SUCCESS;
     }
 
-    private readonly record struct CommandResult(int ExitCode, string Output, string Error);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern uint CM_Disable_DevNode(uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern uint CM_Enable_DevNode(uint dnDevInst, uint ulFlags);
 }
