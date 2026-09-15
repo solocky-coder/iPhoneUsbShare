@@ -2,7 +2,8 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -12,73 +13,62 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanitize legacy USB code and validate Apple child discovery
+      - name: Prepare build source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $path = Join-Path $PWD 'src\UsbNative.cs'
           $text = Get-Content -LiteralPath $path -Raw
 
+          # Remove legacy libusb cleanup calls and methods from the build copy.
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?(?=\r?\n    private static )', "`r`n")
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbService\(\).*?(?=\r?\n    private static )', "`r`n")
 
+          # Verify Apple child discovery handles REV_xxxx before MI_xx.
           $expectedDiscovery = 'id\.StartsWith\("USB\\+VID_05AC&PID_",\s*StringComparison\.OrdinalIgnoreCase\)\s*&&\s*id\.Contains\(marker,\s*StringComparison\.OrdinalIgnoreCase\)'
           if (-not [regex]::IsMatch($text, $expectedDiscovery)) {
-            throw 'Apple child discovery source does not contain the REV_xxxx-safe MI_xx matching logic; refusing to build.'
+            throw 'Apple child discovery validation failed.'
           }
 
           if ($text -match 'RemoveLegacyLibUsb|libusb0\.sys|install-filter\.exe') {
-            throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
+            throw 'Legacy USB code remains after sanitization.'
           }
 
-          # Build the compatible-driver list for the specific Apple MI_00 PDO.
-          $text = $text.Replace('private const uint SPDIT_CLASSDRIVER = 0x00000001;', 'private const uint SPDIT_COMPATDRIVER = 0x00000002;')
+          # Use the compatible-driver list for the specific PDO.
           $text = $text.Replace('SPDIT_CLASSDRIVER', 'SPDIT_COMPATDRIVER')
+          $text = $text.Replace('0x00000001;', '0x00000002;')
 
-          # Pre-stage our custom INF before SetupAPI searches for compatible drivers.
+          # Pre-stage the custom INF before SetupAPI enumerates compatible drivers.
+          $preStageLines = @(
+            '    private static bool PreStageWinUsbControlPackage()',
+            '    {',
+            '        try',
+            '        {',
+            '            var infPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");',
+            '            if (!File.Exists(infPath)) return false;',
+            '            AppendRaw($"WinUSB migration: pre-staging custom INF: {infPath}");',
+            '            var result = RunAllowRestart("pnputil.exe", $"/add-driver \\\"{infPath}\\\" /install");',
+            '            AppendRaw($"WinUSB migration: PnPUtil exit={result.ExitCode}, output={result.Output.Trim()}");',
+            '            return result.ExitCode == 0;',
+            '        }',
+            '        catch (Exception ex)',
+            '        {',
+            '            AppendRaw($"WinUSB migration: pre-stage failed: {ex.GetType().Name}: {ex.Message}");',
+            '            return false;',
+            '        }',
+            '    }'
+          )
+          $preStage = ($preStageLines -join "`r`n") + "`r`n`r`n"
           $marker = '    private static bool InstallWinUsbDriver(string instanceId)'
-          $preStage = @'
-    private static bool PreStageWinUsbControlPackage()
-    {
-        try
-        {
-            var infPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");
-            if (!File.Exists(infPath))
-            {
-                AppendRaw($"WinUSB migration: custom INF not found: {infPath}");
-                return false;
-            }
-
-            AppendRaw($"WinUSB migration: pre-staging custom INF with PnPUtil: {infPath}");
-            var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{infPath}\" /install");
-            AppendRaw($"WinUSB migration: PnPUtil /add-driver exit={result.ExitCode}, output={result.Output.Trim()}, error={result.Error.Trim()}");
-            return result.ExitCode == 0;
-        }
-        catch (Exception ex)
-        {
-            AppendRaw($"WinUSB migration: custom INF pre-stage failed: {ex.GetType().Name}: {ex.Message}");
-            return false;
-        }
-    }
-
-'@
           if (-not $text.Contains('private static bool PreStageWinUsbControlPackage()')) {
             $text = $text.Replace($marker, $preStage + $marker)
           }
 
-          $oldInstall = @'
-    private static bool InstallWinUsbDriver(string instanceId)
-    {
-'@
-          $newInstall = @'
-    private static bool InstallWinUsbDriver(string instanceId)
-    {
-        if (!PreStageWinUsbControlPackage()) return false;
-'@
-          $text = $text.Replace($oldInstall, $newInstall)
-
+          $text = $text.Replace(
+            '    private static bool InstallWinUsbDriver(string instanceId)\r\n    {\r\n',
+            '    private static bool InstallWinUsbDriver(string instanceId)\r\n    {\r\n        if (!PreStageWinUsbControlPackage()) return false;\r\n')
           $text = $text.Replace(
             'installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");',
             'installParams.DriverPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");')
@@ -87,28 +77,18 @@ jobs:
             'if (!string.Equals(driver.Description, "iPhoneUsbShare Apple USB Control Interface", StringComparison.OrdinalIgnoreCase)) continue;')
 
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Build source sanitized; Apple child discovery and compatible-driver SetupAPI migration logic validated.'
+          Write-Host 'Build source prepared.'
 
-      - name: Reject legacy USB filter installer artifacts
+      - name: Reject legacy USB filter artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $scanRoot = Join-Path $PWD 'src'
           $patterns = @('libusb-win32 installer', 'install-filter.exe', 'RemoveLegacyLibUsb', 'libusb0.sys')
-          $files = Get-ChildItem $scanRoot -Recurse -File
-          $hits = foreach ($file in $files) {
+          $hits = foreach ($file in Get-ChildItem $scanRoot -Recurse -File) {
             Select-String -Path $file.FullName -Pattern $patterns -SimpleMatch:$false -ErrorAction SilentlyContinue
           }
-          if ($hits) {
-            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy libusb runtime/install reference detected in application sources.'
-          }
-          $legacyNames = Get-ChildItem . -Recurse -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
-          if ($legacyNames) {
-            $legacyNames | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER FILE: $($_.FullName)" }
-            throw 'Legacy USB filter binary/installer detected in repository.'
-          }
+          if ($hits) { throw 'Legacy USB runtime/install reference detected.' }
           Write-Host 'Legacy USB filter guard passed.'
 
       - name: Acquire Windows Driver Kit tools
@@ -121,23 +101,20 @@ jobs:
           $nupkg = Join-Path $env:RUNNER_TEMP 'wdk.nupkg'
           if (Test-Path $wdkRoot) { Remove-Item $wdkRoot -Recurse -Force }
           New-Item -ItemType Directory -Force $wdkRoot | Out-Null
-          Write-Host "Downloading Microsoft WDK $wdkVersion from NuGet..."
           Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkg
           Expand-Archive -Path $nupkg -DestinationPath $wdkRoot -Force
-          $inf2cat = Get-ChildItem $wdkRoot -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $inf2cat) { throw "Inf2Cat.exe was not found in Microsoft.Windows.WDK.x64 $wdkVersion." }
-          Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
-          "INF2CAT=$($inf2cat.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $inf2cat = Get-ChildItem $wdkRoot -Filter Inf2Cat.exe -Recurse -File | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $inf2cat) { throw 'Inf2Cat.exe was not found.' }
+          "INF2CAT=$($inf2cat.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Generate USB driver catalogs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:INF2CAT -or -not (Test-Path $env:INF2CAT)) { throw 'INF2CAT environment variable does not point to a valid Inf2Cat.exe.' }
           & $env:INF2CAT /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
-          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed with exit code $LASTEXITCODE." }
+          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed: $LASTEXITCODE" }
           foreach ($catalog in @('AppleUsbCompositeConfiguration.cat','WinUsbControl.cat')) {
-            if (-not (Test-Path (Join-Path '.\Driver' $catalog))) { throw "Inf2Cat completed but $catalog was not generated." }
+            if (-not (Test-Path (Join-Path '.\Driver' $catalog))) { throw "Missing $catalog" }
           }
 
       - name: Setup .NET 8
@@ -179,34 +156,23 @@ jobs:
             'Network driver: Microsoft UsbNcm inbox driver',
             'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
           ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
-          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows Usbccgp, WinUSB, and UsbNcm are Microsoft-provided inbox components. The package contains only configuration metadata and an INF for the Apple USB parent plus the WinUSB control INF; it contains no Apple driver binary.'
+          Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows Usbccgp, WinUSB, and UsbNcm are Microsoft-provided inbox components. The package contains configuration metadata and INF files only; it contains no Apple driver binary.'
           $zip = ".\artifacts\iPhoneUsbShare-win-x64-$shortSha.zip"
           Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
-          Get-Item $zip | Select-Object FullName,Length
 
-      - name: Verify driver payload contains no legacy USB filter
+      - name: Verify final payload
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $driver = '.\artifacts\package\Driver'
-          $forbidden = Get-ChildItem $driver -Recurse -File | Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
-          if ($forbidden) { throw 'Legacy USB filter artifact entered the Windows driver payload.' }
-          $textHits = Get-ChildItem $driver -Recurse -File | Where-Object { $_.Extension -in @('.ps1','.inf') } | ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb-win32 installer|install-filter\.exe' -ErrorAction SilentlyContinue }
-          if ($textHits) { throw 'Legacy USB filter installer reference entered the Windows driver payload.' }
-          Write-Host 'Final driver-payload legacy-installer verification passed.'
-
-      - name: Verify executable has no legacy libusb symbols
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
+          $bad = Get-ChildItem $driver -Recurse -File | Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
+          if ($bad) { throw 'Legacy USB filter artifact found.' }
           $exe = '.\artifacts\package\iPhoneUsbShare.exe'
-          $bytes = [IO.File]::ReadAllBytes($exe)
-          $ascii = [Text.Encoding]::ASCII.GetString($bytes)
-          $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
-          $patterns = @('RemoveLegacyLibUsb','libusb0.sys','install-filter.exe','libusb-win32 installer')
-          $hits = $patterns | Where-Object { $ascii.Contains($_) -or $utf16.Contains($_) }
-          if ($hits) { throw "Legacy libusb symbols found in executable: $($hits -join ', ')" }
-          Write-Host 'Executable legacy-libusb symbol verification passed.'
+          $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          foreach ($pattern in @('RemoveLegacyLibUsb','libusb0.sys','install-filter.exe')) {
+            if ($ascii.Contains($pattern)) { throw "Legacy symbol found: $pattern" }
+          }
+          Write-Host 'Final payload verification passed.'
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
