@@ -12,7 +12,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Strip legacy USB cleanup from build sources
+      - name: Sanitize and fix USB discovery in build sources
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -21,11 +21,53 @@ jobs:
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?\r?\n    private static ModeDiagnostic GetModeDiagnostic\(\)', "`r`n    private static ModeDiagnostic GetModeDiagnostic()")
+          # Apple child instance IDs include the parent VID/PID plus REV_xxxx before MI_xx.
+          # Example: USB\VID_05AC&PID_12AB&REV_0503&MI_00\...
+          # The old source incorrectly required parentId + '&MI_', so a real MI_00
+          # was reported as missing even when ConfigMgr showed it was present.
+          $oldFind = '(?ms)    private static string\? FindAppleInterfaceId\(string parentId, int interfaceNumber\)\r?\n    \{.*?\r?\n    \}\r?\n\r?\n    private static CommandResult RunAllowRestart'
+          $newFind = @'
+    private static string? FindAppleInterfaceId(string parentId, int interfaceNumber)
+    {
+        var marker = $"&MI_{interfaceNumber:X2}\\";
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity");
+            foreach (ManagementObject o in searcher.Get())
+            {
+                var id = o["PNPDeviceID"]?.ToString();
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                // Child IDs commonly contain &REV_xxxx before &MI_xx, so do not
+                // require the child ID to start with parentId + "&MI_".
+                if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) &&
+                    id.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                {
+                    AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2}: {id}");
+                    return id;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendRaw($"Apple USB child discovery: WMI lookup for MI_{interfaceNumber:X2} failed: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    private static CommandResult RunAllowRestart
+'@
+          $updated = [regex]::Replace($text, $oldFind, $newFind)
+          if ($updated -eq $text) {
+            throw 'Expected FindAppleInterfaceId source block was not found; refusing to build with the known MI_* discovery bug.'
+          }
+          $text = $updated
           if ($text -match 'RemoveLegacyLibUsb|libusb0\.sys|install-filter\.exe') {
             throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
           }
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Build source sanitized: no legacy libusb cleanup remains in UsbNative.cs.'
+          Write-Host 'Build source sanitized: no legacy libusb cleanup remains.'
+          Write-Host 'Build source fixed: Apple MI_* discovery accepts REV_xxxx before MI_xx.'
 
       - name: Reject legacy USB filter installer artifacts
         shell: pwsh
@@ -125,11 +167,12 @@ jobs:
             "Built: $((Get-Date).ToUniversalTime().ToString('o'))",
             'Control driver: Microsoft WinUSB on Apple USB MI_00',
             'USB composite configuration: Microsoft Usbccgp selects OriginalConfigurationValue=5',
+            'USB child discovery: accepts REV_xxxx before MI_xx in Apple instance IDs',
             'Network driver: Microsoft UsbNcm inbox driver',
             'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
           ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
           Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows Usbccgp, WinUSB, and UsbNcm are Microsoft-provided inbox components. The package contains only configuration metadata and an INF for the Apple USB parent plus the WinUSB control INF; it contains no Apple driver binary.'
-          $zip = ".\\artifacts\\iPhoneUsbShare-win-x64-$shortSha.zip"
+          $zip = ".\artifacts\iPhoneUsbShare-win-x64-$shortSha.zip"
           Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
           Get-Item $zip | Select-Object FullName,Length
 
