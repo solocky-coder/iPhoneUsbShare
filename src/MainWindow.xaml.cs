@@ -35,10 +35,10 @@ public partial class MainWindow : Window
         try
         {
             var s = await _engine.GetStatusAsync();
-            PhoneText.Text = s.AppleConnected ? s.AppleName : "Connect your iPhone or iPad by USB";
+            PhoneText.Text = s.PhoneConnected ? s.PhoneName : "Connect your iPhone or iPad by USB";
             AdapterText.Text = s.AdapterName is null ? "USB NCM Ethernet: not connected" : $"USB NCM Ethernet: {s.AdapterName} ({s.AdapterStatus})";
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                s.AppleConnected ? (s.AdapterStatus == "Up" ? "#16A34A" : "#D97706") : "#98A2B3"));
+                s.PhoneConnected ? (s.AdapterStatus == "Up" ? "#16A34A" : "#D97706") : "#98A2B3"));
             StateText.Text = s.AdapterName is not null && s.AdapterStatus == "Up" ? "USB transport is ready" : "USB transport not ready";
             IpText.Text = s.Lease ?? "—";
             RxText.Text = $"{s.Rx:0.0} KB/s";
