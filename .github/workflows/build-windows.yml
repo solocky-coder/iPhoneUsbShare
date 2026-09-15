@@ -12,6 +12,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Reject legacy USB filter runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patterns = @(
+            'libusb0\.sys',
+            'libusb-win32 installer',
+            'install-filter',
+            'libusb0 service',
+            'UpperFilters.*libusb'
+          )
+          $files = Get-ChildItem . -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Extension -in @('.cs','.csproj','.ps1','.inf','.yml','.yaml') }
+          $hits = foreach ($file in $files) {
+            Select-String -Path $file.FullName -Pattern $patterns -SimpleMatch:$false -ErrorAction SilentlyContinue
+          }
+          if ($hits) {
+            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw 'Legacy libusb filter runtime reference detected in build inputs.'
+          }
+          $legacyNames = Get-ChildItem . -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Name -match '(?i)(libusb0|install-filter)' }
+          if ($legacyNames) {
+            $legacyNames | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER FILE: $($_.FullName)" }
+            throw 'Legacy libusb filter file detected in repository.'
+          }
+          Write-Host 'Legacy USB filter guard passed.'
+
       - name: Acquire Windows Driver Kit tools
         shell: pwsh
         run: |
@@ -69,20 +97,52 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $package = '.\artifacts\package'
           $driver = Join-Path $package 'Driver'
+          $shortSha = '${{ github.sha }}'.Substring(0,12)
           New-Item -ItemType Directory -Force $driver | Out-Null
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
           Copy-Item .\Driver\WinUsbControl.inf $driver\WinUsbControl.inf -Force
           Copy-Item .\Driver\WinUsbControl.cat $driver\WinUsbControl.cat -Force
           Copy-Item .\Driver\install-winusb-control.ps1 $driver\install-winusb-control.ps1 -Force
+          @(
+            'iPhoneUsbShare Windows x64 package',
+            "Commit: ${{ github.sha }}",
+            "Short commit: $shortSha",
+            "Workflow run: ${{ github.run_id }}",
+            "Built: $((Get-Date).ToUniversalTime().ToString('o'))",
+            'Control driver: Microsoft WinUSB on Apple USB MI_00',
+            'Network driver: Microsoft UsbNcm inbox driver',
+            'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
+          ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
           Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components. The WinUSB control package targets Apple USB VID_05AC/PID_12AB MI_00 and contains no Apple driver binary.'
-          Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
-          Get-Item .\artifacts\iPhoneUsbShare-win-x64.zip | Select-Object FullName,Length
+          $zip = ".\\artifacts\\iPhoneUsbShare-win-x64-$shortSha.zip"
+          Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object FullName,Length
+
+      - name: Verify package contains no legacy USB filter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = '.\artifacts\package'
+          $forbidden = Get-ChildItem $package -Recurse -File |
+            Where-Object { $_.Name -match '(?i)(libusb0|install-filter)' }
+          if ($forbidden) {
+            $forbidden | ForEach-Object { Write-Host "FORBIDDEN PACKAGE FILE: $($_.FullName)" }
+            throw 'Legacy USB filter artifact entered the Windows package.'
+          }
+          $textHits = Get-ChildItem $package -Recurse -File |
+            Where-Object { $_.Extension -in @('.txt','.ps1','.inf') } |
+            ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb0\.sys|libusb-win32 installer|install-filter|libusb0 service' -ErrorAction SilentlyContinue }
+          if ($textHits) {
+            $textHits | ForEach-Object { Write-Host "FORBIDDEN PACKAGE REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw 'Legacy USB filter reference entered the Windows package.'
+          }
+          Write-Host 'Final package legacy-driver verification passed.'
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
         with:
-          name: iPhoneUsbShare-win-x64
-          path: artifacts/iPhoneUsbShare-win-x64.zip
+          name: iPhoneUsbShare-win-x64-${{ github.sha }}
+          path: artifacts/iPhoneUsbShare-win-x64-*.zip
           if-no-files-found: error
           retention-days: 14
