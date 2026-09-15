@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
 
@@ -34,9 +35,6 @@ internal static class StartupRecovery
             return;
         }
 
-        // A reboot can leave the Apple parent bound to Apple's appleusb.inf while
-        // the parent is in CM_PROB_FAILED_START. Re-enumeration alone cannot repair
-        // that binding. Stage and force our Usbccgp configuration package first.
         if (parentProblem == 10 || mi00 is null)
         {
             if (InstallCompositeConfiguration(parent, log))
@@ -118,12 +116,7 @@ internal static class StartupRecovery
             if (add.ExitCode != 0 && add.ExitCode != 3010) return false;
 
             log($"Startup recovery: forcing composite configuration onto {AppleParentHardwareId}.");
-            var forced = UpdateDriverForPlugAndPlayDevicesW(
-                IntPtr.Zero,
-                AppleParentHardwareId,
-                infPath,
-                InstallFlagForce,
-                out var rebootRequired);
+            var forced = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, AppleParentHardwareId, infPath, InstallFlagForce, out var rebootRequired);
             if (!forced)
             {
                 var error = Marshal.GetLastWin32Error();
@@ -149,9 +142,7 @@ internal static class StartupRecovery
     {
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                "root\\CIMV2",
-                $"SELECT ConfigManagerErrorCode FROM Win32_PnPEntity WHERE PNPDeviceID='{EscapeWmi(instanceId)}'");
+            using var searcher = new ManagementObjectSearcher("root\\CIMV2", $"SELECT ConfigManagerErrorCode FROM Win32_PnPEntity WHERE PNPDeviceID='{EscapeWmi(instanceId)}'");
             var row = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
             if (row?["ConfigManagerErrorCode"] is null) return null;
             return Convert.ToInt32(row["ConfigManagerErrorCode"]);
@@ -171,8 +162,7 @@ internal static class StartupRecovery
                 Id = device["PNPDeviceID"]?.ToString(), Name = device["Name"]?.ToString(), Description = device["Description"]?.ToString(),
                 ClassGuid = device["ClassGuid"]?.ToString(), Status = device["Status"]?.ToString(), Error = device["ConfigManagerErrorCode"]?.ToString(),
                 Manufacturer = device["Manufacturer"]?.ToString(), Service = device["Service"]?.ToString()
-            }).Where(x => !string.IsNullOrWhiteSpace(x.Id) &&
-                (string.Equals(x.Id, parentId, StringComparison.OrdinalIgnoreCase) || IsAppleChildOfParent(x.Id!, parentId)))
+            }).Where(x => !string.IsNullOrWhiteSpace(x.Id) && (string.Equals(x.Id, parentId, StringComparison.OrdinalIgnoreCase) || IsAppleChildOfParent(x.Id!, parentId)))
               .OrderBy(x => x.Id, StringComparer.OrdinalIgnoreCase).ToArray();
             log($"Startup recovery: Apple USB WMI tree {phase}: {rows.Length} device node(s).");
             foreach (var row in rows) log($"Startup recovery: WMI node={row.Id} | name={row.Name ?? "?"} | description={row.Description ?? "?"} | class={row.ClassGuid ?? "?"} | status={row.Status ?? "?"} | cm_error={row.Error ?? "?"} | manufacturer={row.Manufacturer ?? "?"} | service={row.Service ?? "?"}");
@@ -261,8 +251,7 @@ internal static class StartupRecovery
         var parentWithoutInstance = parentId;
         var separator = parentWithoutInstance.IndexOf('\\');
         if (separator >= 0) parentWithoutInstance = parentWithoutInstance[..separator];
-        return id.StartsWith(parentWithoutInstance + "&MI_", StringComparison.OrdinalIgnoreCase) ||
-               id.StartsWith(parentWithoutInstance + "&REV_", StringComparison.OrdinalIgnoreCase);
+        return id.StartsWith(parentWithoutInstance + "&MI_", StringComparison.OrdinalIgnoreCase) || id.StartsWith(parentWithoutInstance + "&REV_", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? FindMi00(string parentId)
