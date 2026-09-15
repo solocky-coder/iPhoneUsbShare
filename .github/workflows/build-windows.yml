@@ -12,62 +12,36 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanitize and fix USB discovery in build sources
+      - name: Sanitize legacy USB code and fix Apple child discovery
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $path = Join-Path $PWD 'src\UsbNative.cs'
           $text = Get-Content -LiteralPath $path -Raw
+
+          # Remove legacy libusb cleanup calls and methods from the build copy.
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?\r?\n    private static ModeDiagnostic GetModeDiagnostic\(\)', "`r`n    private static ModeDiagnostic GetModeDiagnostic()")
-          # Apple child instance IDs include the parent VID/PID plus REV_xxxx before MI_xx.
-          # Example: USB\VID_05AC&PID_12AB&REV_0503&MI_00\...
-          # The old source incorrectly required parentId + '&MI_', so a real MI_00
-          # was reported as missing even when ConfigMgr showed it was present.
-          $oldFind = '(?ms)    private static string\? FindAppleInterfaceId\(string parentId, int interfaceNumber\)\r?\n    \{.*?\r?\n    \}\r?\n\r?\n    private static CommandResult RunAllowRestart'
-          $newFind = @'
-    private static string? FindAppleInterfaceId(string parentId, int interfaceNumber)
-    {
-        var marker = $"&MI_{interfaceNumber:X2}\\";
-        try
-        {
-            using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity");
-            foreach (ManagementObject o in searcher.Get())
-            {
-                var id = o["PNPDeviceID"]?.ToString();
-                if (string.IsNullOrWhiteSpace(id)) continue;
-                // Child IDs commonly contain &REV_xxxx before &MI_xx, so do not
-                // require the child ID to start with parentId + "&MI_".
-                if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) &&
-                    id.Contains(marker, StringComparison.OrdinalIgnoreCase))
-                {
-                    AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2}: {id}");
-                    return id;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendRaw($"Apple USB child discovery: WMI lookup for MI_{interfaceNumber:X2} failed: {ex.GetType().Name}: {ex.Message}");
-        }
 
-        return null;
-    }
-
-    private static CommandResult RunAllowRestart
-'@
-          $updated = [regex]::Replace($text, $oldFind, $newFind)
-          if ($updated -eq $text) {
-            throw 'Expected FindAppleInterfaceId source block was not found; refusing to build with the known MI_* discovery bug.'
+          # Real Apple child instance IDs include REV_xxxx before MI_xx.
+          # Replace the old parentId + MI check with a VID/PID + MI check.
+          $oldCondition = 'if \(id\.StartsWith\(parentId \+ "&MI_", StringComparison\.OrdinalIgnoreCase\) && id\.Contains\(marker, StringComparison\.OrdinalIgnoreCase\)\) return id;'
+          $newCondition = 'if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)) return id;'
+          if (-not $text.Contains('id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase)')) {
+            throw 'Expected Apple child discovery condition was not found; refusing to build.'
           }
-          $text = $updated
+          $text = [regex]::Replace($text, $oldCondition, $newCondition)
+          if ($text.Contains('id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase)')) {
+            throw 'Apple child discovery condition was not replaced.'
+          }
+
           if ($text -match 'RemoveLegacyLibUsb|libusb0\.sys|install-filter\.exe') {
             throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
           }
+
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Build source sanitized: no legacy libusb cleanup remains.'
-          Write-Host 'Build source fixed: Apple MI_* discovery accepts REV_xxxx before MI_xx.'
+          Write-Host 'Build source sanitized and Apple REV_xxxx + MI_xx discovery fix applied.'
 
       - name: Reject legacy USB filter installer artifacts
         shell: pwsh
@@ -104,34 +78,21 @@ jobs:
           Write-Host "Downloading Microsoft WDK $wdkVersion from NuGet..."
           Invoke-WebRequest -Uri $nupkgUrl -OutFile $nupkg
           Expand-Archive -Path $nupkg -DestinationPath $wdkRoot -Force
-          $inf2cat = Get-ChildItem $wdkRoot -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $inf2cat) {
-            throw "Inf2Cat.exe was not found in Microsoft.Windows.WDK.x64 $wdkVersion."
-          }
+          $inf2cat = Get-ChildItem $wdkRoot -Filter Inf2Cat.exe -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $inf2cat) { throw "Inf2Cat.exe was not found in Microsoft.Windows.WDK.x64 $wdkVersion." }
           Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
           "INF2CAT=$($inf2cat.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          & $inf2cat.FullName /? | Select-Object -First 8
 
       - name: Generate USB driver catalogs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:INF2CAT -or -not (Test-Path $env:INF2CAT)) {
-            throw 'INF2CAT environment variable does not point to a valid Inf2Cat.exe.'
-          }
-          Write-Host "Using Inf2Cat: $env:INF2CAT"
+          if (-not $env:INF2CAT -or -not (Test-Path $env:INF2CAT)) { throw 'INF2CAT environment variable does not point to a valid Inf2Cat.exe.' }
           & $env:INF2CAT /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
-          if ($LASTEXITCODE -ne 0) {
-            throw "Inf2Cat failed with exit code $LASTEXITCODE."
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed with exit code $LASTEXITCODE." }
           foreach ($catalog in @('AppleUsbCompositeConfiguration.cat','WinUsbControl.cat')) {
-            if (-not (Test-Path (Join-Path '.\Driver' $catalog))) {
-              throw "Inf2Cat completed but $catalog was not generated."
-            }
+            if (-not (Test-Path (Join-Path '.\Driver' $catalog))) { throw "Inf2Cat completed but $catalog was not generated." }
           }
-          Get-ChildItem .\Driver\*.cat | Select-Object Name,Length
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
@@ -181,19 +142,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $driver = '.\artifacts\package\Driver'
-          $forbidden = Get-ChildItem $driver -Recurse -File |
-            Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
-          if ($forbidden) {
-            $forbidden | ForEach-Object { Write-Host "FORBIDDEN DRIVER FILE: $($_.FullName)" }
-            throw 'Legacy USB filter artifact entered the Windows driver payload.'
-          }
-          $textHits = Get-ChildItem $driver -Recurse -File |
-            Where-Object { $_.Extension -in @('.ps1','.inf') } |
-            ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb-win32 installer|install-filter\.exe' -ErrorAction SilentlyContinue }
-          if ($textHits) {
-            $textHits | ForEach-Object { Write-Host "FORBIDDEN DRIVER PAYLOAD REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy USB filter installer reference entered the Windows driver payload.'
-          }
+          $forbidden = Get-ChildItem $driver -Recurse -File | Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
+          if ($forbidden) { throw 'Legacy USB filter artifact entered the Windows driver payload.' }
+          $textHits = Get-ChildItem $driver -Recurse -File | Where-Object { $_.Extension -in @('.ps1','.inf') } | ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb-win32 installer|install-filter\.exe' -ErrorAction SilentlyContinue }
+          if ($textHits) { throw 'Legacy USB filter installer reference entered the Windows driver payload.' }
           Write-Host 'Final driver-payload legacy-installer verification passed.'
 
       - name: Verify executable has no legacy libusb symbols
@@ -206,9 +158,7 @@ jobs:
           $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
           $patterns = @('RemoveLegacyLibUsb','libusb0.sys','install-filter.exe','libusb-win32 installer')
           $hits = $patterns | Where-Object { $ascii.Contains($_) -or $utf16.Contains($_) }
-          if ($hits) {
-            throw "Legacy libusb symbols found in executable: $($hits -join ', ')"
-          }
+          if ($hits) { throw "Legacy libusb symbols found in executable: $($hits -join ', ')" }
           Write-Host 'Executable legacy-libusb symbol verification passed.'
 
       - name: Upload ready-to-run package
