@@ -2,6 +2,7 @@ using Microsoft.Win32;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
+using System.Runtime.InteropServices;
 
 namespace iPhoneUsbShare;
 
@@ -10,6 +11,15 @@ internal static class NcmConfigurationRecovery
     private const string VendorProduct = "USB\\VID_05AC&PID_";
     private const uint SafeConfiguration = 2;
     private const uint NcmConfiguration = 5;
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Locate_DevNodeW(out IntPtr pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Disable_DevNode(IntPtr dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    private static extern int CM_Enable_DevNode(IntPtr dnDevInst, uint ulFlags);
 
     internal static bool ArmDirectNcm(Action<string> log)
     {
@@ -58,21 +68,37 @@ internal static class NcmConfigurationRecovery
             parameters.SetValue("AltConfigurationValue", SafeConfiguration, RegistryValueKind.DWord);
             log($"NCM configuration recovery: usbccgp configuration selection set to Original={NcmConfiguration}, Alt={SafeConfiguration}; previous Original={oldOriginal ?? "none"}, Alt={oldAlternate ?? "none"}.");
 
-            var restart = RunPnpUtil($"/restart-device \"{phoneId}\"");
-            log($"NCM configuration recovery: composite parent restart exit code={restart.ExitCode}.");
-            if (!string.IsNullOrWhiteSpace(restart.Output)) log($"NCM configuration recovery: restart output: {restart.Output.Trim()}");
-            if (!string.IsNullOrWhiteSpace(restart.Error)) log($"NCM configuration recovery: restart error: {restart.Error.Trim()}");
-
-            if (restart.Output.Contains("pending system reboot", StringComparison.OrdinalIgnoreCase) ||
-                restart.Output.Contains("pending reboot", StringComparison.OrdinalIgnoreCase))
+            // pnputil /restart-device can be rejected with ERROR_OPERATION_PENDING
+            // even though the devnode is perfectly recoverable. Disable/enable the
+            // existing devnode directly through ConfigMgr instead of asking PnP to
+            // queue another restart operation.
+            var locate = CM_Locate_DevNodeW(out var devInst, phoneId, 0);
+            log($"NCM configuration recovery: CM_Locate_DevNode result={locate}.");
+            if (locate != 0 || devInst == IntPtr.Zero)
             {
-                log("NCM configuration recovery: Windows reports the composite device is pending a system reboot; refusing further PnP resets in this session.");
+                log("NCM configuration recovery: could not locate composite devnode through ConfigMgr.");
                 return false;
             }
 
-            Thread.Sleep(1500);
+            var disable = CM_Disable_DevNode(devInst, 0);
+            log($"NCM configuration recovery: CM_Disable_DevNode result={disable}.");
+            if (disable != 0)
+            {
+                log("NCM configuration recovery: ConfigMgr refused to disable the composite devnode.");
+                return false;
+            }
 
-            for (var i = 0; i < 30; i++)
+            Thread.Sleep(1000);
+
+            var enable = CM_Enable_DevNode(devInst, 0);
+            log($"NCM configuration recovery: CM_Enable_DevNode result={enable}.");
+            if (enable != 0)
+            {
+                log("NCM configuration recovery: ConfigMgr refused to enable the composite devnode.");
+                return false;
+            }
+
+            for (var i = 0; i < 40; i++)
             {
                 if (FindAppleInterface(2) && FindAppleInterface(3))
                 {
@@ -82,7 +108,7 @@ internal static class NcmConfigurationRecovery
                 Thread.Sleep(500);
             }
 
-            log("NCM configuration recovery: composite restart completed, but MI_02/MI_03 are still not visible.");
+            log("NCM configuration recovery: ConfigMgr disable/enable completed, but MI_02/MI_03 are still not visible.");
             return false;
         }
         catch (Exception ex)
