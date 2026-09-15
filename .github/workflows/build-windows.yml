@@ -19,20 +19,17 @@ jobs:
           $path = Join-Path $PWD 'src\UsbNative.cs'
           $text = Get-Content -LiteralPath $path -Raw
 
-          # Remove legacy libusb cleanup calls and methods from the build copy.
+          # Remove only the legacy cleanup calls and their two methods.
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
-          # Remove each legacy method independently. The lookahead stops at the
-          # next private static method, so nested braces inside the method body
-          # do not accidentally delete unrelated methods such as MI discovery.
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?(?=\r?\n    private static )', "`r`n")
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbService\(\).*?(?=\r?\n    private static )', "`r`n")
 
           # Real Apple child instance IDs contain REV_xxxx before MI_xx.
-          # The source must match the actual child PDO rather than assuming
-          # parentId + MI_xx is a literal prefix.
-          $expectedDiscovery = 'id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)'
-          if (-not $text.Contains($expectedDiscovery)) {
+          # Use a regex so PowerShell/C# backslash escaping cannot make this
+          # validation fail even though the source logic is correct.
+          $expectedDiscovery = 'id\.StartsWith\("USB\\+VID_05AC&PID_",\s*StringComparison\.OrdinalIgnoreCase\)\s*&&\s*id\.Contains\(marker,\s*StringComparison\.OrdinalIgnoreCase\)'
+          if (-not [regex]::IsMatch($text, $expectedDiscovery)) {
             throw 'Apple child discovery source does not contain the REV_xxxx-safe MI_xx matching logic; refusing to build.'
           }
 
