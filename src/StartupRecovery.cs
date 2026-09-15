@@ -7,9 +7,7 @@ namespace iPhoneUsbShare;
 internal static class StartupRecovery
 {
     private const string ApplePrefix = "USB\\VID_05AC&PID_";
-    private const string Mi00Marker = "&MI_00\\";
     private const uint CrSuccess = 0;
-    private const uint CrNoSuchDevnode = 0x0000000D;
     private const uint CmLocateDevNodeNormal = 0x00000000;
     private const uint CmReenumerateSynchronous = 0x00000001;
 
@@ -21,6 +19,10 @@ internal static class StartupRecovery
             log("Startup recovery: Apple composite device is not enumerated; nothing to recover yet.");
             return;
         }
+
+        var children = FindAppleChildren(parent);
+        if (children.Length > 0)
+            log($"Startup recovery: current Apple USB children: {string.Join(" | ", children)}");
 
         if (FindMi00(parent) is not null)
         {
@@ -40,6 +42,10 @@ internal static class StartupRecovery
         await Task.Delay(1800);
 
         parent = FindAppleCompositeParent() ?? parent;
+        children = FindAppleChildren(parent);
+        if (children.Length > 0)
+            log($"Startup recovery: Apple USB children after re-enumeration: {string.Join(" | ", children)}");
+
         if (FindMi00(parent) is not null)
         {
             log("Startup recovery: Apple MI_00 reappeared; WinUSB prerequisite check can continue.");
@@ -54,11 +60,7 @@ internal static class StartupRecovery
     {
         var result = CM_Locate_DevNodeW(out var devInst, instanceId, CmLocateDevNodeNormal);
         if (result != CrSuccess)
-        {
-            if (result == CrNoSuchDevnode)
-                return result;
             return result;
-        }
 
         return CM_Reenumerate_DevNode(devInst, CmReenumerateSynchronous);
     }
@@ -69,7 +71,7 @@ internal static class StartupRecovery
         {
             using var searcher = new ManagementObjectSearcher(
                 "root\\CIMV2",
-                "SELECT PNPDeviceID, Name FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
+                "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
             foreach (ManagementObject device in searcher.Get())
             {
                 var id = device["PNPDeviceID"]?.ToString();
@@ -83,23 +85,29 @@ internal static class StartupRecovery
         return null;
     }
 
-    private static string? FindMi00(string parentId)
+    private static string[] FindAppleChildren(string parentId)
     {
         try
         {
             using var searcher = new ManagementObjectSearcher(
                 "root\\CIMV2",
                 "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
-            foreach (ManagementObject device in searcher.Get())
-            {
-                var id = device["PNPDeviceID"]?.ToString();
-                if (string.IsNullOrWhiteSpace(id)) continue;
-                if (id.StartsWith(parentId + "&MI_00\\", StringComparison.OrdinalIgnoreCase))
-                    return id;
-            }
+            return searcher.Get()
+                .Cast<ManagementObject>()
+                .Select(device => device["PNPDeviceID"]?.ToString())
+                .Where(id => !string.IsNullOrWhiteSpace(id) &&
+                             id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase))
+                .Select(id => id!)
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
         }
-        catch { }
-        return null;
+        catch { return Array.Empty<string>(); }
+    }
+
+    private static string? FindMi00(string parentId)
+    {
+        return FindAppleChildren(parentId)
+            .FirstOrDefault(id => id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase));
     }
 
     private static ProcessResult RunPnpUtil(string arguments)
