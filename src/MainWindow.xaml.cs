@@ -70,6 +70,21 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Log($"ERROR: {ex.Message}");
+            if (NetworkSharingRecovery.IsSubscriberError(ex))
+            {
+                Log("ICS COM subscriber failure detected; starting isolated SharedAccess recovery without touching the USB stack.");
+                var recovered = await Task.Run(() => NetworkSharingRecovery.ApplySharingWithFallback(Log));
+                if (recovered)
+                {
+                    _sharing = true;
+                    StopButton.IsEnabled = true;
+                    Log("ICS recovery succeeded; USB Ethernet path remains untouched and sharing is ON.");
+                    _timer.Start();
+                    await RefreshAsync();
+                    return;
+                }
+                Log("ICS recovery did not complete. No USB/PnP reset was performed.");
+            }
             StartButton.IsEnabled = true;
         }
     }
