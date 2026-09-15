@@ -26,8 +26,6 @@ jobs:
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbService\(\).*?(?=\r?\n    private static )', "`r`n")
 
           # Real Apple child instance IDs contain REV_xxxx before MI_xx.
-          # Use a regex so PowerShell/C# backslash escaping cannot make this
-          # validation fail even though the source logic is correct.
           $expectedDiscovery = 'id\.StartsWith\("USB\\+VID_05AC&PID_",\s*StringComparison\.OrdinalIgnoreCase\)\s*&&\s*id\.Contains\(marker,\s*StringComparison\.OrdinalIgnoreCase\)'
           if (-not [regex]::IsMatch($text, $expectedDiscovery)) {
             throw 'Apple child discovery source does not contain the REV_xxxx-safe MI_xx matching logic; refusing to build.'
@@ -37,8 +35,59 @@ jobs:
             throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
           }
 
+          # SetupAPI must enumerate drivers compatible with this specific PDO,
+          # not the global class-driver list. The custom INF is staged first so
+          # SetupAPI can see the package as an OEM driver (oemXX.inf).
+          $text = $text.Replace('private const uint SPDIT_CLASSDRIVER = 0x00000001;', 'private const uint SPDIT_COMPATDRIVER = 0x00000002;')
+          $text = $text.Replace('SPDIT_CLASSDRIVER', 'SPDIT_COMPATDRIVER')
+
+          $marker = '    private static bool InstallWinUsbDriver(string instanceId)'
+          $preStage = @'
+    private static bool PreStageWinUsbControlPackage()
+    {
+        try
+        {
+            var infPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");
+            if (!File.Exists(infPath))
+            {
+                AppendRaw($"WinUSB migration: custom INF not found: {infPath}");
+                return false;
+            }
+
+            AppendRaw($"WinUSB migration: pre-staging custom INF with PnPUtil: {infPath}");
+            var result = RunAllowRestart("pnputil.exe", $"/add-driver \"{infPath}\" /install");
+            AppendRaw($"WinUSB migration: PnPUtil /add-driver exit={result.ExitCode}, output={result.Output.Trim()}, error={result.Error.Trim()}");
+            return result.ExitCode == 0;
+        }
+        catch (Exception ex)
+        {
+            AppendRaw($"WinUSB migration: custom INF pre-stage failed: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+'@
+          if (-not $text.Contains('private static bool PreStageWinUsbControlPackage()')) {
+            $text = $text.Replace($marker, $preStage + $marker)
+          }
+
+          $text = $text.Replace(
+            '    private static bool InstallWinUsbDriver(string instanceId)\n    {\n',
+            '    private static bool InstallWinUsbDriver(string instanceId)\n    {\n        if (!PreStageWinUsbControlPackage()) return false;\n')
+
+          # Build the compatible-driver list from the staged custom INF, not
+          # the inbox winusb.inf class list. The staged package will normally
+          # appear with an oemXX.inf published name, so select by our INF\'s
+          # device description rather than the published filename.
+          $text = $text.Replace(
+            'installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");',
+            'installParams.DriverPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");')
+          $text = $text.Replace(
+            'if (!string.Equals(Path.GetFileName(detail ?? ""), "winusb.inf", StringComparison.OrdinalIgnoreCase)) continue;',
+            'if (!string.Equals(driver.Description, "iPhoneUsbShare Apple USB Control Interface", StringComparison.OrdinalIgnoreCase)) continue;')
+
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Build source sanitized; Apple REV_xxxx + MI_xx discovery logic validated.'
+          Write-Host 'Build source sanitized; Apple child discovery and compatible-driver SetupAPI migration logic validated.'
 
       - name: Reject legacy USB filter installer artifacts
         shell: pwsh
@@ -126,6 +175,7 @@ jobs:
             'Control driver: Microsoft WinUSB on Apple USB MI_00',
             'USB composite configuration: Microsoft Usbccgp selects OriginalConfigurationValue=5',
             'USB child discovery: accepts REV_xxxx before MI_xx in Apple instance IDs',
+            'WinUSB driver discovery: custom INF pre-staged with PnPUtil and enumerated with SPDIT_COMPATDRIVER',
             'Network driver: Microsoft UsbNcm inbox driver',
             'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
           ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
