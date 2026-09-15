@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Management;
+using System.Runtime.InteropServices;
 
 namespace iPhoneUsbShare;
 
@@ -7,44 +8,59 @@ internal static class StartupRecovery
 {
     private const string ApplePrefix = "USB\\VID_05AC&PID_";
     private const string Mi00Marker = "&MI_00\\";
+    private const uint CrSuccess = 0;
+    private const uint CrNoSuchDevnode = 0x0000000D;
+    private const uint CmLocateDevNodeNormal = 0x00000000;
+    private const uint CmReenumerateSynchronous = 0x00000001;
 
     public static async Task RecoverWinUsbControlAsync(Action<string> log)
     {
-        for (var attempt = 1; attempt <= 3; attempt++)
+        var parent = FindAppleCompositeParent();
+        if (parent is null)
         {
-            var parent = FindAppleCompositeParent();
-            if (parent is null)
-            {
-                log("Startup recovery: Apple composite device is not enumerated; nothing to recover yet.");
-                return;
-            }
-
-            if (FindMi00(parent) is not null)
-            {
-                log("Startup recovery: Apple MI_00 is already enumerated.");
-                return;
-            }
-
-            log($"Startup recovery {attempt}/3: MI_00 is missing; restarting Apple composite devnode {parent}.");
-            var result = RunPnpUtil($"/restart-device \"{parent}\"");
-            log($"Startup recovery: pnputil /restart-device exit code {result.ExitCode}.");
-            if (!string.IsNullOrWhiteSpace(result.Output)) log($"Startup recovery: {result.Output.Trim()}");
-            if (!string.IsNullOrWhiteSpace(result.Error)) log($"Startup recovery: {result.Error.Trim()}");
-
-            await Task.Delay(1800);
-
-            var scan = RunPnpUtil("/scan-devices");
-            log($"Startup recovery: pnputil /scan-devices exit code {scan.ExitCode}.");
-            await Task.Delay(1800);
-
-            if (FindMi00(FindAppleCompositeParent() ?? parent) is not null)
-            {
-                log("Startup recovery: Apple MI_00 reappeared; WinUSB prerequisite check can continue.");
-                return;
-            }
+            log("Startup recovery: Apple composite device is not enumerated; nothing to recover yet.");
+            return;
         }
 
-        log("Startup recovery: MI_00 is still missing after three targeted composite-device restarts.");
+        if (FindMi00(parent) is not null)
+        {
+            log("Startup recovery: Apple MI_00 is already enumerated.");
+            return;
+        }
+
+        log($"Startup recovery: MI_00 is missing; requesting targeted PnP re-enumeration of {parent}.");
+        var reenumerate = ReenumerateDevNode(parent);
+        log($"Startup recovery: CM_Reenumerate_DevNode result 0x{reenumerate:X8}.");
+        await Task.Delay(1800);
+
+        var scan = RunPnpUtil("/scan-devices");
+        log($"Startup recovery: pnputil /scan-devices exit code {scan.ExitCode}.");
+        if (!string.IsNullOrWhiteSpace(scan.Output)) log($"Startup recovery: {scan.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(scan.Error)) log($"Startup recovery: {scan.Error.Trim()}");
+        await Task.Delay(1800);
+
+        parent = FindAppleCompositeParent() ?? parent;
+        if (FindMi00(parent) is not null)
+        {
+            log("Startup recovery: Apple MI_00 reappeared; WinUSB prerequisite check can continue.");
+            return;
+        }
+
+        log("Startup recovery: targeted re-enumeration did not restore MI_00; no further automatic device-stack restarts will be attempted.");
+        log("Startup recovery: reconnect the Apple device by USB if MI_00 remains absent.");
+    }
+
+    private static uint ReenumerateDevNode(string instanceId)
+    {
+        var result = CM_Locate_DevNodeW(out var devInst, instanceId, CmLocateDevNodeNormal);
+        if (result != CrSuccess)
+        {
+            if (result == CrNoSuchDevnode)
+                return result;
+            return result;
+        }
+
+        return CM_Reenumerate_DevNode(devInst, CmReenumerateSynchronous);
     }
 
     private static string? FindAppleCompositeParent()
@@ -78,8 +94,8 @@ internal static class StartupRecovery
             {
                 var id = device["PNPDeviceID"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id)) continue;
-                if (!id.StartsWith(parentId + Mi00Marker[..^1], StringComparison.OrdinalIgnoreCase)) continue;
-                if (id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase)) return id;
+                if (id.StartsWith(parentId + "&MI_00\\", StringComparison.OrdinalIgnoreCase))
+                    return id;
             }
         }
         catch { }
@@ -113,6 +129,17 @@ internal static class StartupRecovery
             return new ProcessResult(-1, string.Empty, ex.Message);
         }
     }
+
+    [DllImport("CfgMgr32.dll", CharSet = CharSet.Unicode, SetLastError = false)]
+    private static extern uint CM_Locate_DevNodeW(
+        out uint pdnDevInst,
+        string pDeviceID,
+        uint ulFlags);
+
+    [DllImport("CfgMgr32.dll", SetLastError = false)]
+    private static extern uint CM_Reenumerate_DevNode(
+        uint dnDevInst,
+        uint ulFlags);
 
     private sealed record ProcessResult(int ExitCode, string Output, string Error);
 }
