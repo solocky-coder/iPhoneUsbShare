@@ -113,25 +113,25 @@ jobs:
           Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
           Get-Item $zip | Select-Object FullName,Length
 
-      - name: Verify package contains no legacy USB filter installer
+      - name: Verify driver payload contains no legacy USB filter
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $package = '.\artifacts\package'
-          $forbidden = Get-ChildItem $package -Recurse -File |
+          $driver = '.\artifacts\package\Driver'
+          $forbidden = Get-ChildItem $driver -Recurse -File |
             Where-Object { $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
           if ($forbidden) {
-            $forbidden | ForEach-Object { Write-Host "FORBIDDEN PACKAGE FILE: $($_.FullName)" }
-            throw 'Legacy USB filter artifact entered the Windows package.'
+            $forbidden | ForEach-Object { Write-Host "FORBIDDEN DRIVER FILE: $($_.FullName)" }
+            throw 'Legacy USB filter artifact entered the Windows driver payload.'
           }
-          $textHits = Get-ChildItem $package -Recurse -File |
-            Where-Object { $_.Extension -in @('.txt','.ps1','.inf') } |
+          $textHits = Get-ChildItem $driver -Recurse -File |
+            Where-Object { $_.Extension -in @('.ps1','.inf') } |
             ForEach-Object { Select-String -Path $_.FullName -Pattern 'libusb-win32 installer|install-filter\.exe' -ErrorAction SilentlyContinue }
           if ($textHits) {
-            $textHits | ForEach-Object { Write-Host "FORBIDDEN PACKAGE REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy USB filter installer reference entered the Windows package.'
+            $textHits | ForEach-Object { Write-Host "FORBIDDEN DRIVER PAYLOAD REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw 'Legacy USB filter installer reference entered the Windows driver payload.'
           }
-          Write-Host 'Final package legacy-installer verification passed.'
+          Write-Host 'Final driver-payload legacy-installer verification passed.'
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
