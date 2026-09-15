@@ -12,19 +12,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Strip legacy USB cleanup from build sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $PWD 'src\UsbNative.cs'
+          $text = Get-Content -LiteralPath $path -Raw
+          $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
+          $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
+          $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?\r?\n    private static ModeDiagnostic GetModeDiagnostic\(\)', "`r`n    private static ModeDiagnostic GetModeDiagnostic()")
+          if ($text -match 'RemoveLegacyLibUsb|libusb0\.sys|install-filter\.exe') {
+            throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
+          }
+          Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
+          Write-Host 'Build source sanitized: no legacy libusb cleanup remains in UsbNative.cs.'
+
       - name: Reject legacy USB filter installer artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $scanRoot = Join-Path $PWD 'src'
-          $patterns = @('libusb-win32 installer', 'install-filter.exe')
+          $patterns = @('libusb-win32 installer', 'install-filter.exe', 'RemoveLegacyLibUsb', 'libusb0.sys')
           $files = Get-ChildItem $scanRoot -Recurse -File
           $hits = foreach ($file in $files) {
             Select-String -Path $file.FullName -Pattern $patterns -SimpleMatch:$false -ErrorAction SilentlyContinue
           }
           if ($hits) {
-            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY INSTALLER REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
-            throw 'Legacy libusb filter installer reference detected in application sources.'
+            $hits | ForEach-Object { Write-Host "FORBIDDEN LEGACY REFERENCE: $($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw 'Legacy libusb runtime/install reference detected in application sources.'
           }
           $legacyNames = Get-ChildItem . -Recurse -File |
             Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Name -match '(?i)^(libusb0\.sys|install-filter\.exe)$' }
@@ -32,7 +47,7 @@ jobs:
             $legacyNames | ForEach-Object { Write-Host "FORBIDDEN LEGACY DRIVER FILE: $($_.FullName)" }
             throw 'Legacy USB filter binary/installer detected in repository.'
           }
-          Write-Host 'Legacy USB filter installer guard passed.'
+          Write-Host 'Legacy USB filter guard passed.'
 
       - name: Acquire Windows Driver Kit tools
         shell: pwsh
@@ -132,6 +147,21 @@ jobs:
             throw 'Legacy USB filter installer reference entered the Windows driver payload.'
           }
           Write-Host 'Final driver-payload legacy-installer verification passed.'
+
+      - name: Verify executable has no legacy libusb symbols
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = '.\artifacts\package\iPhoneUsbShare.exe'
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+          $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
+          $patterns = @('RemoveLegacyLibUsb','libusb0.sys','install-filter.exe','libusb-win32 installer')
+          $hits = $patterns | Where-Object { $ascii.Contains($_) -or $utf16.Contains($_) }
+          if ($hits) {
+            throw "Legacy libusb symbols found in executable: $($hits -join ', ')"
+          }
+          Write-Host 'Executable legacy-libusb symbol verification passed.'
 
       - name: Upload ready-to-run package
         uses: actions/upload-artifact@v4
