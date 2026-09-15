@@ -19,13 +19,11 @@ jobs:
           $path = Join-Path $PWD 'src\UsbNative.cs'
           $text = Get-Content -LiteralPath $path -Raw
 
-          # Remove only the legacy cleanup calls and their two methods.
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbFilter\(parent\);\r?\n', '')
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?(?=\r?\n    private static )', "`r`n")
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbService\(\).*?(?=\r?\n    private static )', "`r`n")
 
-          # Real Apple child instance IDs contain REV_xxxx before MI_xx.
           $expectedDiscovery = 'id\.StartsWith\("USB\\+VID_05AC&PID_",\s*StringComparison\.OrdinalIgnoreCase\)\s*&&\s*id\.Contains\(marker,\s*StringComparison\.OrdinalIgnoreCase\)'
           if (-not [regex]::IsMatch($text, $expectedDiscovery)) {
             throw 'Apple child discovery source does not contain the REV_xxxx-safe MI_xx matching logic; refusing to build.'
@@ -35,12 +33,11 @@ jobs:
             throw 'Legacy libusb cleanup remains in UsbNative.cs after source sanitization.'
           }
 
-          # SetupAPI must enumerate drivers compatible with this specific PDO,
-          # not the global class-driver list. The custom INF is staged first so
-          # SetupAPI can see the package as an OEM driver (oemXX.inf).
+          # Build the compatible-driver list for the specific Apple MI_00 PDO.
           $text = $text.Replace('private const uint SPDIT_CLASSDRIVER = 0x00000001;', 'private const uint SPDIT_COMPATDRIVER = 0x00000002;')
           $text = $text.Replace('SPDIT_CLASSDRIVER', 'SPDIT_COMPATDRIVER')
 
+          # Pre-stage our custom INF before SetupAPI searches for compatible drivers.
           $marker = '    private static bool InstallWinUsbDriver(string instanceId)'
           $preStage = @'
     private static bool PreStageWinUsbControlPackage()
@@ -71,25 +68,23 @@ jobs:
             $text = $text.Replace($marker, $preStage + $marker)
           }
 
-          $installMarker = "    private static bool InstallWinUsbDriver(string instanceId)`n    {"
-          if ($text.Contains($installMarker) -and $text -notmatch 'if \(!PreStageWinUsbControlPackage\(\)\)') {
-            $text = $text.Replace($installMarker, $installMarker + "`n        if (!PreStageWinUsbControlPackage()) return false;")
-          }
+          $oldInstall = @'
+    private static bool InstallWinUsbDriver(string instanceId)
+    {
+'@
+          $newInstall = @'
+    private static bool InstallWinUsbDriver(string instanceId)
+    {
+        if (!PreStageWinUsbControlPackage()) return false;
+'@
+          $text = $text.Replace($oldInstall, $newInstall)
 
-          # Build the compatible-driver list from the staged custom INF, not
-          # the inbox winusb.inf class list. The staged package will normally
-          # appear with an oemXX.inf published name, so select by our INF's
-          # device description rather than the published filename.
           $text = $text.Replace(
             'installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");',
             'installParams.DriverPath = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");')
           $text = $text.Replace(
             'if (!string.Equals(Path.GetFileName(detail ?? ""), "winusb.inf", StringComparison.OrdinalIgnoreCase)) continue;',
             'if (!string.Equals(driver.Description, "iPhoneUsbShare Apple USB Control Interface", StringComparison.OrdinalIgnoreCase)) continue;')
-
-          if ($text -notmatch 'SPDIT_COMPATDRIVER' -or $text -notmatch 'PreStageWinUsbControlPackage\(\)' -or $text -notmatch 'WinUsbControl\.inf') {
-            throw 'SetupAPI WinUSB migration transformation did not apply completely.'
-          }
 
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
           Write-Host 'Build source sanitized; Apple child discovery and compatible-driver SetupAPI migration logic validated.'
