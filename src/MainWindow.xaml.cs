@@ -8,7 +8,7 @@ public partial class MainWindow : Window
 {
     private readonly ShareEngine _engine = new();
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(2) };
-    private bool _sharing;
+    private bool _transportReady;
 
     public MainWindow()
     {
@@ -36,16 +36,16 @@ public partial class MainWindow : Window
         {
             var s = await _engine.GetStatusAsync();
             PhoneText.Text = s.AppleConnected ? s.AppleName : "Connect your iPhone or iPad by USB";
-            AdapterText.Text = s.AdapterName is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.AdapterName} ({s.AdapterStatus})";
+            AdapterText.Text = s.AdapterName is null ? "USB NCM Ethernet: not connected" : $"USB NCM Ethernet: {s.AdapterName} ({s.AdapterStatus})";
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                s.AppleConnected ? (s.Sharing ? "#16A34A" : "#D97706") : "#98A2B3"));
-            StateText.Text = s.Sharing ? "Internet sharing is ON" : "Ready";
+                s.AppleConnected ? (s.AdapterStatus == "Up" ? "#16A34A" : "#D97706") : "#98A2B3"));
+            StateText.Text = s.AdapterName is not null && s.AdapterStatus == "Up" ? "USB transport is ready" : "USB transport not ready";
             IpText.Text = s.Lease ?? "—";
             RxText.Text = $"{s.Rx:0.0} KB/s";
             TxText.Text = $"{s.Tx:0.0} KB/s";
-            if (_sharing && !s.Sharing && s.AdapterName is null)
+            if (_transportReady && (s.AdapterName is null || s.AdapterStatus != "Up"))
             {
-                _sharing = false;
+                _transportReady = false;
                 StartButton.IsEnabled = true;
                 StopButton.IsEnabled = false;
             }
@@ -59,32 +59,17 @@ public partial class MainWindow : Window
         StopButton.IsEnabled = false;
         try
         {
-            Log("Starting…");
-            await _engine.StartAsync();
-            _sharing = true;
+            Log("Starting USB transport…");
+            await _engine.EnsureUsbTransportAsync();
+            _transportReady = true;
             StopButton.IsEnabled = true;
-            Log("Sharing is ON.");
+            Log("USB transport is ready. No ICS, NAT, DHCP or Wi-Fi configuration was performed.");
             _timer.Start();
             await RefreshAsync();
         }
         catch (Exception ex)
         {
             Log($"ERROR: {ex.Message}");
-            if (NetworkSharingRecovery.IsSubscriberError(ex))
-            {
-                Log("ICS COM subscriber failure detected; starting isolated SharedAccess recovery without touching the USB stack.");
-                var recovered = await Task.Run(() => NetworkSharingRecovery.ApplySharingWithFallback(Log));
-                if (recovered)
-                {
-                    _sharing = true;
-                    StopButton.IsEnabled = true;
-                    Log("ICS recovery succeeded; USB Ethernet path remains untouched and sharing is ON.");
-                    _timer.Start();
-                    await RefreshAsync();
-                    return;
-                }
-                Log("ICS recovery did not complete. No USB/PnP reset was performed.");
-            }
             StartButton.IsEnabled = true;
         }
     }
@@ -95,9 +80,9 @@ public partial class MainWindow : Window
         try
         {
             await _engine.StopAsync();
-            _sharing = false;
+            _transportReady = false;
             StartButton.IsEnabled = true;
-            Log("Sharing stopped.");
+            Log("USB transport stopped.");
             await RefreshAsync();
         }
         catch (Exception ex)
