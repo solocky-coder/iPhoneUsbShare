@@ -12,7 +12,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Sanitize legacy USB code and fix Apple child discovery
+      - name: Sanitize legacy USB code and validate Apple child discovery
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -24,16 +24,12 @@ jobs:
           $text = [regex]::Replace($text, '(?m)^\s*RemoveLegacyLibUsbService\(\);\r?\n', '')
           $text = [regex]::Replace($text, '(?ms)\r?\n    private static void RemoveLegacyLibUsbFilter\(string parentId\).*?\r?\n    private static ModeDiagnostic GetModeDiagnostic\(\)', "`r`n    private static ModeDiagnostic GetModeDiagnostic()")
 
-          # Real Apple child instance IDs include REV_xxxx before MI_xx.
-          # Replace the old parentId + MI check with a VID/PID + MI check.
-          $oldCondition = 'if \(id\.StartsWith\(parentId \+ "&MI_", StringComparison\.OrdinalIgnoreCase\) && id\.Contains\(marker, StringComparison\.OrdinalIgnoreCase\)\) return id;'
-          $newCondition = 'if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)) return id;'
-          if (-not $text.Contains('id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase)')) {
-            throw 'Expected Apple child discovery condition was not found; refusing to build.'
-          }
-          $text = [regex]::Replace($text, $oldCondition, $newCondition)
-          if ($text.Contains('id.StartsWith(parentId + "&MI_", StringComparison.OrdinalIgnoreCase)')) {
-            throw 'Apple child discovery condition was not replaced.'
+          # Real Apple child instance IDs contain REV_xxxx before MI_xx.
+          # The source must match the actual child PDO rather than assuming
+          # parentId + MI_xx is a literal prefix.
+          $expectedDiscovery = 'id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && id.Contains(marker, StringComparison.OrdinalIgnoreCase)'
+          if (-not $text.Contains($expectedDiscovery)) {
+            throw 'Apple child discovery source does not contain the REV_xxxx-safe MI_xx matching logic; refusing to build.'
           }
 
           if ($text -match 'RemoveLegacyLibUsb|libusb0\.sys|install-filter\.exe') {
@@ -41,7 +37,7 @@ jobs:
           }
 
           Set-Content -LiteralPath $path -Value $text -Encoding utf8 -NoNewline
-          Write-Host 'Build source sanitized and Apple REV_xxxx + MI_xx discovery fix applied.'
+          Write-Host 'Build source sanitized; Apple REV_xxxx + MI_xx discovery logic validated.'
 
       - name: Reject legacy USB filter installer artifacts
         shell: pwsh
