@@ -17,6 +17,26 @@ jobs:
         with:
           dotnet-version: '8.x'
 
+      - name: Generate WinUSB control catalog
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inf2cat = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin" -Filter Inf2Cat.exe -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $inf2cat) {
+            throw 'Inf2Cat.exe was not found in the installed Windows Driver Kit.'
+          }
+          Write-Host "Using Inf2Cat: $($inf2cat.FullName)"
+          & $inf2cat.FullName /driver:"$PWD\Driver" /os:10_VB_X64 /uselocaltime /verbose
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inf2Cat failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path .\Driver\WinUsbControl.cat)) {
+            throw 'Inf2Cat completed but WinUsbControl.cat was not generated.'
+          }
+          Get-Item .\Driver\WinUsbControl.cat | Select-Object FullName,Length
+
       - name: Publish EXE
         shell: pwsh
         run: |
@@ -33,6 +53,7 @@ jobs:
           Copy-Item .\artifacts\publish\iPhoneUsbShare.exe $package\iPhoneUsbShare.exe -Force
           Copy-Item .\README.md $package\README.txt -Force
           Copy-Item .\Driver\WinUsbControl.inf $driver\WinUsbControl.inf -Force
+          Copy-Item .\Driver\WinUsbControl.cat $driver\WinUsbControl.cat -Force
           Copy-Item .\Driver\install-winusb-control.ps1 $driver\install-winusb-control.ps1 -Force
           Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows WinUSB and UsbNcm are Microsoft-provided inbox components. The WinUSB control package targets Apple USB VID_05AC/PID_12AB MI_00 and contains no Apple driver binary.'
           Compress-Archive -Path "$package\*" -DestinationPath .\artifacts\iPhoneUsbShare-win-x64.zip -Force
