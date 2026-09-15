@@ -19,7 +19,11 @@ public partial class MainWindow : Window
         _timer.Tick += async (_, _) => await RefreshAsync();
         Loaded += async (_, _) =>
         {
-            try { await _engine.EnsurePrerequisitesAsync(); }
+            try
+            {
+                await StartupRecovery.RecoverWinUsbControlAsync(Log);
+                await _engine.EnsurePrerequisitesAsync();
+            }
             catch (Exception ex) { Log($"Setup check: {ex.Message}"); }
             await RefreshAsync();
         };
