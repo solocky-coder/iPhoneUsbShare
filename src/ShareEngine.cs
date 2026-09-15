@@ -85,7 +85,7 @@ public sealed class ShareEngine
             WriteLog("USB transport: Apple accepted CDC-NCM mode switch.");
         }
 
-        await EnsureInboxNcmBindingAsync();
+        await EnsureInboxNcmBindingAsync(phone.Id);
         adapter = await WaitForPhoneAdapterAsync(20);
         if (adapter is not null)
         {
@@ -93,8 +93,6 @@ public sealed class ShareEngine
             return adapter;
         }
 
-        // iOS can perform a delayed USB reset on a fresh connection. Retry once without
-        // involving ICS or any network COM state.
         WriteLog("USB transport: NCM adapter not ready; performing one USB-only recovery pass.");
         phone = FindAppleDevice() ?? throw new InvalidOperationException("Apple device disappeared during USB transport recovery.");
         SetConfig(phone.Id, SafeIndexValue, "0");
@@ -109,7 +107,7 @@ public sealed class ShareEngine
             SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
             if (!await UsbNative.SetModeAsync(3)) throw new InvalidOperationException("Apple rejected the CDC-NCM recovery mode switch.");
         }
-        await EnsureInboxNcmBindingAsync();
+        await EnsureInboxNcmBindingAsync(phone.Id);
         adapter = await WaitForPhoneAdapterAsync(30);
         return adapter ?? throw new InvalidOperationException("USB NCM adapter did not become operational after the USB-only recovery pass.");
     }
@@ -180,7 +178,7 @@ public sealed class ShareEngine
         throw new TimeoutException("Apple USB control interface did not return a mode.");
     }
 
-    private async Task EnsureInboxNcmBindingAsync()
+    private async Task EnsureInboxNcmBindingAsync(string parentId)
     {
         var infCandidates = new[]
         {
@@ -206,15 +204,44 @@ public sealed class ShareEngine
 
         var add = Run("pnputil.exe", $"/add-driver \"{inf}\" /install");
         WriteLog($"USB transport: UsbNcm package registration exit={add.ExitCode}");
-        if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm pnputil: {add.Error.Trim()}");
+        if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm pnputil output: {add.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(add.Error)) WriteLog($"UsbNcm pnputil error: {add.Error.Trim()}");
 
-        var child = FindAppleInterfaceId(2);
-        if (child is not null)
+        // After SET_MODE(3), iOS exposes configuration 5 but Windows can retain the
+        // old usbccgp child tree. Force one parent re-enumeration before looking for MI_02.
+        var child = await WaitForAppleInterfaceIdAsync(2, 4);
+        if (child is null)
         {
-            var restart = Run("pnputil.exe", $"/restart-device \"{child}\"");
-            if (restart.ExitCode != 0 && restart.ExitCode != 3010)
-                WriteLog($"USB transport: NCM child restart exit={restart.ExitCode}: {restart.Error.Trim()}");
+            WriteLog("USB transport: MI_02 is not yet enumerated after mode switch; re-enumerating Apple composite parent once.");
+            var restart = Run("pnputil.exe", $"/restart-device \"{parentId}\"");
+            WriteLog($"USB transport: Apple composite parent re-enumeration exit={restart.ExitCode}");
+            if (!string.IsNullOrWhiteSpace(restart.Output)) WriteLog($"Apple parent pnputil output: {restart.Output.Trim()}");
+            if (!string.IsNullOrWhiteSpace(restart.Error)) WriteLog($"Apple parent pnputil error: {restart.Error.Trim()}");
+            child = await WaitForAppleInterfaceIdAsync(2, 8);
         }
+
+        if (child is null)
+        {
+            WriteLog("USB transport: MI_02 still not enumerated; UsbNcm cannot bind yet. Leaving USB control plane intact.");
+            return;
+        }
+
+        WriteLog($"USB transport: discovered NCM control interface MI_02: {child}");
+        var childRestart = Run("pnputil.exe", $"/restart-device \"{child}\"");
+        WriteLog($"USB transport: NCM child restart exit={childRestart.ExitCode}");
+        if (!string.IsNullOrWhiteSpace(childRestart.Output)) WriteLog($"NCM child pnputil output: {childRestart.Output.Trim()}");
+        if (!string.IsNullOrWhiteSpace(childRestart.Error)) WriteLog($"NCM child pnputil error: {childRestart.Error.Trim()}");
+    }
+
+    private static async Task<string?> WaitForAppleInterfaceIdAsync(int interfaceNumber, int seconds)
+    {
+        for (var i = 0; i < seconds * 2; i++)
+        {
+            var id = FindAppleInterfaceId(interfaceNumber);
+            if (id is not null) return id;
+            await Task.Delay(500);
+        }
+        return null;
     }
 
     private static async Task<NetworkInterface?> WaitForPhoneAdapterAsync(int seconds)
@@ -358,13 +385,18 @@ public sealed class ShareEngine
         catch (Exception ex) { return new CommandResult(-1, "", ex.Message); }
     }
 
+    private sealed record PnpDevice(string Id, string Name);
+    private sealed record CommandResult(int ExitCode, string Output, string Error);
+
     private static async Task WaitUntil(Func<bool> predicate, int seconds, string what)
     {
-        for (var i = 0; i < seconds * 2; i++) { if (predicate()) return; await Task.Delay(500); }
+        for (var i = 0; i < seconds * 2; i++)
+        {
+            if (predicate()) return;
+            await Task.Delay(500);
+        }
         throw new TimeoutException($"Timed out waiting for {what}.");
     }
 
-    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
-    private readonly record struct CommandResult(int ExitCode, string Output, string Error);
-    private sealed record PnpDevice(string Id, string Name);
+    public sealed record Status(bool PhoneConnected, string PhoneName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
 }
