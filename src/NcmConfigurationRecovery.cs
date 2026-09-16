@@ -10,6 +10,7 @@ internal static class NcmConfigurationRecovery
     private const string VendorProduct = "USB\\VID_05AC&PID_";
     private const uint SafeConfiguration = 2;
     private const uint NcmConfiguration = 5;
+    private const int PnpUtilRebootRequired = 3010;
 
     internal static bool ArmDirectNcm(Action<string> log)
     {
@@ -83,7 +84,16 @@ internal static class NcmConfigurationRecovery
             log($"NCM configuration recovery: composite subtree removal exit code={remove.ExitCode}.");
             if (!string.IsNullOrWhiteSpace(remove.Output)) log($"NCM configuration recovery: subtree removal output: {remove.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(remove.Error)) log($"NCM configuration recovery: subtree removal error: {remove.Error.Trim()}");
-            if (remove.ExitCode != 0)
+
+            // pnputil returns 3010 when the removal itself succeeded but Windows
+            // reports that a reboot is required to finish configuration. Treat
+            // this as success: the device subtree has been accepted for removal,
+            // and a scan can now rebuild it using the newly selected config.
+            if (remove.ExitCode == PnpUtilRebootRequired)
+            {
+                log("NCM configuration recovery: composite subtree removal succeeded; Windows reports reboot-required (3010). Continuing with device scan without reboot.");
+            }
+            else if (remove.ExitCode != 0)
             {
                 log("NCM configuration recovery: Windows refused to remove the composite subtree; leaving the USB stack untouched and reporting failure.");
                 return false;
