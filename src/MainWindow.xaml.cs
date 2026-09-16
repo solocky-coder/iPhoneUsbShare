@@ -64,22 +64,18 @@ public partial class MainWindow : Window
         try
         {
             Log("Starting USB network path…");
-            await _engine.EnsurePrerequisitesAsync();
 
-            var recovered = await Task.Run(() => NcmConfigurationRecovery.ArmDirectNcm(Log));
-            if (!recovered)
-                throw new InvalidOperationException("Windows could not rebuild the Apple USB composite tree with CDC-NCM configuration 5.");
+            // ShareEngine owns the complete reference-compatible transition:
+            // usbccgp EnumeratorClass preparation -> registry index 2 -> restart
+            // -> GET_MODE -> registry index 4 -> SET_MODE(3) -> NCM driver bind.
+            // Do not use NcmConfigurationRecovery here; its old direct-config-5
+            // path bypassed Apple's required mode-switch handshake and could leave
+            // configuration 5 present without a Windows USB Ethernet adapter.
+            await _engine.StartAsync();
 
-            // At this point usbccgp has rebuilt the composite device using
-            // OriginalConfigurationValue=5. Do not call ShareEngine.StartAsync:
-            // that legacy path deliberately resets to configuration 2 first,
-            // which is exactly the sequencing that caused the missing-MI_02/03
-            // failure. The USB transport is the product; ICS/DHCP is not part of
-            // this bring-up step.
-            await WaitForUsbEthernetAsync();
             _sharing = true;
             StopButton.IsEnabled = true;
-            Log("USB Ethernet path is ON.");
+            Log("USB network path is ON.");
             _timer.Start();
             await RefreshAsync();
         }
@@ -90,46 +86,16 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task WaitForUsbEthernetAsync()
-    {
-        for (var i = 0; i < 60; i++)
-        {
-            var adapter = FindUsbEthernetAdapter();
-            if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
-            {
-                Log($"USB Ethernet adapter is up: {adapter.Name}");
-                return;
-            }
-            await Task.Delay(500);
-        }
-
-        var current = FindUsbEthernetAdapter();
-        throw new InvalidOperationException(
-            current is null
-                ? "Apple CDC-NCM configuration 5 is present, but Windows did not expose a USB Ethernet adapter."
-                : $"USB Ethernet adapter '{current.Name}' exists but is not operational ({current.OperationalStatus}).");
-    }
-
-    private static NetworkInterface? FindUsbEthernetAdapter()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.NetworkInterfaceType == NetworkInterfaceType.Ethernet)
-            .Where(n => n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) ||
-                        n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) ||
-                        n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase) ||
-                        n.Description.Contains("UsbNcm", StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(n => n.OperationalStatus == OperationalStatus.Up)
-            .FirstOrDefault();
-    }
-
     private async void StopButton_Click(object sender, RoutedEventArgs e)
     {
         StopButton.IsEnabled = false;
         try
         {
             _sharing = false;
+            _timer.Stop();
+            Log("Stopping USB network path…");
+            await _engine.StopAsync();
             StartButton.IsEnabled = true;
-            Log("USB network path stopped.");
             await RefreshAsync();
         }
         catch (Exception ex)
