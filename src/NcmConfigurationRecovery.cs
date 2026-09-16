@@ -2,6 +2,8 @@ using Microsoft.Win32;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace iPhoneUsbShare;
 
@@ -10,7 +12,9 @@ internal static class NcmConfigurationRecovery
     private const string VendorProduct = "USB\\VID_05AC&PID_";
     private const uint SafeConfiguration = 2;
     private const uint NcmConfiguration = 5;
-    private const int PnpUtilRebootRequired = 3010;
+    private const uint CM_LOCATE_DEVNODE_NORMAL = 0;
+    private const uint CM_REMOVE_UI_NOT_OK = 0x00000001;
+    private const uint CR_SUCCESS = 0x00000000;
 
     internal static bool ArmDirectNcm(Action<string> log)
     {
@@ -63,9 +67,6 @@ internal static class NcmConfigurationRecovery
                 log("NCM configuration recovery: usbccgp EnumeratorClass set to 02 00 00.");
             }
 
-            // MI_00 is the only child currently left alive. Disable it first so
-            // the composite parent can be removed without the child vetoing the
-            // operation. Then remove the complete usbccgp subtree and rescan.
             foreach (var child in FindAppleChildren())
             {
                 if (!TryGetInterfaceNumber(child, out var mi)) continue;
@@ -79,24 +80,31 @@ internal static class NcmConfigurationRecovery
                 break;
             }
 
-            log("NCM configuration recovery: removing the complete Apple composite device subtree.");
-            var remove = RunPnpUtil($"/remove-device \"{phoneId}\" /subtree");
-            log($"NCM configuration recovery: composite subtree removal exit code={remove.ExitCode}.");
-            if (!string.IsNullOrWhiteSpace(remove.Output)) log($"NCM configuration recovery: subtree removal output: {remove.Output.Trim()}");
-            if (!string.IsNullOrWhiteSpace(remove.Error)) log($"NCM configuration recovery: subtree removal error: {remove.Error.Trim()}");
+            // PnPUtil /remove-device can return 3010 when Windows queues the
+            // removal until reboot. That does not help us here: we need the
+            // usbccgp parent removed and immediately re-enumerated so the new
+            // OriginalConfigurationValue=5 is applied without rebooting Windows.
+            // Use ConfigMgr directly first so removal is attempted synchronously.
+            log("NCM configuration recovery: removing the complete Apple composite device subtree with ConfigMgr.");
+            if (!TryRemoveCompositeSubtree(phoneId, log))
+            {
+                log("NCM configuration recovery: ConfigMgr could not remove the composite subtree; trying PnPUtil as a fallback.");
+                var remove = RunPnpUtil($"/remove-device \"{phoneId}\" /subtree");
+                log($"NCM configuration recovery: fallback subtree removal exit code={remove.ExitCode}.");
+                if (!string.IsNullOrWhiteSpace(remove.Output)) log($"NCM configuration recovery: fallback subtree removal output: {remove.Output.Trim()}");
+                if (!string.IsNullOrWhiteSpace(remove.Error)) log($"NCM configuration recovery: fallback subtree removal error: {remove.Error.Trim()}");
 
-            // pnputil returns 3010 when the removal itself succeeded but Windows
-            // reports that a reboot is required to finish configuration. Treat
-            // this as success: the device subtree has been accepted for removal,
-            // and a scan can now rebuild it using the newly selected config.
-            if (remove.ExitCode == PnpUtilRebootRequired)
-            {
-                log("NCM configuration recovery: composite subtree removal succeeded; Windows reports reboot-required (3010). Continuing with device scan without reboot.");
-            }
-            else if (remove.ExitCode != 0)
-            {
-                log("NCM configuration recovery: Windows refused to remove the composite subtree; leaving the USB stack untouched and reporting failure.");
-                return false;
+                if (remove.ExitCode != 0 && remove.ExitCode != 3010)
+                {
+                    log("NCM configuration recovery: Windows refused to remove the composite subtree; leaving the USB stack untouched and reporting failure.");
+                    return false;
+                }
+
+                if (remove.ExitCode == 3010)
+                {
+                    log("NCM configuration recovery: fallback removal is reboot-pending (3010), so it cannot rebuild usbccgp immediately.");
+                    return false;
+                }
             }
 
             log("NCM configuration recovery: scanning for USB hardware changes.");
@@ -124,6 +132,36 @@ internal static class NcmConfigurationRecovery
             return false;
         }
     }
+
+    private static bool TryRemoveCompositeSubtree(string instanceId, Action<string> log)
+    {
+        var cr = CM_Locate_DevNodeW(out var devInst, instanceId, CM_LOCATE_DEVNODE_NORMAL);
+        log($"NCM configuration recovery: CM_Locate_DevNode result=0x{cr:X8}.");
+        if (cr != CR_SUCCESS) return false;
+
+        var vetoType = 0;
+        var vetoName = new StringBuilder(260);
+        cr = CM_Query_And_Remove_SubTreeW(
+            devInst,
+            out vetoType,
+            vetoName,
+            (uint)vetoName.Capacity,
+            CM_REMOVE_UI_NOT_OK);
+
+        log($"NCM configuration recovery: CM_Query_And_Remove_SubTree result=0x{cr:X8}, vetoType={vetoType}, vetoName={vetoName}.");
+        return cr == CR_SUCCESS;
+    }
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint CM_Query_And_Remove_SubTreeW(
+        uint dnAncestor,
+        out int pVetoType,
+        StringBuilder pszVetoName,
+        uint ulNameLength,
+        uint ulFlags);
 
     private static string? FindCompositeInf()
     {
