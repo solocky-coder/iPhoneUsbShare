@@ -30,6 +30,48 @@ internal static class StartupRecovery
             return;
         }
 
+        // A reboot can leave usbccgp itself stuck in Code 10 while the composite
+        // parent has no child PDOs. In that state CM_Reenumerate_DevNode and
+        // /restart-device only restart the already-broken parent stack and do not
+        // recreate MI_00. Remove only this broken Apple composite instance (and its
+        // nonexistent child subtree), then let PnP scan the still-connected device
+        // and rebuild usbccgp. This is deliberately restricted to Code 10 + zero
+        // children at startup; normal NCM transitions never use subtree removal.
+        var cmError = GetCompositeConfigManagerError(parent);
+        if (cmError == 10)
+        {
+            log("Startup recovery: Apple composite parent is in ConfigMgr Code 10 with no child devnodes; rebuilding the usbccgp device instance once.");
+            var remove = RunPnpUtil($"/remove-device \"{parent}\" /subtree");
+            log($"Startup recovery: pnputil /remove-device /subtree exit code {remove.ExitCode}.");
+            if (!string.IsNullOrWhiteSpace(remove.Output)) log($"Startup recovery: {remove.Output.Trim()}");
+            if (!string.IsNullOrWhiteSpace(remove.Error)) log($"Startup recovery: {remove.Error.Trim()}");
+            await Task.Delay(1200);
+
+            var scanAfterRemove = RunPnpUtil("/scan-devices");
+            log($"Startup recovery: pnputil /scan-devices after Code 10 rebuild exit code {scanAfterRemove.ExitCode}.");
+            if (!string.IsNullOrWhiteSpace(scanAfterRemove.Output)) log($"Startup recovery: {scanAfterRemove.Output.Trim()}");
+            if (!string.IsNullOrWhiteSpace(scanAfterRemove.Error)) log($"Startup recovery: {scanAfterRemove.Error.Trim()}");
+
+            for (var attempt = 1; attempt <= 10; attempt++)
+            {
+                await Task.Delay(1000);
+                parent = FindAppleCompositeParent() ?? parent;
+                if (FindMi00(parent) is not null)
+                {
+                    LogAppleTree(parent, log, "after Code 10 rebuild");
+                    LogCfgMgrChildren(parent, log, "after Code 10 rebuild");
+                    log("Startup recovery: usbccgp Code 10 recovery restored Apple MI_00; WinUSB prerequisite check can continue.");
+                    return;
+                }
+                if (attempt == 1 || attempt == 5 || attempt == 10)
+                    log($"Startup recovery: waiting for MI_00 after Code 10 rebuild ({attempt}/10)…");
+            }
+
+            parent = FindAppleCompositeParent() ?? parent;
+            LogAppleTree(parent, log, "after Code 10 rebuild attempt");
+            LogCfgMgrChildren(parent, log, "after Code 10 rebuild attempt");
+        }
+
         log($"Startup recovery: MI_00 is missing; requesting targeted PnP re-enumeration of {parent}.");
         var reenumerate = ReenumerateDevNode(parent);
         log($"Startup recovery: CM_Reenumerate_DevNode result 0x{reenumerate:X8}.");
@@ -70,6 +112,24 @@ internal static class StartupRecovery
 
         log("Startup recovery: MI_00 remains absent after targeted re-enumeration and one controlled restart; no further automatic device-stack mutations will be attempted.");
         log("Startup recovery: reconnect the Apple device by USB if MI_00 remains absent.");
+    }
+
+    private static int GetCompositeConfigManagerError(string parentId)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "root\\CIMV2",
+                "SELECT PNPDeviceID, ConfigManagerErrorCode FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
+            foreach (ManagementObject device in searcher.Get())
+            {
+                var id = device["PNPDeviceID"]?.ToString();
+                if (!string.Equals(id, parentId, StringComparison.OrdinalIgnoreCase)) continue;
+                return device["ConfigManagerErrorCode"] is null ? 0 : Convert.ToInt32(device["ConfigManagerErrorCode"]);
+            }
+        }
+        catch { }
+        return 0;
     }
 
     private static void LogAppleTree(string parentId, Action<string> log, string phase)
