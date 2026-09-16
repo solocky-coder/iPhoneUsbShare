@@ -67,24 +67,18 @@ internal static class NcmConfigurationRecovery
                 log("NCM configuration recovery: usbccgp EnumeratorClass set to 02 00 00.");
             }
 
-            foreach (var child in FindAppleChildren())
+            // A previous removal attempt was vetoed by MI_01. Disable every
+            // existing composite child first so no child remains active when
+            // ConfigMgr evaluates the parent subtree for synchronous removal.
+            foreach (var child in FindAppleChildren().ToArray())
             {
-                if (!TryGetInterfaceNumber(child, out var mi)) continue;
-                if (mi != 0) continue;
-
-                log($"NCM configuration recovery: disabling existing Apple MI_00 child: {child}");
+                log($"NCM configuration recovery: disabling existing Apple child: {child}");
                 var disableChild = RunPnpUtil($"/disable-device \"{child}\"");
-                log($"NCM configuration recovery: MI_00 disable exit code={disableChild.ExitCode}.");
-                if (!string.IsNullOrWhiteSpace(disableChild.Output)) log($"NCM configuration recovery: MI_00 disable output: {disableChild.Output.Trim()}");
-                if (!string.IsNullOrWhiteSpace(disableChild.Error)) log($"NCM configuration recovery: MI_00 disable error: {disableChild.Error.Trim()}");
-                break;
+                log($"NCM configuration recovery: disable {child} exit code={disableChild.ExitCode}.");
+                if (!string.IsNullOrWhiteSpace(disableChild.Output)) log($"NCM configuration recovery: disable output: {disableChild.Output.Trim()}");
+                if (!string.IsNullOrWhiteSpace(disableChild.Error)) log($"NCM configuration recovery: disable error: {disableChild.Error.Trim()}");
             }
 
-            // PnPUtil /remove-device can return 3010 when Windows queues the
-            // removal until reboot. That does not help us here: we need the
-            // usbccgp parent removed and immediately re-enumerated so the new
-            // OriginalConfigurationValue=5 is applied without rebooting Windows.
-            // Use ConfigMgr directly first so removal is attempted synchronously.
             log("NCM configuration recovery: removing the complete Apple composite device subtree with ConfigMgr.");
             if (!TryRemoveCompositeSubtree(phoneId, log))
             {
@@ -141,13 +135,7 @@ internal static class NcmConfigurationRecovery
 
         var vetoType = 0;
         var vetoName = new StringBuilder(260);
-        cr = CM_Query_And_Remove_SubTreeW(
-            devInst,
-            out vetoType,
-            vetoName,
-            (uint)vetoName.Capacity,
-            CM_REMOVE_UI_NOT_OK);
-
+        cr = CM_Query_And_Remove_SubTreeW(devInst, out vetoType, vetoName, (uint)vetoName.Capacity, CM_REMOVE_UI_NOT_OK);
         log($"NCM configuration recovery: CM_Query_And_Remove_SubTree result=0x{cr:X8}, vetoType={vetoType}, vetoName={vetoName}.");
         return cr == CR_SUCCESS;
     }
@@ -156,12 +144,7 @@ internal static class NcmConfigurationRecovery
     private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
 
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint CM_Query_And_Remove_SubTreeW(
-        uint dnAncestor,
-        out int pVetoType,
-        StringBuilder pszVetoName,
-        uint ulNameLength,
-        uint ulFlags);
+    private static extern uint CM_Query_And_Remove_SubTreeW(uint dnAncestor, out int pVetoType, StringBuilder pszVetoName, uint ulNameLength, uint ulFlags);
 
     private static string? FindCompositeInf()
     {
@@ -177,30 +160,22 @@ internal static class NcmConfigurationRecovery
 
     private static string? FindAppleCompositeId()
     {
-        using var searcher = new ManagementObjectSearcher(
-            "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
+        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
         foreach (ManagementObject o in searcher.Get())
         {
             var id = o["PNPDeviceID"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(id) &&
-                id.Contains(VendorProduct, StringComparison.OrdinalIgnoreCase) &&
-                !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-            {
-                return id;
-            }
+            if (!string.IsNullOrWhiteSpace(id) && id.Contains(VendorProduct, StringComparison.OrdinalIgnoreCase) && !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)) return id;
         }
         return null;
     }
 
     private static IEnumerable<string> FindAppleChildren()
     {
-        using var searcher = new ManagementObjectSearcher(
-            "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
+        using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'USB\\\\VID_05AC&PID_%'");
         foreach (ManagementObject o in searcher.Get())
         {
             var id = o["PNPDeviceID"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(id) && id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
-                yield return id;
+            if (!string.IsNullOrWhiteSpace(id) && id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)) yield return id;
         }
     }
 
@@ -208,14 +183,6 @@ internal static class NcmConfigurationRecovery
     {
         var marker = $"&MI_{interfaceNumber:X2}";
         return FindAppleChildren().Any(id => id.Contains(marker, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool TryGetInterfaceNumber(string instanceId, out int interfaceNumber)
-    {
-        interfaceNumber = -1;
-        var marker = instanceId.LastIndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
-        if (marker < 0 || marker + 5 > instanceId.Length) return false;
-        return int.TryParse(instanceId.AsSpan(marker + 4, 2), System.Globalization.NumberStyles.HexNumber, null, out interfaceNumber);
     }
 
     private static ProcessResult RunPnpUtil(string arguments)
