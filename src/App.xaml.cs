@@ -4,4 +4,49 @@ namespace iPhoneUsbShare;
 
 public partial class App : Application
 {
+    protected override async void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+
+        bool hidden = false;
+        string? stopEventName = null;
+        foreach (var arg in e.Args)
+        {
+            if (arg.Equals("--hidden", StringComparison.OrdinalIgnoreCase))
+                hidden = true;
+            else if (arg.StartsWith("--stop-event=", StringComparison.OrdinalIgnoreCase))
+                stopEventName = arg["--stop-event=".Length..];
+        }
+
+        if (!hidden)
+        {
+            // App.xaml no longer sets StartupUri, so this is now the only
+            // place a normal (non-hidden) launch creates and shows
+            // MainWindow. ShutdownMode stays at its default
+            // (OnLastWindowClose), so behavior here is otherwise identical
+            // to what StartupUri used to do.
+            var window = new MainWindow();
+            MainWindow = window;
+            window.Show();
+            return;
+        }
+
+        if (string.IsNullOrEmpty(stopEventName))
+        {
+            // Hidden mode with no stop event means DYSEKT has no way to ask
+            // us to shut down gracefully. Fail loudly instead of running
+            // orphaned and elevated with nothing to stop it.
+            Shutdown(1);
+            return;
+        }
+
+        // No window ever opens in hidden mode, so nothing triggers the
+        // usual OnLastWindowClose shutdown; HiddenHostService.RunAsync()
+        // returning is what ends the process instead.
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+
+        var service = new HiddenHostService(stopEventName);
+        await service.RunAsync();
+        Shutdown();
+    }
 }
