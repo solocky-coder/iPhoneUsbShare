@@ -8,8 +8,8 @@ namespace iPhoneUsbShare;
 // It does not advertise a router or DNS server and performs no NAT/ICS.
 internal sealed class IsolatedDhcpServer : IDisposable
 {
-    private const string HostAddress = "192.168.99.1";
-    private const string PeerAddress = "192.168.99.2";
+    private readonly string _hostAddress;
+    private readonly string _peerAddress;
     private const int ServerPort = 67;
     private const int ClientPort = 68;
     private const uint LeaseSeconds = 3600;
@@ -18,7 +18,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loop;
 
-    public IsolatedDhcpServer(Action<string> log) => _log = log;
+    public IsolatedDhcpServer(Action<string> log, string hostAddress = "192.168.99.1", string peerAddress = "192.168.99.2") { _log = log; _hostAddress = hostAddress; _peerAddress = peerAddress; }
 
     public void Start()
     {
@@ -32,12 +32,12 @@ internal sealed class IsolatedDhcpServer : IDisposable
         // Bind UDP/67 to all local IPv4 addresses so Windows can deliver that
         // initial broadcast to us. The Windows Firewall rule below restricts
         // inbound UDP/67 to the isolated NCM host address.
-        _socket.Client.Bind(new IPEndPoint(IPAddress.Any, ServerPort));
+        _socket.Client.Bind(new IPEndPoint(IPAddress.Parse(_hostAddress), ServerPort));
         RunFirewall("add");
 
         _cts = new CancellationTokenSource();
         _loop = Task.Run(() => ReceiveLoopAsync(_cts.Token));
-        _log($"Isolated DHCP server listening on {HostAddress}:{ServerPort}; fixed lease {PeerAddress}/24, no gateway, no DNS.");
+        _log($"Isolated DHCP server listening on {_hostAddress}:{ServerPort}; fixed lease {_peerAddress}/24, no gateway, no DNS.");
     }
 
     public void Dispose()
@@ -83,7 +83,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
                 }
                 else if (messageType == 3) // DHCPREQUEST
                 {
-                    if (serverId is not null && !serverId.Equals(IPAddress.Parse(HostAddress))) continue;
+                    if (serverId is not null && !serverId.Equals(IPAddress.Parse(_hostAddress))) continue;
                     await SendReplyAsync(packet, xid, flags, 5, cancellationToken);
                     _log($"DHCP REQUEST received for {requested?.ToString() ?? PeerAddress}; acknowledged fixed peer address {PeerAddress}.");
                 }
@@ -107,7 +107,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
         reply[3] = 0;
         WriteUInt32(reply, 4, xid);
         WriteUInt16(reply, 10, flags);
-        CopyAddress(reply, 16, IPAddress.Parse(PeerAddress)); // yiaddr
+        CopyAddress(reply, 16, IPAddress.Parse(_peerAddress)); // yiaddr
         CopyAddress(reply, 20, IPAddress.Parse(HostAddress)); // siaddr
         Buffer.BlockCopy(request, 28, reply, 28, 16); // chaddr
 
@@ -127,10 +127,10 @@ internal sealed class IsolatedDhcpServer : IDisposable
         // A global limited broadcast can be routed through another active interface
         // (for example Wi-Fi) on Windows. 192.168.99.255 is unambiguously on the
         // NCM interface because Windows has 192.168.99.1/24 there.
-        var destination = new IPEndPoint(IPAddress.Parse("192.168.99.255"), ClientPort);
+        var destination = new IPEndPoint(GetBroadcastAddress(), ClientPort);
 
         await _socket!.SendAsync(reply.AsMemory(0, pos), destination, cancellationToken);
-        _log($"DHCP {(messageType == 2 ? "OFFER" : "ACK")} sent to 192.168.99.255:68 for {PeerAddress}.");
+        _log($"DHCP {(messageType == 2 ? "OFFER" : "ACK")} sent to {GetBroadcastAddress()}:68 for {_peerAddress}.");
     }
 
     private static byte? GetOptionByte(byte[] packet, byte wanted)
@@ -205,8 +205,15 @@ internal sealed class IsolatedDhcpServer : IDisposable
 
     private static void RunFirewall(string action)
     {
-        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("netsh.exe", $"advfirewall firewall {action} rule name=\\\"iPhoneUsbShare Isolated DHCP\\\" dir=in action=allow protocol=UDP localport={ServerPort} localip={HostAddress} profile=any") { UseShellExecute = false, CreateNoWindow = true });
+        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("netsh.exe", $"advfirewall firewall {action} rule name=\\\"iPhoneUsbShare Isolated DHCP {_hostAddress}\\\" dir=in action=allow protocol=UDP localport={ServerPort} localip={_hostAddress} profile=any") { UseShellExecute = false, CreateNoWindow = true });
         p?.WaitForExit(2000);
+    }
+
+    private IPAddress GetBroadcastAddress()
+    {
+        var bytes = IPAddress.Parse(_hostAddress).GetAddressBytes();
+        bytes[3] = 255;
+        return new IPAddress(bytes);
     }
 
     private static void CopyAddress(byte[] data, int offset, IPAddress address)
