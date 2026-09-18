@@ -27,7 +27,8 @@ internal sealed class IsolatedDhcpServer : IDisposable
         _socket = new UdpClient(AddressFamily.InterNetwork);
         _socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _socket.EnableBroadcast = true;
-        _socket.Client.Bind(new IPEndPoint(IPAddress.Parse(HostAddress), ServerPort));\n        RunFirewall("add");
+        _socket.Client.Bind(new IPEndPoint(IPAddress.Parse(HostAddress), ServerPort));
+        RunFirewall("add");
 
         _cts = new CancellationTokenSource();
         _loop = Task.Run(() => ReceiveLoopAsync(_cts.Token));
@@ -37,7 +38,8 @@ internal sealed class IsolatedDhcpServer : IDisposable
     public void Dispose()
     {
         try { _cts?.Cancel(); } catch { }
-        try { _socket?.Close(); } catch { }\n        try { RunFirewall("delete"); } catch { }
+        try { _socket?.Close(); } catch { }
+        try { RunFirewall("delete"); } catch { }
         try { _loop?.Wait(1000); } catch { }
         _loop = null;
         _cts?.Dispose();
@@ -193,6 +195,12 @@ internal sealed class IsolatedDhcpServer : IDisposable
         data[offset + 3] = (byte)value;
     }
 
-    private static void RunFirewall(string action)\n    {\n        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("netsh.exe", $"advfirewall firewall {action} rule name=\\\"iPhoneUsbShare Isolated DHCP\\\" dir=in action=allow protocol=UDP localport={ServerPort} localip={HostAddress} profile=any") { UseShellExecute = false, CreateNoWindow = true });\n        p?.WaitForExit(2000);\n    }\n\n    private static void CopyAddress(byte[] data, int offset, IPAddress address)
+    private static void RunFirewall(string action)
+    {
+        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("netsh.exe", $"advfirewall firewall {action} rule name=\\\"iPhoneUsbShare Isolated DHCP\\\" dir=in action=allow protocol=UDP localport={ServerPort} localip={HostAddress} profile=any") { UseShellExecute = false, CreateNoWindow = true });
+        p?.WaitForExit(2000);
+    }
+
+    private static void CopyAddress(byte[] data, int offset, IPAddress address)
         => Buffer.BlockCopy(address.GetAddressBytes(), 0, data, offset, 4);
 }
