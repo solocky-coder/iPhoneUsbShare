@@ -16,11 +16,12 @@ public sealed class ShareEngine
     private const string Vendor = "05AC";
     private const string SafeIndexValue = "2";
     private const string NcmIndexValue = "4";
-    private const string HostAddress = "192.168.99.1";
-    private const string PeerAddress = "192.168.99.2";
+    private static readonly string[] HostAddresses = { "192.168.99.1", "192.168.100.1", "192.168.101.1", "192.168.102.1" };
+    private static readonly string[] PeerAddresses = { "192.168.99.2", "192.168.100.2", "192.168.101.2", "192.168.102.2" };
     private static readonly object LogFileLock = new();
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
-    private IsolatedDhcpServer? _isolatedDhcp;
+    private readonly Dictionary<string, ActiveSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
+    private sealed record ActiveSession(UsbNative.AppleUsbTarget Target, NetworkInterface Adapter, string HostAddress, string PeerAddress, IsolatedDhcpServer Dhcp);
     private string AppDir => AppContext.BaseDirectory;
     private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
