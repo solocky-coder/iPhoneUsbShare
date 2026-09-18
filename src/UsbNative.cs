@@ -245,13 +245,13 @@ internal static class UsbNative
         catch (Exception ex) { AppendRaw($"WinUSB migration: libusb0 service cleanup failed: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private static ModeDiagnostic GetModeDiagnostic()
+    private static ModeDiagnostic GetModeDiagnostic(AppleUsbTarget? target = null)
     {
         try
         {
-            var path = FindWinUsbDevicePath();
+            var path = target is null ? FindWinUsbDevicePath() : FindWinUsbDevicePathForInstance(target.ControlInterfaceId);
             if (path is null) return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, "WinUSB control interface is not present.");
-            var id = GetDeviceId();
+            var id = target is null ? GetDeviceId() : GetDeviceId(target);
             using var file = OpenDevice(path);
             if (file.IsInvalid) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"CreateFile failed: {Marshal.GetLastWin32Error()}");
             if (!WinUsb_Initialize(file, out var usb)) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"WinUsb_Initialize failed: {Marshal.GetLastWin32Error()}");
@@ -277,9 +277,9 @@ internal static class UsbNative
         catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"WinUSB diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private static bool SetConfiguration(int configuration)
+    private static bool SetConfiguration(int configuration, AppleUsbTarget? target = null)
     {
-        var usb = OpenWinUsb(out var file);
+        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
         if (usb == IntPtr.Zero) return false;
         try
         {
@@ -291,9 +291,9 @@ internal static class UsbNative
         finally { WinUsb_Free(usb); file.Dispose(); }
     }
 
-    private static int[] GetNcmControlInterfaces()
+    private static int[] GetNcmControlInterfaces(AppleUsbTarget? target = null)
     {
-        var usb = OpenWinUsb(out var file);
+        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
         if (usb != IntPtr.Zero)
         {
             try
@@ -350,7 +350,7 @@ internal static class UsbNative
             file.Dispose();
         }
 
-        var parent = FindAppleCompositeId();
+        var parent = target?.ParentId ?? FindAppleCompositeId();
         if (parent is null) return Array.Empty<int>();
         for (var attempt = 0; attempt < 20; attempt++)
         {
@@ -366,9 +366,9 @@ internal static class UsbNative
         return Array.Empty<int>();
     }
 
-    private static int? GetConfiguration()
+    private static int? GetConfiguration(AppleUsbTarget? target = null)
     {
-        var usb = OpenWinUsb(out var file);
+        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
         if (usb == IntPtr.Zero) return null;
         try
         {
@@ -379,9 +379,9 @@ internal static class UsbNative
         finally { WinUsb_Free(usb); file.Dispose(); }
     }
 
-    private static bool SetMode(int mode)
+    private static bool SetMode(int mode, AppleUsbTarget? target = null)
     {
-        var usb = OpenWinUsb(out var file);
+        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
         if (usb == IntPtr.Zero) return false;
         try
         {
@@ -431,6 +431,17 @@ internal static class UsbNative
             else if (type == 0x24) AppendRaw($"USB CONFIG {index + 1} CDC EXTRA: offset={pos}, len={len}, subtype={(len >= 3 ? cfg[pos+2].ToString("X2") : "??")}, raw={Hex(cfg, pos, len)}");
             pos += len;
         }
+    }
+
+    private static IntPtr OpenWinUsb(AppleUsbTarget target, out SafeFileHandle file)
+    {
+        file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+        var path = FindWinUsbDevicePathForInstance(target.ControlInterfaceId);
+        if (path is null) return IntPtr.Zero;
+        file = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+        if (file.IsInvalid) return IntPtr.Zero;
+        return WinUsb_Initialize(file, out var usb) ? usb : IntPtr.Zero;
     }
 
     private static IntPtr OpenWinUsb(out SafeFileHandle file)
