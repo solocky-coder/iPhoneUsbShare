@@ -42,10 +42,25 @@ internal static class UsbNative
     public static AppleUsbTarget[] EnumerateTargets()
     {
         EnsureWinUsbPath();
-        return FindAppleCompositeIds()
-            .Select(parent => new AppleUsbTarget(parent, FindAppleInterfaceId(parent, 0) ?? "", FindWinUsbDevicePathForInstance(FindAppleInterfaceId(parent, 0) ?? "")))
-            .Where(target => !string.IsNullOrWhiteSpace(target.ControlInterfaceId))
-            .ToArray();
+        var result = new List<AppleUsbTarget>();
+        foreach (var parent in FindAppleCompositeIds())
+        {
+            var mi00 = FindAppleInterfaceId(parent, 0);
+            if (string.IsNullOrWhiteSpace(mi00)) continue;
+            var path = FindWinUsbDevicePathForInstance(mi00);
+            if (path is null)
+            {
+                SetWinUsbDeviceParameters(mi00);
+                if (InstallWinUsbDriver(mi00))
+                {
+                    AppendRaw($"WinUSB migration: installed WinUSB on additional Apple device {mi00}; restarting MI_00 once.");
+                    RunAllowRestart("pnputil.exe", $"/restart-device "{mi00}"");
+                }
+                path = FindWinUsbDevicePathForInstance(mi00);
+            }
+            result.Add(new AppleUsbTarget(parent, mi00, path));
+        }
+        return result.ToArray();
     }
 
     public static bool IsReachable(AppleUsbTarget target)
