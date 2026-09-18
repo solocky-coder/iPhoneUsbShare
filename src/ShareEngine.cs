@@ -160,9 +160,9 @@ public sealed class ShareEngine
         return sb.ToString();
     }
 
-    private async Task BindAppleOrInboxNcmDriverAsync()
+    private async Task BindAppleOrInboxNcmDriverAsync(UsbNative.AppleUsbTarget target)
     {
-        var controlInterfaces = await UsbNative.GetNcmControlInterfacesAsync();
+        var controlInterfaces = await UsbNative.GetNcmControlInterfacesAsync(target);
         if (controlInterfaces.Length == 0)
         {
             WriteLog("USB descriptors expose no CDC-NCM control interface after mode 5.");
@@ -171,7 +171,7 @@ public sealed class ShareEngine
         }
         foreach (var n in controlInterfaces) WriteLog($"USB descriptor NCM control interface: {n}");
 
-        var appleChildren = FindPnP("USB\\VID_05AC&PID_", null).ToList();
+        var appleChildren = FindPnP("USB\\VID_05AC&PID_", null).Where(d => IsChildOfAppleParent(d.Id, target.ParentId)).ToList();
         var targets = controlInterfaces.Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n)).Where(d => d is not null).Cast<PnpDevice>().ToList();
         if (targets.Count == 0)
         {
@@ -217,7 +217,7 @@ public sealed class ShareEngine
                 if (!changed) continue;
                 await Task.Delay(2000);
                 LogPnpDriverState(target.Id, "after AppleNcm driver install settled");
-                var adapter = FindPhoneAdapter();
+                var adapter = FindPhoneAdapter(target.ParentId);
                 if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteStaticLog($"AppleNcm produced a usable adapter: {adapter.Name}"); return; }
             }
             WriteLog("Bundled AppleNcm was present but did not produce an active adapter; continuing with inbox UsbNcm diagnostics.");
@@ -532,16 +532,16 @@ public sealed class ShareEngine
         var output = p.StandardOutput.ReadToEnd(); var error = p.StandardError.ReadToEnd(); p.WaitForExit(); return new CommandResult(p.ExitCode, output, error);
     }
 
-    private static async Task ConfigureStaticNetworkAsync(string adapterName)
+    private static async Task ConfigureStaticNetworkAsync(string adapterName, string hostAddress)
     {
-        foreach (var existing in FindAddresses(adapterName).Where(a => !a.Equals(HostAddress, StringComparison.OrdinalIgnoreCase)).Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var existing in FindAddresses(adapterName).Where(a => !a.Equals(hostAddress, StringComparison.OrdinalIgnoreCase)).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             var remove = RunAllowRestart("netsh.exe", $"interface ipv4 delete address name=\\\"{adapterName}\\\" addr={existing}");
             if (remove.ExitCode != 0)
                 WriteStaticLog($"Removed stale IPv4 address {existing} returned {remove.ExitCode}: {remove.Error}");
         }
 
-        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\\\"{adapterName}\\\" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
+        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\\\"{adapterName}\\\" source=static address={hostAddress} mask=255.255.255.0 gateway=none");
         if (address.ExitCode != 0)
             throw new InvalidOperationException($"netsh IPv4 address configuration failed ({address.ExitCode}): {address.Error}");
 
@@ -581,22 +581,34 @@ public sealed class ShareEngine
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private static NetworkInterface? FindPhoneAdapter()
+    private static NetworkInterface? FindPhoneAdapter(string? parentId = null)
     {
-        var nics = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211)
-            .ToList();
-
-        var strong = nics.Where(n =>
-            n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) ||
-            n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)).ToList();
-
+        var nics = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211).ToList();
+        var strong = nics.Where(n => n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (!string.IsNullOrWhiteSpace(parentId))
+        {
+            try
+            {
+                using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, NetConnectionID FROM Win32_NetworkAdapter");
+                foreach (ManagementObject o in searcher.Get())
+                {
+                    var pnp = o["PNPDeviceID"]?.ToString() ?? "";
+                    var name = o["NetConnectionID"]?.ToString() ?? "";
+                    if (string.IsNullOrWhiteSpace(pnp) || string.IsNullOrWhiteSpace(name) || !IsChildOfAppleParent(pnp, parentId)) continue;
+                    var match = nics.FirstOrDefault(n => n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null) return match;
+                }
+            } catch { }
+        }
         if (strong.Count == 1) return strong[0];
-        if (strong.Count > 1)
-            return strong.FirstOrDefault(n => HasAddress(n.Name, HostAddress)) ?? strong[0];
+        return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
+    }
 
-        var ethernet = nics.Where(n => n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase)).ToList();
-        return ethernet.Count == 1 ? ethernet[0] : null;
+    private static bool IsChildOfAppleParent(string childId, string parentId)
+    {
+        var childToken = childId.LastIndexOf('\\') >= 0 ? childId[(childId.LastIndexOf('\\') + 1)..] : childId;
+        var parentToken = parentId.LastIndexOf('\\') >= 0 ? parentId[(parentId.LastIndexOf('\\') + 1)..] : parentId;
+        return childToken.StartsWith(parentToken + "&", StringComparison.OrdinalIgnoreCase) || childToken.Equals(parentToken, StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
@@ -612,6 +624,7 @@ public sealed class ShareEngine
     }
 
     private static PnpDevice? FindAppleDevice() => FindPnP("USB\\VID_05AC&PID_", null).Where(d => !d.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
+    private static PnpDevice? FindAppleDevice(string parentId) => FindPnP("USB\\VID_05AC&PID_", null).FirstOrDefault(d => d.Id.Equals(parentId, StringComparison.OrdinalIgnoreCase));
 
     private static string GetApplePid(string id)
     {
