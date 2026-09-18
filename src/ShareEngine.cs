@@ -183,15 +183,15 @@ public sealed class ShareEngine
             if (ReenumerateAppleCompositeDevNode(out var reenumError))
             {
                 await Task.Delay(1500);
-                appleChildren = FindPnP("USB\\VID_05AC&PID_", null).ToList();
+                appleChildren = FindPnP("USB\\VID_05AC&PID_", null).Where(d => IsChildOfAppleParent(d.Id, target.ParentId)).ToList();
                 targets = controlInterfaces.Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n)).Where(d => d is not null).Cast<PnpDevice>().ToList();
                 WriteLog($"usbccgp targeted re-enumeration completed; NCM child targets now: {targets.Count}.");
             }
             else WriteLog($"usbccgp targeted re-enumeration failed, ConfigMgr error={reenumError}.");
         }
-        foreach (var target in targets)
+        foreach (var ncmTarget in targets)
         {
-            LogPnpDriverState(target.Id, "NCM candidate");
+            LogPnpDriverState(ncmTarget.Id, "NCM candidate");
             LogPnpIds(target.Id);
             LogPnpUtilDrivers(target.Id);
         }
@@ -213,7 +213,7 @@ public sealed class ShareEngine
             if (!string.IsNullOrWhiteSpace(addApple.Error)) WriteLog($"AppleNcm package error: {addApple.Error.Trim()}");
             foreach (var target in targets)
             {
-                WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {target.Id} | {target.Name}");
+                WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {target.Id} | {ncmTarget.Name}");
                 var changed = InstallSelectedDriverByDescription(target.Id, appleInf, "Apple iPhone NCM Host Device", out var setupError);
                 WriteLog($"AppleNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
                 LogPnpDriverState(target.Id, "after AppleNcm selection");
@@ -249,7 +249,7 @@ public sealed class ShareEngine
             if (!changed) continue;
             await Task.Delay(2000);
             LogPnpDriverState(target.Id, "after NCM driver install settled");
-            var adapter = FindPhoneAdapter();
+            var adapter = FindPhoneAdapter(target.ParentId);
             if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}"); return; }
             WriteLog("Selected NCM function did not produce an active network adapter; trying the next descriptor-identified NCM function.");
         }
