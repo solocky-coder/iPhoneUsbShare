@@ -118,23 +118,20 @@ public sealed class ShareEngine
         await _startStopLock.WaitAsync();
         try
         {
-            try
+            foreach (var session in _sessions.Values.ToArray())
             {
-                _isolatedDhcp?.Dispose();
-                _isolatedDhcp = null;
-                var phone = FindAppleDevice();
-                if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0");
-                WriteLog("Sharing stopped; Apple USB configuration restored. No ICS/DHCP state is modified.");
+                try { session.Dhcp.Dispose(); } catch { }
+                try { var phone = FindAppleDevice(session.Target.ParentId); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch (Exception ex) { WriteLog($"Stop cleanup {session.Target.ParentId}: {ex.Message}"); }
             }
-            catch (Exception ex) { WriteLog($"Stop cleanup: {ex.Message}"); }
+            _sessions.Clear();
+            WriteLog("Sharing stopped; Apple USB configurations restored. No ICS/NAT/gateway/DNS state is modified.");
         }
         finally { _startStopLock.Release(); }
     }
 
     private static async Task WaitForAppleUsbReadyAsync()
     {
-        await WaitUntil(() => FindAppleDevice() is not null, 10, "Apple USB device");
-        await WaitUntil(() => UsbNative.IsReachable(), 15, "Apple WinUSB control interface");
+        await WaitUntil(() => UsbNative.EnumerateTargets().Length > 0, 15, "Apple USB devices");
     }
 
     public async Task<Status> GetStatusAsync()
