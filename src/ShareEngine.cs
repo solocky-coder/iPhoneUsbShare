@@ -183,10 +183,9 @@ public sealed class ShareEngine
     {
         var p = FindAppleDevice();
         var a = FindPhoneAdapter();
-        var lease = a is null ? null : FindLease(a.Name);
-        var sharing = a is not null && IsIcsEnabled(a.Name);
+        var sharing = a is not null && HasAddress(a.Name, HostAddress);
         var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
-        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, lease, rx, tx));
+        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, a is null ? null : FindAddress(a.Name), rx, tx));
     }
 
     public async Task<string> DiagnosticsAsync()
