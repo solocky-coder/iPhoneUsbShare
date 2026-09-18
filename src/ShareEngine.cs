@@ -198,8 +198,9 @@ public sealed class ShareEngine
         sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}");
         sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
         sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]");
-        sb.AppendLine($"Lease: {(a is null ? "—" : FindLease(a.Name) ?? "none")}");
-        sb.AppendLine($"Wi-Fi: {FindWifi()?.Name ?? "none"}");
+        sb.AppendLine($"Windows USB address: {(a is null ? "—" : FindAddress(a.Name) ?? "none")}");
+        sb.AppendLine($"iPhone peer {PeerAddress}: {(await PingPeerAsync(PeerAddress, 3000) ? "reachable" : "not reachable")}");
+        sb.AppendLine("Network mode: isolated static IPv4; no ICS/DHCP/gateway/DNS");
         WriteLog("Diagnostics result: " + sb.ToString().Replace(Environment.NewLine, " | ").Trim());
         return sb.ToString();
     }
@@ -597,18 +598,11 @@ public sealed class ShareEngine
         return false;
     }
 
-    private static string? FindLease(string adapterName)
-    {
-        try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); if (nic is null) return null; foreach (var ua in nic.GetIPProperties().UnicastAddresses) if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && ua.Address.ToString().StartsWith(Subnet, StringComparison.Ordinal)) return ua.Address.ToString(); } catch { }
-        return null;
-    }
-
     private static (double Rx, double Tx) GetRates(string adapterName)
     {
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private static NetworkInterface? FindWifi() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && n.OperationalStatus == OperationalStatus.Up);
     private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.OperationalStatus == OperationalStatus.Up && (n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)) && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211);
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
