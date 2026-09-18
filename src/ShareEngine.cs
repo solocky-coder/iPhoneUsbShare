@@ -542,9 +542,11 @@ public sealed class ShareEngine
 
     private static void DisablePhotoInterfaces()
     {
+        // MI_00 is the Apple USB control interface used by WinUSB/GetMode.
+        // Never disable it even if Windows currently classifies it as WPD.
         foreach (var d in FindPnP("VID_05AC&PID_", "WPD"))
         {
-            if (!d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase)) continue;
+            if (d.Id.Contains("&MI_00\\", StringComparison.OrdinalIgnoreCase)) continue;
             var r = RunAllowRestart("pnputil.exe", $"/disable-device \"{d.Id}\"");
             if (r.ExitCode != 0 && r.ExitCode != 3010) throw new InvalidOperationException($"PNPUTIL.exe failed ({r.ExitCode}): {r.Error}");
         }
