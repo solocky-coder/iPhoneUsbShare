@@ -27,7 +27,12 @@ internal sealed class IsolatedDhcpServer : IDisposable
         _socket = new UdpClient(AddressFamily.InterNetwork);
         _socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _socket.EnableBroadcast = true;
-        _socket.Client.Bind(new IPEndPoint(IPAddress.Parse(HostAddress), ServerPort));
+
+        // DHCPDISCOVER is normally sent from 0.0.0.0:68 to 255.255.255.255:67.
+        // Bind UDP/67 to all local IPv4 addresses so Windows can deliver that
+        // initial broadcast to us. The Windows Firewall rule below restricts
+        // inbound UDP/67 to the isolated NCM host address.
+        _socket.Client.Bind(new IPEndPoint(IPAddress.Any, ServerPort));
         RunFirewall("add");
 
         _cts = new CancellationTokenSource();
