@@ -221,17 +221,17 @@ public sealed class ShareEngine
             WriteLog($"AppleNcm package registration exit code: {addApple.ExitCode}");
             if (!string.IsNullOrWhiteSpace(addApple.Output)) WriteLog($"AppleNcm package output: {addApple.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(addApple.Error)) WriteLog($"AppleNcm package error: {addApple.Error.Trim()}");
-            foreach (var ncmTarget in targets)
+            foreach (var ncmTarget in targets))
             {
                 WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {ncmTarget.Id} | {ncmTarget.Name}");
-                var changed = InstallSelectedDriverByDescription(target.Id, appleInf, "Apple iPhone NCM Host Device", out var setupError);
-                WriteLog($"AppleNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
-                LogPnpDriverState(target.Id, "after AppleNcm selection");
-                LogPnpUtilDrivers(target.Id);
+                var changed = InstallSelectedDriverByDescription(ncmTarget.Id, appleInf, "Apple iPhone NCM Host Device", out var setupError);
+                WriteLog($"AppleNcm SetupAPI driver selection {ncmTarget.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
+                LogPnpDriverState(ncmTarget.Id, "after AppleNcm selection");
+                LogPnpUtilDrivers(ncmTarget.Id);
                 if (!changed) continue;
                 await Task.Delay(2000);
-                LogPnpDriverState(target.Id, "after AppleNcm driver install settled");
-                var adapter = FindPhoneAdapter(target.ParentId);
+                LogPnpDriverState(ncmTarget.Id, "after AppleNcm driver install settled");
+                var adapter = FindPhoneAdapter(ncmTarget.ParentId);
                 if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteStaticLog($"AppleNcm produced a usable adapter: {adapter.Name}"); return; }
             }
             WriteLog("Bundled AppleNcm was present but did not produce an active adapter; continuing with inbox UsbNcm diagnostics.");
@@ -250,16 +250,16 @@ public sealed class ShareEngine
         WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteStaticLog($"UsbNcm package error: {add.Error.Trim()}");
-        foreach (var target in targets)
+        foreach (var ncmTarget in targets)
         {
-            WriteLog($"Selecting Microsoft UsbNcm for Apple NCM interface: {target.Id} | {ncmTarget.Name}");
-            var changed = InstallSelectedNcmDriver(target.Id, inf, out var setupError);
-            WriteLog($"UsbNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
-            LogPnpDriverState(target.Id, "after UsbNcm selection");
+            WriteLog($"Selecting Microsoft UsbNcm for Apple NCM interface: {ncmTarget.Id} | {ncmTarget.Name}");
+            var changed = InstallSelectedNcmDriver(ncmTarget.Id, inf, out var setupError);
+            WriteLog($"UsbNcm SetupAPI driver selection {ncmTarget.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
+            LogPnpDriverState(ncmTarget.Id, "after UsbNcm selection");
             if (!changed) continue;
             await Task.Delay(2000);
-            LogPnpDriverState(target.Id, "after NCM driver install settled");
-            var adapter = FindPhoneAdapter(target.ParentId);
+            LogPnpDriverState(ncmTarget.Id, "after NCM driver install settled");
+            var adapter = FindPhoneAdapter(ncmTarget.ParentId);
             if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}"); return; }
             WriteLog("Selected NCM function did not produce an active network adapter; trying the next descriptor-identified NCM function.");
         }
