@@ -203,7 +203,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
         data[offset + 3] = (byte)value;
     }
 
-    private static void RunFirewall(string action)
+    private void RunFirewall(string action)
     {
         using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("netsh.exe", $"advfirewall firewall {action} rule name=\\\"iPhoneUsbShare Isolated DHCP {_hostAddress}\\\" dir=in action=allow protocol=UDP localport={ServerPort} localip={_hostAddress} profile=any") { UseShellExecute = false, CreateNoWindow = true });
         p?.WaitForExit(2000);
