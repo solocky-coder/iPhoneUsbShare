@@ -221,7 +221,7 @@ public sealed class ShareEngine
             WriteLog($"AppleNcm package registration exit code: {addApple.ExitCode}");
             if (!string.IsNullOrWhiteSpace(addApple.Output)) WriteLog($"AppleNcm package output: {addApple.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(addApple.Error)) WriteLog($"AppleNcm package error: {addApple.Error.Trim()}");
-            foreach (var ncmTarget in targets))
+            foreach (var ncmTarget in targets)
             {
                 WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {ncmTarget.Id} | {ncmTarget.Name}");
                 var changed = InstallSelectedDriverByDescription(ncmTarget.Id, appleInf, "Apple iPhone NCM Host Device", out var setupError);
