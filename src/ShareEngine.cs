@@ -16,7 +16,8 @@ public sealed class ShareEngine
     private const string Vendor = "05AC";
     private const string SafeIndexValue = "2";
     private const string NcmIndexValue = "4";
-    private const string Subnet = "192.168.137.";
+    private const string HostAddress = "192.168.99.1";
+    private const string PeerAddress = "192.168.99.2";
     private static readonly object LogFileLock = new();
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
     private string AppDir => AppContext.BaseDirectory;
@@ -72,8 +73,7 @@ public sealed class ShareEngine
         var phone = FindAppleDevice() ?? throw new InvalidOperationException("iPhone/iPad not found.");
         WriteLog($"Apple device found: {phone.Id} ({phone.Name})");
         DisablePhotoInterfaces();
-        var wifi = FindWifi() ?? throw new InvalidOperationException("No connected Wi-Fi adapter found.");
-        WriteLog($"Internet source: {wifi.Name}");
+
         var adapter = FindPhoneAdapter();
         if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
         {
@@ -96,7 +96,7 @@ public sealed class ShareEngine
                 if (mode is not null) break;
                 await Task.Delay(1000);
             }
-            if (mode is null) throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The WinUSB control interface did not reappear; unplug/replug the iPad and try again.");
+            if (mode is null) throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The WinUSB control interface did not reappear; unplug/replug the iPhone/iPad and try again.");
             WriteLog($"Apple USB mode: {mode}");
 
             if (mode == "5:3:3:0" || mode == "5:3:3")
@@ -120,43 +120,17 @@ public sealed class ShareEngine
             }
 
             await BindAppleOrInboxNcmDriverAsync();
-            try
-            {
-                await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 15, "USB Ethernet adapter");
-            }
-            catch
-            {
-                WriteLog("USB Ethernet did not remain available on the first pass; restoring safe configuration and retrying the mode switch once.");
-                var current = FindAppleDevice();
-                if (current is null) throw;
-                SetConfig(current.Id, SafeIndexValue, "0");
-                RestartDevice(current.Id);
-                await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device after NCM retry reset");
-                DisablePhotoInterfaces();
-                var retryMode = await UsbNative.GetModeAsync();
-                WriteLog($"Retry GET_MODE: {retryMode ?? "unreachable"}");
-                ConfigureUsbCgpEnumerator(current.Id);
-                if (retryMode == "5:3:3:0" || retryMode == "5:3:3")
-                {
-                    WriteLog("Retry device is already in CDC-NCM direct mode (5); binding NCM without another SET_MODE.");
-                }
-                else
-                {
-                    if (retryMode != "3:3:3:0" && retryMode != "3:3:3") throw new InvalidOperationException("Apple USB device did not return to a usable safe/NCM transition mode for the retry.");
-                    SetConfig(current.Id, NcmIndexValue, SafeIndexValue);
-                    if (!await UsbNative.SetModeAsync(3)) throw new InvalidOperationException("Apple device rejected the CDC-NCM retry mode switch.");
-                }
-                await BindAppleOrInboxNcmDriverAsync();
-                await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter after retry");
-            }
+            await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
             adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             WriteLog($"USB Ethernet adapter is up: {adapter.Name}");
             DisablePhotoInterfaces();
         }
-        await ConfigureIcsAsync(wifi.Name, adapter.Name);
-        WriteLog("Waiting for DHCP lease…");
-        await WaitUntil(() => FindLease(adapter.Name) is not null, 30, "phone DHCP lease");
-        WriteLog($"DHCP lease acquired: {FindLease(adapter.Name) ?? "none"}");
+
+        await ConfigureStaticNetworkAsync(adapter.Name);
+        await WaitUntil(() => HasAddress(adapter.Name, HostAddress), 15, "static USB IPv4 address");
+        WriteLog($"Isolated USB network ready: Windows={HostAddress}, iPhone={PeerAddress}, mask=255.255.255.0, no gateway, no DNS, no ICS/DHCP.");
+        if (!await PingPeerAsync(PeerAddress, 3000))
+            WriteLog($"iPhone peer {PeerAddress} did not answer ICMP; continuing because UDP does not require ICMP.");
     }
 
     public async Task StopAsync()
@@ -164,13 +138,15 @@ public sealed class ShareEngine
         await _startStopLock.WaitAsync();
         try
         {
-            try { if (FindPhoneAdapter() is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); WriteLog("Sharing stopped and Apple USB configuration restored."); }
+            try
+            {
+                var phone = FindAppleDevice();
+                if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0");
+                WriteLog("Sharing stopped; Apple USB configuration restored. No ICS/DHCP state is modified.");
+            }
             catch (Exception ex) { WriteLog($"Stop cleanup: {ex.Message}"); }
         }
-        finally
-        {
-            _startStopLock.Release();
-        }
+        finally { _startStopLock.Release(); }
     }
 
     private static async Task WaitForAppleUsbReadyAsync()
@@ -577,25 +553,41 @@ public sealed class ShareEngine
         var output = p.StandardOutput.ReadToEnd(); var error = p.StandardError.ReadToEnd(); p.WaitForExit(); return new CommandResult(p.ExitCode, output, error);
     }
 
-    private async Task ConfigureIcsAsync(string wifi, string phoneAdapter)
+    private static async Task ConfigureStaticNetworkAsync(string adapterName)
     {
-        WriteLog($"Configuring Internet Connection Sharing: {wifi} -> {phoneAdapter}"); DisableAllIcs();
-        var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare") ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
-        dynamic mgr = Activator.CreateInstance(mgrType)!; dynamic? wifiCfg = null, phoneCfg = null;
-        foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name == wifi) wifiCfg = mgr.INetSharingConfigurationForINetConnection(c); if ((string)props.Name == phoneAdapter) phoneCfg = mgr.INetSharingConfigurationForINetConnection(c); }
-        if (wifiCfg is null || phoneCfg is null) throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
-        wifiCfg.EnableSharing(0); phoneCfg.EnableSharing(1); await Task.Delay(3000); WriteLog("Internet Connection Sharing enabled.");
+        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name="{adapterName}" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
+        if (address.ExitCode != 0)
+            throw new InvalidOperationException($"netsh IPv4 address configuration failed ({address.ExitCode}): {address.Error}");
+
+        var dns = RunAllowRestart("netsh.exe", $"interface ipv4 set dnsservers name="{adapterName}" source=static address=none");
+        if (dns.ExitCode != 0)
+            WriteStaticLog($"netsh DNS cleanup returned {dns.ExitCode}: {dns.Error}");
     }
 
-    private static void DisableAllIcs()
+    private static bool HasAddress(string adapterName, string address) =>
+        FindAddresses(adapterName).Any(a => a.Equals(address, StringComparison.OrdinalIgnoreCase));
+
+    private static string? FindAddress(string adapterName) =>
+        FindAddresses(adapterName).FirstOrDefault();
+
+    private static IEnumerable<string> FindAddresses(string adapterName)
     {
-        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); if ((bool)cfg.SharingEnabled) cfg.DisableSharing(); } } catch { }
+        var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName);
+        if (nic is null) yield break;
+        foreach (var u in nic.GetIPProperties().UnicastAddresses)
+            if (u.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                yield return u.Address.ToString();
     }
 
-    private static bool IsIcsEnabled(string name)
+    private static async Task<bool> PingPeerAsync(string address, int timeoutMs)
     {
-        try { var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare"); if (mgrType is null) return false; dynamic mgr = Activator.CreateInstance(mgrType)!; foreach (var c in mgr.EnumEveryConnection()) { dynamic props = mgr.NetConnectionProps(c); if ((string)props.Name != name) continue; dynamic cfg = mgr.INetSharingConfigurationForINetConnection(c); return (bool)cfg.SharingEnabled; } } catch { }
-        return false;
+        try
+        {
+            using var ping = new Ping();
+            var reply = await ping.SendPingAsync(address, timeoutMs);
+            return reply.Status == IPStatus.Success;
+        }
+        catch { return false; }
     }
 
     private static (double Rx, double Tx) GetRates(string adapterName)
@@ -603,7 +595,23 @@ public sealed class ShareEngine
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private static NetworkInterface? FindPhoneAdapter() => NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.OperationalStatus == OperationalStatus.Up && (n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)) && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211);
+    private static NetworkInterface? FindPhoneAdapter()
+    {
+        var nics = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211)
+            .ToList();
+
+        var strong = nics.Where(n =>
+            n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) ||
+            n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        if (strong.Count == 1) return strong[0];
+        if (strong.Count > 1)
+            return strong.FirstOrDefault(n => HasAddress(n.Name, HostAddress)) ?? strong[0];
+
+        var ethernet = nics.Where(n => n.Name.Contains("Ethernet", StringComparison.OrdinalIgnoreCase)).ToList();
+        return ethernet.Count == 1 ? ethernet[0] : null;
+    }
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
     {
