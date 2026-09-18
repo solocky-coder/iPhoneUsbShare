@@ -123,11 +123,14 @@ internal sealed class IsolatedDhcpServer : IDisposable
         pos = AddOptionUInt32(reply, pos, 51, LeaseSeconds);
         reply[pos++] = 255;
 
-        var destination = (flags & 0x8000) != 0
-            ? new IPEndPoint(IPAddress.Broadcast, ClientPort)
-            : new IPEndPoint(IPAddress.Broadcast, ClientPort);
+        // Use the isolated subnet broadcast rather than 255.255.255.255.
+        // A global limited broadcast can be routed through another active interface
+        // (for example Wi-Fi) on Windows. 192.168.99.255 is unambiguously on the
+        // NCM interface because Windows has 192.168.99.1/24 there.
+        var destination = new IPEndPoint(IPAddress.Parse("192.168.99.255"), ClientPort);
 
         await _socket!.SendAsync(reply.AsMemory(0, pos), destination, cancellationToken);
+        _log($"DHCP {(messageType == 2 ? "OFFER" : "ACK")} sent to 192.168.99.255:68 for {PeerAddress}.");
     }
 
     private static byte? GetOptionByte(byte[] packet, byte wanted)
