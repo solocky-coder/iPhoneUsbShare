@@ -34,6 +34,32 @@ internal static class UsbNative
     private static bool migrationAttempted;
 
     internal sealed record ModeDiagnostic(int BusCount, int DeviceCount, bool DeviceEnumerated, string? DeviceId, bool OpenSucceeded, int ControlReturn, int ExpectedBytes, string? Mode, string Error);
+    internal sealed record AppleUsbTarget(string ParentId, string ControlInterfaceId, string? WinUsbPath)
+    {
+        public string DeviceKey => ParentId;
+    }
+
+    public static AppleUsbTarget[] EnumerateTargets()
+    {
+        EnsureWinUsbPath();
+        return FindAppleCompositeIds()
+            .Select(parent => new AppleUsbTarget(parent, FindAppleInterfaceId(parent, 0) ?? "", FindWinUsbDevicePathForInstance(FindAppleInterfaceId(parent, 0) ?? "")))
+            .Where(target => !string.IsNullOrWhiteSpace(target.ControlInterfaceId))
+            .ToArray();
+    }
+
+    public static bool IsReachable(AppleUsbTarget target)
+    {
+        try { return FindWinUsbDevicePathForInstance(target.ControlInterfaceId) is not null; }
+        catch (Exception ex) { AppendRaw($"WINUSB reachability check failed for {target.ParentId}: {ex.GetType().Name}: {ex.Message}"); return false; }
+    }
+
+    public static Task<string?> GetModeAsync(AppleUsbTarget target) => Task.Run(() => GetModeDiagnostic(target).Mode);
+    public static Task<bool> SetModeAsync(AppleUsbTarget target, int mode) => Task.Run(() => SetMode(target, mode));
+    public static Task<bool> SetConfigurationAsync(AppleUsbTarget target, int configuration) => Task.Run(() => SetConfiguration(target, configuration));
+    public static Task<int?> GetConfigurationAsync(AppleUsbTarget target) => Task.Run(() => GetConfiguration(target));
+    public static Task<int[]> GetNcmControlInterfacesAsync(AppleUsbTarget target) => Task.Run(() => GetNcmControlInterfaces(target));
+    public static string? GetDeviceId(AppleUsbTarget target) => GetDeviceIdFromParent(target.ParentId);
 
     public static bool IsReachable()
     {
@@ -420,6 +446,54 @@ internal static class UsbNative
 
     private static SafeFileHandle OpenDevice(string path) => CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, IntPtr.Zero);
 
+    private static string? FindWinUsbDevicePathForInstance(string instanceId)
+    {
+        if (string.IsNullOrWhiteSpace(instanceId)) return null;
+        var guid = InterfaceGuid;
+        var h = SetupDiGetClassDevs(ref guid, null, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (h == INVALID_HANDLE_VALUE) return null;
+        try
+        {
+            for (uint i = 0; ; i++)
+            {
+                var data = new SP_DEVICE_INTERFACE_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVICE_INTERFACE_DATA>() };
+                if (!SetupDiEnumDeviceInterfaces(h, IntPtr.Zero, ref guid, i, ref data))
+                {
+                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
+                    continue;
+                }
+
+                SetupDiGetDeviceInterfaceDetail(h, ref data, IntPtr.Zero, 0, out var required, IntPtr.Zero);
+                if (required == 0) continue;
+
+                var buffer = Marshal.AllocHGlobal((int)required);
+                var devInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<SP_DEVINFO_DATA>());
+                try
+                {
+                    Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 5);
+                    var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+                    Marshal.StructureToPtr(devInfo, devInfoPtr, false);
+                    if (!SetupDiGetDeviceInterfaceDetail(h, ref data, buffer, required, out _, devInfoPtr))
+                        continue;
+
+                    devInfo = Marshal.PtrToStructure<SP_DEVINFO_DATA>(devInfoPtr);
+                    var discoveredId = GetDeviceInstanceId(h, ref devInfo);
+                    if (!discoveredId.Equals(instanceId, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    return Marshal.PtrToStringUni(buffer + 4);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(devInfoPtr);
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+            return null;
+        }
+        finally { SetupDiDestroyDeviceInfoList(h); }
+    }
+
     private static string? FindWinUsbDevicePath()
     {
         var guid = InterfaceGuid;
@@ -453,17 +527,26 @@ internal static class UsbNative
 
     private static string? FindAppleCompositeId()
     {
+        return FindAppleCompositeIds().FirstOrDefault();
+    }
+
+    private static string[] FindAppleCompositeIds()
+    {
         try
         {
+            var result = new List<string>();
             using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID FROM Win32_PnPEntity");
             foreach (ManagementObject o in searcher.Get())
             {
                 var id = o["PNPDeviceID"]?.ToString();
-                if (!string.IsNullOrWhiteSpace(id) && id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) && !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)) return id;
+                if (!string.IsNullOrWhiteSpace(id) &&
+                    id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) &&
+                    !id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
+                    result.Add(id);
             }
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         }
-        catch { }
-        return null;
+        catch { return Array.Empty<string>(); }
     }
 
     private static string? FindAppleInterfaceId(string parentId, int interfaceNumber)
@@ -480,9 +563,10 @@ internal static class UsbNative
                 // Match the real child PDO identity instead of assuming that the
                 // parent instance string is a literal prefix of the child ID.
                 if (id.StartsWith("USB\\VID_05AC&PID_", StringComparison.OrdinalIgnoreCase) &&
-                    id.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                    id.Contains(marker, StringComparison.OrdinalIgnoreCase) &&
+                    IsChildOfAppleParent(id, parentId))
                 {
-                    AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2}: {id}");
+                    AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2} for {parentId}: {id}");
                     return id;
                 }
             }
@@ -492,6 +576,28 @@ internal static class UsbNative
             AppendRaw($"Apple USB child discovery: WMI lookup for MI_{interfaceNumber:X2} failed: {ex.GetType().Name}: {ex.Message}");
         }
         return null;
+    }
+
+    private static bool IsChildOfAppleParent(string childId, string parentId)
+    {
+        var childToken = childId.LastIndexOf('\\') >= 0 ? childId[(childId.LastIndexOf('\\') + 1)..] : childId;
+        var parentToken = parentId.LastIndexOf('\\') >= 0 ? parentId[(parentId.LastIndexOf('\\') + 1)..] : parentId;
+        return childToken.StartsWith(parentToken + "&", StringComparison.OrdinalIgnoreCase)
+            || childToken.Equals(parentToken, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? GetDeviceIdFromParent(string p)
+    {
+        try
+        {
+            var marker = "PID_";
+            var i = p.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (i < 0) return null;
+            i += marker.Length;
+            var end = p.IndexOf('&', i);
+            return $"05AC:{(end < 0 ? p[i..] : p[i..end])}";
+        }
+        catch { return null; }
     }
 
     private static CommandResult RunAllowRestart(string file, string args)
