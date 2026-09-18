@@ -71,10 +71,20 @@ public sealed class ShareEngine
         {
             var target = targets[index];
             if (_sessions.ContainsKey(target.DeviceKey)) continue;
-            try { await StartCoreAsync(target, index); }
+            var slot = FindFreeSlot();
+            if (slot < 0) break;
+            try { await StartCoreAsync(target, slot); }
             catch (Exception ex) { WriteLog($"Apple USB session {target.ParentId} failed: {ex.Message}"); }
         }
         if (_sessions.Count == 0) throw new InvalidOperationException("No Apple USB networking session could be started.");
+    }
+
+    private int FindFreeSlot()
+    {
+        for (var i = 0; i < HostAddresses.Length; i++)
+            if (!_sessions.Values.Any(session => session.HostAddress.Equals(HostAddresses[i], StringComparison.OrdinalIgnoreCase)))
+                return i;
+        return -1;
     }
 
     private async Task StartCoreAsync(UsbNative.AppleUsbTarget target, int slot)
