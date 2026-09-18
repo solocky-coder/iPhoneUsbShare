@@ -221,9 +221,9 @@ public sealed class ShareEngine
             WriteLog($"AppleNcm package registration exit code: {addApple.ExitCode}");
             if (!string.IsNullOrWhiteSpace(addApple.Output)) WriteLog($"AppleNcm package output: {addApple.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(addApple.Error)) WriteLog($"AppleNcm package error: {addApple.Error.Trim()}");
-            foreach (var target in targets)
+            foreach (var ncmTarget in targets)
             {
-                WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {target.Id} | {ncmTarget.Name}");
+                WriteLog($"Selecting bundled AppleNcm for Apple NCM interface: {ncmTarget.Id} | {ncmTarget.Name}");
                 var changed = InstallSelectedDriverByDescription(target.Id, appleInf, "Apple iPhone NCM Host Device", out var setupError);
                 WriteLog($"AppleNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
                 LogPnpDriverState(target.Id, "after AppleNcm selection");
@@ -252,7 +252,7 @@ public sealed class ShareEngine
         if (!string.IsNullOrWhiteSpace(add.Error)) WriteStaticLog($"UsbNcm package error: {add.Error.Trim()}");
         foreach (var target in targets)
         {
-            WriteLog($"Selecting Microsoft UsbNcm for Apple NCM interface: {target.Id} | {target.Name}");
+            WriteLog($"Selecting Microsoft UsbNcm for Apple NCM interface: {target.Id} | {ncmTarget.Name}");
             var changed = InstallSelectedNcmDriver(target.Id, inf, out var setupError);
             WriteLog($"UsbNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
             LogPnpDriverState(target.Id, "after UsbNcm selection");
