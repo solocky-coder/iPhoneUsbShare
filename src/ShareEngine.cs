@@ -242,9 +242,8 @@ public sealed class ShareEngine
                 LogPnpDriverState(target.Id, "after AppleNcm selection");
                 LogPnpUtilDrivers(target.Id);
                 if (!changed) continue;
-                try { RestartDevice(target.Id); } catch (Exception ex) { WriteStaticLog($"AppleNcm child restart: {ex.Message}"); }
                 await Task.Delay(2000);
-                LogPnpDriverState(target.Id, "after AppleNcm child restart");
+                LogPnpDriverState(target.Id, "after AppleNcm driver install settled");
                 var adapter = FindPhoneAdapter();
                 if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteStaticLog($"AppleNcm produced a usable adapter: {adapter.Name}"); return; }
             }
@@ -271,9 +270,8 @@ public sealed class ShareEngine
             WriteLog($"UsbNcm SetupAPI driver selection {target.Id}: {(changed ? "success" : "failed")}, Win32Error={setupError}");
             LogPnpDriverState(target.Id, "after UsbNcm selection");
             if (!changed) continue;
-            try { RestartDevice(target.Id); } catch (Exception ex) { WriteStaticLog($"NCM child restart: {ex.Message}"); }
             await Task.Delay(2000);
-            LogPnpDriverState(target.Id, "after NCM child restart");
+            LogPnpDriverState(target.Id, "after NCM driver install settled");
             var adapter = FindPhoneAdapter();
             if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}"); return; }
             WriteLog("Selected NCM function did not produce an active network adapter; trying the next descriptor-identified NCM function.");
