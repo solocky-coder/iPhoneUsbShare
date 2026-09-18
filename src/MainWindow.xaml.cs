@@ -151,6 +151,14 @@ public partial class MainWindow : Window
         await Task.Delay(250);
         try
         {
+            if (_sharing)
+            {
+                Log($"Apple USB device detected ({reason}); reconciling additional USB sessions…");
+                await _engine.StartAsync();
+                await RefreshAsync();
+                return;
+            }
+
             var status = await _engine.GetStatusAsync();
             if (status.AppleConnected) return;
             _autoStartArmed = true;
@@ -166,7 +174,7 @@ public partial class MainWindow : Window
 
     private async Task TryAutoStartAsync(string reason)
     {
-        if (!_autoStartArmed || _autoStarting || _sharing) return;
+        if (!_autoStartArmed || _autoStarting) return;
         _autoStarting = true;
         try
         {
