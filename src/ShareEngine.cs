@@ -18,6 +18,7 @@ public sealed class ShareEngine
     private const string NcmIndexValue = "4";
     private const string Subnet = "192.168.137.";
     private static readonly object LogFileLock = new();
+    private readonly SemaphoreSlim _startStopLock = new(1, 1);
     private string AppDir => AppContext.BaseDirectory;
     private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
@@ -54,7 +55,20 @@ public sealed class ShareEngine
 
     public async Task StartAsync()
     {
-        await EnsurePrerequisitesAsync();
+        await _startStopLock.WaitAsync();
+        try
+        {
+            await StartCoreAsync();
+        }
+        finally
+        {
+            _startStopLock.Release();
+        }
+    }
+
+    private async Task StartCoreAsync()
+    {
+        await WaitForAppleUsbReadyAsync();
         var phone = FindAppleDevice() ?? throw new InvalidOperationException("iPhone/iPad not found.");
         WriteLog($"Apple device found: {phone.Id} ({phone.Name})");
         DisablePhotoInterfaces();
@@ -145,11 +159,24 @@ public sealed class ShareEngine
         WriteLog($"DHCP lease acquired: {FindLease(adapter.Name) ?? "none"}");
     }
 
-    public Task StopAsync()
+    public async Task StopAsync()
     {
-        try { if (FindPhoneAdapter() is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); WriteLog("Sharing stopped and Apple USB configuration restored."); }
-        catch (Exception ex) { WriteLog($"Stop cleanup: {ex.Message}"); }
-        return Task.CompletedTask;
+        await _startStopLock.WaitAsync();
+        try
+        {
+            try { if (FindPhoneAdapter() is not null) DisableAllIcs(); var phone = FindAppleDevice(); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); WriteLog("Sharing stopped and Apple USB configuration restored."); }
+            catch (Exception ex) { WriteLog($"Stop cleanup: {ex.Message}"); }
+        }
+        finally
+        {
+            _startStopLock.Release();
+        }
+    }
+
+    private static async Task WaitForAppleUsbReadyAsync()
+    {
+        await WaitUntil(() => FindAppleDevice() is not null, 10, "Apple USB device");
+        await WaitUntil(() => UsbNative.IsReachable(), 15, "Apple WinUSB control interface");
     }
 
     public async Task<Status> GetStatusAsync()
