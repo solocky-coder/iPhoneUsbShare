@@ -1,4 +1,6 @@
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Windows.Interop;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -10,6 +12,13 @@ public partial class MainWindow : Window
     private readonly ShareEngine _engine = new();
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private bool _sharing;
+    private bool _autoStarting;
+    private bool _autoStartArmed = true;
+    private HwndSource? _hwndSource;
+
+    private const int WM_DEVICECHANGE = 0x0219;
+    private const int DBT_DEVICEARRIVAL = 0x8000;
+    private const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
 
     public MainWindow()
     {
@@ -30,8 +39,19 @@ public partial class MainWindow : Window
             }
             catch (Exception ex) { Log($"Setup check: {ex.Message}"); }
             await RefreshAsync();
+            await TryAutoStartAsync("startup");
         };
-        Closed += (_, _) => { _timer.Stop(); _engine.WriteLog("iPhoneUsbShare session ended"); };
+        SourceInitialized += (_, _) =>
+        {
+            _hwndSource = PresentationSource.FromVisual(this) as HwndSource;
+            _hwndSource?.AddHook(WndProc);
+        };
+        Closed += (_, _) =>
+        {
+            _hwndSource?.RemoveHook(WndProc);
+            _timer.Stop();
+            _engine.WriteLog("iPhoneUsbShare session ended");
+        };
     }
 
     private async Task RefreshAsync()
@@ -59,6 +79,7 @@ public partial class MainWindow : Window
 
     private async void StartButton_Click(object sender, RoutedEventArgs e)
     {
+        _autoStartArmed = true;
         StartButton.IsEnabled = false;
         StopButton.IsEnabled = false;
         try
@@ -92,6 +113,7 @@ public partial class MainWindow : Window
         try
         {
             _sharing = false;
+            _autoStartArmed = false;
             _timer.Stop();
             Log("Stopping USB network path…");
             await _engine.StopAsync();
@@ -103,6 +125,79 @@ public partial class MainWindow : Window
             Log($"ERROR: {ex.Message}");
             StopButton.IsEnabled = true;
         }
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WM_DEVICECHANGE)
+        {
+            if (wParam.ToInt32() == DBT_DEVICEARRIVAL)
+                Dispatcher.BeginInvoke(new Action(() => _ = HandleDeviceArrivalAsync()));
+            else if (wParam.ToInt32() == DBT_DEVICEREMOVECOMPLETE)
+                Dispatcher.BeginInvoke(new Action(() => _ = HandleDeviceRemovalAsync()));
+        }
+        return IntPtr.Zero;
+    }
+
+    private async Task HandleDeviceArrivalAsync()
+    {
+        if (!_autoStartArmed || _autoStarting) return;
+        await Task.Delay(750);
+        await TryAutoStartAsync("USB device arrival");
+    }
+
+    private async Task HandleDeviceRemovalAsync()
+    {
+        await Task.Delay(250);
+        try
+        {
+            var status = await _engine.GetStatusAsync();
+            if (status.AppleConnected) return;
+            _autoStartArmed = true;
+            if (!_sharing && !_autoStarting) return;
+            _sharing = false;
+            _timer.Stop();
+            StartButton.IsEnabled = true;
+            StopButton.IsEnabled = false;
+            Log("Apple USB device removed; USB network path is OFF.");
+        }
+        catch (Exception ex) { Log($"Device removal status: {ex.Message}"); }
+    }
+
+    private async Task TryAutoStartAsync(string reason)
+    {
+        if (!_autoStartArmed || _autoStarting || _sharing) return;
+        _autoStarting = true;
+        try
+        {
+            var status = await _engine.GetStatusAsync();
+            if (!status.AppleConnected) return;
+            if (status.AdapterName is not null && status.AdapterStatus == OperationalStatus.Up.ToString())
+            {
+                _sharing = true;
+                StopButton.IsEnabled = true;
+                _timer.Start();
+                Log($"USB Ethernet already available; automatic startup satisfied by {reason}.");
+                return;
+            }
+
+            StartButton.IsEnabled = false;
+            StopButton.IsEnabled = false;
+            Log($"Apple USB device detected ({reason}); starting USB network path automatically…");
+            await _engine.StartAsync();
+            _sharing = true;
+            StopButton.IsEnabled = true;
+            _timer.Start();
+            Log("Automatic USB network startup complete.");
+            await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            Log($"Automatic USB startup failed: {ex.Message}");
+            StartButton.IsEnabled = true;
+            StopButton.IsEnabled = false;
+        }
+        finally { _autoStarting = false; }
     }
 
     private async void DiagnosticsButton_Click(object sender, RoutedEventArgs e)
