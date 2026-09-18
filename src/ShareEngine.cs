@@ -555,11 +555,11 @@ public sealed class ShareEngine
 
     private static async Task ConfigureStaticNetworkAsync(string adapterName)
     {
-        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name="{adapterName}" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
+        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\\\"{adapterName}\\\" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
         if (address.ExitCode != 0)
             throw new InvalidOperationException($"netsh IPv4 address configuration failed ({address.ExitCode}): {address.Error}");
 
-        var dns = RunAllowRestart("netsh.exe", $"interface ipv4 set dnsservers name="{adapterName}" source=static address=none");
+        var dns = RunAllowRestart("netsh.exe", $"interface ipv4 set dnsservers name=\\\"{adapterName}\\\" source=static address=none");
         if (dns.ExitCode != 0)
             WriteStaticLog($"netsh DNS cleanup returned {dns.ExitCode}: {dns.Error}");
     }
