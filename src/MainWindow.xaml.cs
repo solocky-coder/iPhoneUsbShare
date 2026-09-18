@@ -172,7 +172,7 @@ public partial class MainWindow : Window
         {
             var status = await _engine.GetStatusAsync();
             if (!status.AppleConnected) return;
-            if (status.AdapterName is not null && status.AdapterStatus == OperationalStatus.Up.ToString())
+            if (status.Sharing && status.AdapterName is not null && status.AdapterStatus == OperationalStatus.Up.ToString())
             {
                 _sharing = true;
                 StopButton.IsEnabled = true;
