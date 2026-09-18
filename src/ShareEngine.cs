@@ -19,7 +19,7 @@ public sealed class ShareEngine
     private const string HostAddress = "192.168.99.1";
     private const string PeerAddress = "192.168.99.2";
     private static readonly object LogFileLock = new();
-    private readonly SemaphoreSlim _startStopLock = new(1, 1);
+    private readonly SemaphoreSlim _startStopLock = new(1, 1);\n    private IsolatedDhcpServer? _isolatedDhcp;
     private string AppDir => AppContext.BaseDirectory;
     private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
@@ -555,6 +555,13 @@ public sealed class ShareEngine
 
     private static async Task ConfigureStaticNetworkAsync(string adapterName)
     {
+        foreach (var existing in FindAddresses(adapterName).Where(a => !a.Equals(HostAddress, StringComparison.OrdinalIgnoreCase)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var remove = RunAllowRestart("netsh.exe", $"interface ipv4 delete address name=\\\"{adapterName}\\\" addr={existing}");
+            if (remove.ExitCode != 0)
+                WriteStaticLog($"Removed stale IPv4 address {existing} returned {remove.ExitCode}: {remove.Error}");
+        }
+
         var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\\\"{adapterName}\\\" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
         if (address.ExitCode != 0)
             throw new InvalidOperationException($"netsh IPv4 address configuration failed ({address.ExitCode}): {address.Error}");
