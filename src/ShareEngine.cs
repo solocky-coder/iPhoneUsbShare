@@ -129,7 +129,10 @@ public sealed class ShareEngine
 
         await ConfigureStaticNetworkAsync(adapter.Name);
         await WaitUntil(() => HasAddress(adapter.Name, HostAddress), 15, "static USB IPv4 address");
-        WriteLog($"Isolated USB network ready: Windows={HostAddress}, iPhone={PeerAddress}, mask=255.255.255.0, no gateway, no DNS, no ICS/DHCP.");
+        _isolatedDhcp?.Dispose();
+        _isolatedDhcp = new IsolatedDhcpServer(WriteLog);
+        _isolatedDhcp.Start();
+        WriteLog($"Isolated USB network ready: Windows={HostAddress}, iPhone={PeerAddress}, mask=255.255.255.0, fixed DHCP peer lease, no gateway, no DNS, no ICS.");
         if (!await PingPeerAsync(PeerAddress, 3000))
             WriteLog($"iPhone peer {PeerAddress} did not answer ICMP; continuing because UDP does not require ICMP.");
     }
@@ -141,6 +144,8 @@ public sealed class ShareEngine
         {
             try
             {
+                _isolatedDhcp?.Dispose();
+                _isolatedDhcp = null;
                 var phone = FindAppleDevice();
                 if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0");
                 WriteLog("Sharing stopped; Apple USB configuration restored. No ICS/DHCP state is modified.");
