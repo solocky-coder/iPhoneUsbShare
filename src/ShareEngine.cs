@@ -136,26 +136,30 @@ public sealed class ShareEngine
 
     public async Task<Status> GetStatusAsync()
     {
+        ReconcileRemovedSessions();
         var p = FindAppleDevice();
-        var a = FindPhoneAdapter();
-        var sharing = a is not null && HasAddress(a.Name, HostAddress);
+        var a = _sessions.Values.FirstOrDefault()?.Adapter ?? FindPhoneAdapter();
+        var sharing = _sessions.Count > 0;
         var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
-        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, a is null ? null : FindAddress(a.Name), rx, tx));
+        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, a is null ? null : FindAddress(a.Name), rx, tx, _sessions.Count));
     }
 
     public async Task<string> DiagnosticsAsync()
     {
         WriteLog("Running diagnostics…");
         var sb = new StringBuilder();
-        var p = FindAppleDevice(); var a = FindPhoneAdapter();
+        ReconcileRemovedSessions();
+        var p = FindAppleDevice(); var a = _sessions.Values.FirstOrDefault()?.Adapter ?? FindPhoneAdapter();
         sb.AppendLine($"Apple device: {(p is null ? "not connected" : p.Name)}");
         sb.AppendLine($"Apple PnP ID: {p?.Id ?? "—"}");
         sb.AppendLine($"USB identity: {UsbNative.GetDeviceId() ?? "unreachable"}");
         sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
         sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]");
         sb.AppendLine($"Windows USB address: {(a is null ? "—" : FindAddress(a.Name) ?? "none")}");
-        sb.AppendLine($"iPhone peer {PeerAddress}: {(await PingPeerAsync(PeerAddress, 3000) ? "reachable" : "not reachable")}");
-        sb.AppendLine("Network mode: isolated static IPv4; no ICS/DHCP/gateway/DNS");
+        foreach (var session in _sessions.Values)
+            sb.AppendLine($"USB slot: {session.HostAddress} -> {session.PeerAddress} | adapter={session.Adapter.Name} | peer={(await PingPeerAsync(session.PeerAddress, 3000) ? "reachable" : "not reachable")}");
+        sb.AppendLine($"Active USB sessions: {_sessions.Count}/4");
+        sb.AppendLine("Network mode: isolated static IPv4; no ICS/NAT/gateway/DNS");
         WriteLog("Diagnostics result: " + sb.ToString().Replace(Environment.NewLine, " | ").Trim());
         return sb.ToString();
     }
@@ -576,6 +580,18 @@ public sealed class ShareEngine
         catch { return false; }
     }
 
+    private void ReconcileRemovedSessions()
+    {
+        foreach (var key in _sessions.Keys.ToArray())
+        {
+            var session = _sessions[key];
+            if (FindAppleDevice(session.Target.ParentId) is not null) continue;
+            try { session.Dhcp.Dispose(); } catch { }
+            _sessions.Remove(key);
+            WriteLog($"Apple USB device removed; session {key} cleaned up.");
+        }
+    }
+
     private static (double Rx, double Tx) GetRates(string adapterName)
     {
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
@@ -656,7 +672,7 @@ public sealed class ShareEngine
         throw new TimeoutException($"Timed out waiting for {what}.");
     }
 
-    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx);
+    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx, int SessionCount);
     private readonly record struct CommandResult(int ExitCode, string Output, string Error);
     private sealed record PnpDevice(string Id, string Name);
 }
