@@ -590,43 +590,6 @@ public sealed class ShareEngine
         catch { return false; }
     }
 
-    private static async Task ConfigureStaticNetworkAsync(string adapterName)
-    {
-        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\"{adapterName}\" source=static address={HostAddress} mask=255.255.255.0 gateway=none");
-        if (address.ExitCode != 0)
-            throw new InvalidOperationException($"netsh IPv4 address configuration failed ({address.ExitCode}): {address.Error}");
-
-        var dns = RunAllowRestart("netsh.exe", $"interface ipv4 set dnsservers name=\"{adapterName}\" source=static address=none");
-        if (dns.ExitCode != 0)
-            WriteStaticLog($"netsh DNS cleanup returned {dns.ExitCode}: {dns.Error}");
-    }
-
-    private static bool HasAddress(string adapterName, string address) =>
-        FindAddresses(adapterName).Any(a => a.Equals(address, StringComparison.OrdinalIgnoreCase));
-
-    private static string? FindAddress(string adapterName) =>
-        FindAddresses(adapterName).FirstOrDefault();
-
-    private static IEnumerable<string> FindAddresses(string adapterName)
-    {
-        var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName);
-        if (nic is null) yield break;
-        foreach (var u in nic.GetIPProperties().UnicastAddresses)
-            if (u.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                yield return u.Address.ToString();
-    }
-
-    private static async Task<bool> PingPeerAsync(string address, int timeoutMs)
-    {
-        try
-        {
-            using var ping = new Ping();
-            var reply = await ping.SendPingAsync(address, timeoutMs);
-            return reply.Status == IPStatus.Success;
-        }
-        catch { return false; }
-    }
-
     private static (double Rx, double Tx) GetRates(string adapterName)
     {
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
