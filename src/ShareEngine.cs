@@ -19,7 +19,8 @@ public sealed class ShareEngine
     private const string HostAddress = "192.168.99.1";
     private const string PeerAddress = "192.168.99.2";
     private static readonly object LogFileLock = new();
-    private readonly SemaphoreSlim _startStopLock = new(1, 1);\n    private IsolatedDhcpServer? _isolatedDhcp;
+    private readonly SemaphoreSlim _startStopLock = new(1, 1);
+    private IsolatedDhcpServer? _isolatedDhcp;
     private string AppDir => AppContext.BaseDirectory;
     private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
