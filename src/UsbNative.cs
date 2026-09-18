@@ -56,7 +56,11 @@ internal static class UsbNative
                     AppendRaw($"WinUSB migration: installed WinUSB on additional Apple device {mi00}; restarting MI_00 once.");
                     RunAllowRestart("pnputil.exe", $"/restart-device "{mi00}"");
                 }
-                path = FindWinUsbDevicePathForInstance(mi00);
+                for (var attempt = 0; attempt < 20 && path is null; attempt++)
+                {
+                    Thread.Sleep(250);
+                    path = FindWinUsbDevicePathForInstance(mi00);
+                }
             }
             result.Add(new AppleUsbTarget(parent, mi00, path));
         }
