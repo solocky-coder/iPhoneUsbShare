@@ -59,83 +59,58 @@ public sealed class ShareEngine
     public async Task StartAsync()
     {
         await _startStopLock.WaitAsync();
-        try
-        {
-            await StartCoreAsync();
-        }
-        finally
-        {
-            _startStopLock.Release();
-        }
+        try { await StartAllAsync(); }
+        finally { _startStopLock.Release(); }
     }
 
-    private async Task StartCoreAsync()
+    private async Task StartAllAsync()
     {
-        await WaitForAppleUsbReadyAsync();
-        var phone = FindAppleDevice() ?? throw new InvalidOperationException("iPhone/iPad not found.");
-        WriteLog($"Apple device found: {phone.Id} ({phone.Name})");
-        DisablePhotoInterfaces();
-
-        var adapter = FindPhoneAdapter();
-        if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
+        await WaitUntil(() => UsbNative.EnumerateTargets().Length > 0, 15, "Apple USB devices");
+        var targets = UsbNative.EnumerateTargets();
+        for (var index = 0; index < targets.Length && index < HostAddresses.Length; index++)
         {
-            WriteLog($"USB Ethernet already available: {adapter.Name}");
+            var target = targets[index];
+            if (_sessions.ContainsKey(target.DeviceKey)) continue;
+            try { await StartCoreAsync(target, index); }
+            catch (Exception ex) { WriteLog($"Apple USB session {target.ParentId} failed: {ex.Message}"); }
         }
-        else
+        if (_sessions.Count == 0) throw new InvalidOperationException("No Apple USB networking session could be started.");
+    }
+
+    private async Task StartCoreAsync(UsbNative.AppleUsbTarget target, int slot)
+    {
+        var hostAddress = HostAddresses[slot];
+        var peerAddress = PeerAddresses[slot];
+        var phone = FindAppleDevice(target.ParentId) ?? throw new InvalidOperationException($"Apple device not found: {target.ParentId}");
+        WriteLog($"Apple device found: {phone.Id} ({phone.Name}); USB slot {slot + 1}, host={hostAddress}, peer={peerAddress}");
+        DisablePhotoInterfaces();
+        var adapter = FindPhoneAdapter(target.ParentId);
+        if (adapter is null || adapter.OperationalStatus != OperationalStatus.Up)
         {
             ConfigureUsbCgpEnumerator(phone.Id);
             SetConfig(phone.Id, SafeIndexValue, "0");
-            WriteLog("Set Apple USB configuration to safe mode (2).");
             RestartDevice(phone.Id);
-            await WaitUntil(() => FindAppleDevice() is not null, 25, "Apple device to re-enumerate");
+            await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate");
             DisablePhotoInterfaces();
-            WriteLog("Waiting for Apple USB control interface…");
             string? mode = null;
-            for (var i = 0; i < 20; i++)
+            for (var i = 0; i < 20; i++) { mode = await UsbNative.GetModeAsync(target); if (mode is not null) break; await Task.Delay(1000); }
+            if (mode is null) throw new InvalidOperationException("Apple USB control interface did not reappear.");
+            if (mode != "5:3:3:0" && mode != "5:3:3")
             {
-                mode = await UsbNative.GetModeAsync();
-                WriteLog($"GET_MODE attempt {i + 1}/20: {(mode ?? "unreachable")}");
-                if (mode is not null) break;
-                await Task.Delay(1000);
+                if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
+                if (!await UsbNative.SetConfigurationAsync(target, int.Parse(NcmIndexValue))) throw new InvalidOperationException("Apple CDC-NCM configuration switch failed.");
+                if (!await UsbNative.SetModeAsync(target, 3)) throw new InvalidOperationException("Apple device rejected CDC-NCM mode.");
             }
-            if (mode is null) throw new InvalidOperationException("Apple USB control interface is unreachable after the device restart. The WinUSB control interface did not reappear; unplug/replug the iPhone/iPad and try again.");
-            WriteLog($"Apple USB mode: {mode}");
-
-            if (mode == "5:3:3:0" || mode == "5:3:3")
-            {
-                WriteLog("Apple is already in CDC-NCM direct mode (5); skipping configuration 4 and SET_MODE(3).");
-            }
-            else
-            {
-                if (mode != "3:3:3:0" && mode != "3:3:3")
-                    throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
-                SetConfig(phone.Id, NcmIndexValue, SafeIndexValue);
-                WriteLog("Set Apple USB configuration to CDC-NCM mode (4).");
-                var accepted = await UsbNative.SetModeAsync(3);
-                WriteLog($"SET_MODE(3) result: {(accepted ? "accepted" : "rejected/failed")}");
-                if (!accepted)
-                {
-                    SetConfig(phone.Id, SafeIndexValue, "0");
-                    throw new InvalidOperationException("The Apple device rejected the CDC-NCM mode switch. Unplug/replug and try again.");
-                }
-                WriteLog("Apple device accepted CDC-NCM mode; waiting for USB Ethernet…");
-            }
-
-            await BindAppleOrInboxNcmDriverAsync();
-            await WaitUntil(() => FindPhoneAdapter()?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
-            adapter = FindPhoneAdapter() ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
-            WriteLog($"USB Ethernet adapter is up: {adapter.Name}");
-            DisablePhotoInterfaces();
+            await BindAppleOrInboxNcmDriverAsync(target);
+            await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
+            adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
         }
-
-        await ConfigureStaticNetworkAsync(adapter.Name);
-        await WaitUntil(() => HasAddress(adapter.Name, HostAddress), 15, "static USB IPv4 address");
-        _isolatedDhcp?.Dispose();
-        _isolatedDhcp = new IsolatedDhcpServer(WriteLog);
-        _isolatedDhcp.Start();
-        WriteLog($"Isolated USB network ready: Windows={HostAddress}, iPhone={PeerAddress}, mask=255.255.255.0, fixed DHCP peer lease, no gateway, no DNS, no ICS.");
-        if (!await PingPeerAsync(PeerAddress, 3000))
-            WriteLog($"iPhone peer {PeerAddress} did not answer ICMP; continuing because UDP does not require ICMP.");
+        await ConfigureStaticNetworkAsync(adapter.Name, hostAddress);
+        await WaitUntil(() => HasAddress(adapter.Name, hostAddress), 15, "static USB IPv4 address");
+        var dhcp = new IsolatedDhcpServer(WriteLog, hostAddress, peerAddress);
+        dhcp.Start();
+        _sessions[target.DeviceKey] = new ActiveSession(target, adapter, hostAddress, peerAddress, dhcp);
+        WriteLog($"Isolated USB network ready: Windows={hostAddress}, iPhone={peerAddress}, mask=255.255.255.0, no gateway, no DNS, no ICS.");
     }
 
     public async Task StopAsync()
