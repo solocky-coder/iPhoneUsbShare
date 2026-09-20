@@ -54,7 +54,7 @@ internal static class UsbNative
                 if (InstallWinUsbDriver(mi00))
                 {
                     AppendRaw($"WinUSB migration: installed WinUSB on additional Apple device {mi00}; restarting MI_00 once.");
-                    RunAllowRestart("pnputil.exe", $"/restart-device "{mi00}"");
+                    RunAllowRestart("pnputil.exe", $"/restart-device \"{mi00}\"");
                 }
                 for (var attempt = 0; attempt < 20 && path is null; attempt++)
                 {
@@ -97,8 +97,7 @@ internal static class UsbNative
     public static string? GetDeviceId()
     {
         try
-        {
-            var p = FindAppleCompositeId();
+        {            var p = FindAppleCompositeId();
             if (p is null) return null;
             var marker = "PID_";
             var i = p.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
@@ -197,8 +196,7 @@ internal static class UsbNative
                     }
                 }
                 finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
-                return false;
-            }
+                return false;            }
             return false;
         }
         finally { SetupDiDestroyDeviceInfoList(h); }
@@ -297,8 +295,7 @@ internal static class UsbNative
     }
 
     private static bool SetConfiguration(int configuration, AppleUsbTarget? target = null)
-    {
-        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
+    {        var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
         if (usb == IntPtr.Zero) return false;
         try
         {
@@ -397,7 +394,6 @@ internal static class UsbNative
         }
         finally { WinUsb_Free(usb); file.Dispose(); }
     }
-
     private static bool SetMode(int mode, AppleUsbTarget? target = null)
     {
         var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
@@ -497,8 +493,7 @@ internal static class UsbNative
                 if (required == 0) continue;
 
                 var buffer = Marshal.AllocHGlobal((int)required);
-                var devInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<SP_DEVINFO_DATA>());
-                try
+                var devInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<SP_DEVINFO_DATA>());                try
                 {
                     Marshal.WriteInt32(buffer, IntPtr.Size == 8 ? 8 : 5);
                     var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
@@ -597,8 +592,7 @@ internal static class UsbNative
                     IsChildOfAppleParent(id, parentId))
                 {
                     AppendRaw($"Apple USB child discovery: matched MI_{interfaceNumber:X2} for {parentId}: {id}");
-                    return id;
-                }
+                    return id;                }
             }
         }
         catch (Exception ex)
@@ -697,8 +691,7 @@ internal static class UsbNative
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstanceIdW", SetLastError = true)] private static extern bool SetupDiGetDeviceInstanceId(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, StringBuilder DeviceInstanceId, int DeviceInstanceIdSize, out int RequiredSize);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInstallParamsW", SetLastError = true)] private static extern bool SetupDiGetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetDeviceInstallParamsW", SetLastError = true)] private static extern bool SetupDiSetDeviceInstallParams(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DEVINSTALL_PARAMS DeviceInstallParams);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiBuildDriverInfoList", SetLastError = true)] private static extern bool SetupDiBuildDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDriverInfoW", SetLastError = true)] private static extern bool SetupDiEnumDriverInfo(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType, uint MemberIndex, ref SP_DRVINFO_DATA DriverInfoData);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiBuildDriverInfoList", SetLastError = true)] private static extern bool SetupDiBuildDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiEnumDriverInfoW", SetLastError = true)] private static extern bool SetupDiEnumDriverInfo(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType, uint MemberIndex, ref SP_DRVINFO_DATA DriverInfoData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiSetSelectedDriverW", SetLastError = true)] private static extern bool SetupDiSetSelectedDriver(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDriverInfoDetailW", SetLastError = true)] private static extern bool SetupDiGetDriverInfoDetail(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, IntPtr DriverInfoDetailData, uint DriverInfoDetailDataSize, out uint RequiredSize);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDriverInfoList(IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, uint DriverType);
