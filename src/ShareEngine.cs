@@ -690,7 +690,7 @@ public sealed class ShareEngine
         {
             get
             {
-                var slash = Id.LastIndexOf('\\\\');
+                var slash = Id.LastIndexOf('\\');
                 if (slash < 0) return Id;
                 var token = Id[(slash + 1)..];
                 var mi = token.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
