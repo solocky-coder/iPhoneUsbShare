@@ -1,3 +1,5 @@
-ACTUAL SOURCE CHANGES MADE TO UPLOADED REPOSITORY
+BUILD FIX
 
-- src/ShareEngine.cs
+Removed the duplicated/malformed PnpDevice.ParentId block that caused:
+CS1519 at ShareEngine.cs(701,5) and CS1022 at ShareEngine.cs(714,1).
+Kept one valid PnpDevice record with ParentId.
