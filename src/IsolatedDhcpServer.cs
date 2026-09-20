@@ -85,7 +85,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
                 {
                     if (serverId is not null && !serverId.Equals(IPAddress.Parse(_hostAddress))) continue;
                     await SendReplyAsync(packet, xid, flags, 5, cancellationToken);
-                    _log($"DHCP REQUEST received for {requested?.ToString() ?? PeerAddress}; acknowledged fixed peer address {_peerAddress}.");
+                    _log($"DHCP REQUEST received for {requested?.ToString() ?? _peerAddress}; acknowledged fixed peer address {_peerAddress}.");
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
