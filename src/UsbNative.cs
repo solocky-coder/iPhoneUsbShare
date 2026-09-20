@@ -74,8 +74,8 @@ internal static class UsbNative
     }
 
     public static Task<string?> GetModeAsync(AppleUsbTarget target) => Task.Run(() => GetModeDiagnostic(target).Mode);
-    public static Task<bool> SetModeAsync(AppleUsbTarget target, int mode) => Task.Run(() => SetMode(target, mode));
-    public static Task<bool> SetConfigurationAsync(AppleUsbTarget target, int configuration) => Task.Run(() => SetConfiguration(target, configuration));
+    public static Task<bool> SetModeAsync(AppleUsbTarget target, int mode) => Task.Run(() => SetMode(mode, target));
+    public static Task<bool> SetConfigurationAsync(AppleUsbTarget target, int configuration) => Task.Run(() => SetConfiguration(configuration, target));
     public static Task<int?> GetConfigurationAsync(AppleUsbTarget target) => Task.Run(() => GetConfiguration(target));
     public static Task<int[]> GetNcmControlInterfacesAsync(AppleUsbTarget target) => Task.Run(() => GetNcmControlInterfaces(target));
     public static string? GetDeviceId(AppleUsbTarget target) => GetDeviceIdFromParent(target.ParentId);
@@ -110,11 +110,11 @@ internal static class UsbNative
     }
 
     public static Task<string?> GetModeAsync() => Task.Run(() => { var d = GetModeDiagnostic(); if (d.Mode is null) AppendDiagnostic(d); return d.Mode; });
-    public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(GetModeDiagnostic);
+    public static Task<ModeDiagnostic> GetModeDiagnosticAsync() => Task.Run(() => GetModeDiagnostic());
     public static Task<bool> SetModeAsync(int mode) => Task.Run(() => SetMode(mode));
     public static Task<bool> SetConfigurationAsync(int configuration) => Task.Run(() => SetConfiguration(configuration));
-    public static Task<int?> GetConfigurationAsync() => Task.Run(GetConfiguration);
-    public static Task<int[]> GetNcmControlInterfacesAsync() => Task.Run(GetNcmControlInterfaces);
+    public static Task<int?> GetConfigurationAsync() => Task.Run(() => GetConfiguration());
+    public static Task<int[]> GetNcmControlInterfacesAsync() => Task.Run(() => GetNcmControlInterfaces());
 
     private static void EnsureWinUsbPath()
     {
