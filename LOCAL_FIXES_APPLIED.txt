@@ -1,3 +1,7 @@
-BUILD FIX
+RUNTIME FIX
 
-src/IsolatedDhcpServer.cs: replaced 1 remaining PeerAddress reference(s) with _peerAddress.
+Fixed Apple composite/MI child matching in src/UsbNative.cs.
+The previous code compared the parent serial token with the child's
+separate MI_00 instance token, so an actually enumerated MI_00 child
+was incorrectly reported as missing. Matching now uses the stable
+VID/PID hardware prefix before &MI_.

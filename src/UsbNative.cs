@@ -605,10 +605,22 @@ internal static class UsbNative
 
     private static bool IsChildOfAppleParent(string childId, string parentId)
     {
-        var childToken = childId.LastIndexOf('\\') >= 0 ? childId[(childId.LastIndexOf('\\') + 1)..] : childId;
-        var parentToken = parentId.LastIndexOf('\\') >= 0 ? parentId[(parentId.LastIndexOf('\\') + 1)..] : parentId;
-        return childToken.StartsWith(parentToken + "&", StringComparison.OrdinalIgnoreCase)
-            || childToken.Equals(parentToken, StringComparison.OrdinalIgnoreCase);
+        // Composite USB children have a different instance token from the
+        // composite parent. The stable relationship is the VID/PID hardware
+        // prefix: e.g. parent USB\\VID_05AC&PID_12AB and child
+        // USB\\VID_05AC&PID_12AB&MI_00\\...
+        static string HardwarePrefix(string id)
+        {
+            var slash = id.IndexOf('\\');
+            var hardware = slash >= 0 ? id[..slash] : id;
+            var mi = hardware.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
+            return mi >= 0 ? hardware[..mi] : hardware;
+        }
+
+        return string.Equals(
+            HardwarePrefix(childId),
+            HardwarePrefix(parentId),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? GetDeviceIdFromParent(string p)
