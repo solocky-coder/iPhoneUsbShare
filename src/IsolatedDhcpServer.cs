@@ -79,13 +79,13 @@ internal sealed class IsolatedDhcpServer : IDisposable
                 if (messageType == 1) // DHCPDISCOVER
                 {
                     await SendReplyAsync(packet, xid, flags, 2, cancellationToken);
-                    _log($"DHCP DISCOVER received; offered fixed peer address {PeerAddress}.");
+                    _log($"DHCP DISCOVER received; offered fixed peer address {_peerAddress}.");
                 }
                 else if (messageType == 3) // DHCPREQUEST
                 {
                     if (serverId is not null && !serverId.Equals(IPAddress.Parse(_hostAddress))) continue;
                     await SendReplyAsync(packet, xid, flags, 5, cancellationToken);
-                    _log($"DHCP REQUEST received for {requested?.ToString() ?? PeerAddress}; acknowledged fixed peer address {PeerAddress}.");
+                    _log($"DHCP REQUEST received for {requested?.ToString() ?? PeerAddress}; acknowledged fixed peer address {_peerAddress}.");
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { break; }
@@ -108,7 +108,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
         WriteUInt32(reply, 4, xid);
         WriteUInt16(reply, 10, flags);
         CopyAddress(reply, 16, IPAddress.Parse(_peerAddress)); // yiaddr
-        CopyAddress(reply, 20, IPAddress.Parse(HostAddress)); // siaddr
+        CopyAddress(reply, 20, IPAddress.Parse(_hostAddress)); // siaddr
         Buffer.BlockCopy(request, 28, reply, 28, 16); // chaddr
 
         reply[236] = 99;
@@ -118,7 +118,7 @@ internal sealed class IsolatedDhcpServer : IDisposable
 
         var pos = 240;
         pos = AddOptionByte(reply, pos, 53, messageType);
-        pos = AddOptionAddress(reply, pos, 54, IPAddress.Parse(HostAddress));
+        pos = AddOptionAddress(reply, pos, 54, IPAddress.Parse(_hostAddress));
         pos = AddOption(reply, pos, 1, new byte[] { 255, 255, 255, 0 });
         pos = AddOptionUInt32(reply, pos, 51, LeaseSeconds);
         reply[pos++] = 255;
