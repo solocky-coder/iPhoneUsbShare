@@ -27,9 +27,6 @@ public partial class MainWindow : Window
         _engine = new ShareEngine(modeOverride ?? ShareModes.LoadSaved());
         InitializeComponent();
         SyncModeRadios(_engine.Mode);
-        // The mode can only change while idle: the Start button is disabled while a
-        // session is starting or running, so the selector follows it.
-        StartButton.IsEnabledChanged += (_, _) => ModePanel.IsEnabled = StartButton.IsEnabled;
         _engine.Log += (_, e) =>
         {
             Dispatcher.Invoke(() =>
@@ -72,20 +69,37 @@ public partial class MainWindow : Window
         finally { _syncingMode = false; }
     }
 
-    private void ModeRadio_Checked(object sender, RoutedEventArgs e)
+    // The mode can be switched at any time, including while a device is connected and
+    // sharing: the engine restarts the network side (DHCP server / ICS) in the new mode
+    // without redoing the USB bring-up. The selector is only locked for the switch itself.
+    private async void ModeRadio_Checked(object sender, RoutedEventArgs e)
     {
         if (_syncingMode) return;
         var selected = ReverseModeRadio.IsChecked == true ? ShareMode.ReverseTethering : ShareMode.DirectUsb;
+        if (selected == _engine.Mode) return;
+
+        ShareModes.Save(selected);
+        ModePanel.IsEnabled = false;
+        var wasSharing = _sharing;
         try
         {
-            _engine.Mode = selected;
-            ShareModes.Save(selected);
+            if (wasSharing) { _timer.Stop(); Log($"Switching to {selected.DisplayName()}…"); }
+            await _engine.SwitchModeAsync(selected);
+            if (wasSharing) { _timer.Start(); await RefreshAsync(); }
         }
         catch (Exception ex)
         {
-            Log($"Mode change refused: {ex.Message}");
-            SyncModeRadios(_engine.Mode);
+            Log($"ERROR: mode switch: {ex.Message}");
+            if (wasSharing)
+            {
+                // The new mode is selected but its session did not start; let the user retry with Start.
+                _sharing = false;
+                StartButton.IsEnabled = true;
+                StopButton.IsEnabled = false;
+            }
+            await RefreshAsync();
         }
+        finally { ModePanel.IsEnabled = true; }
     }
 
     private async Task RefreshAsync()

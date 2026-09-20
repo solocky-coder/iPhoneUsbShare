@@ -27,7 +27,7 @@ WinUSB control-transfer, and Internet Connection Sharing operations itself.
 
 ## Modes
 
-Steps 1–10 (WinUSB control path, Apple mode switch, descriptor-based NCM selection, Microsoft `UsbNcm` bind) are identical in both modes. The mode only decides how the resulting USB Ethernet adapter is configured. Pick it in the **Mode** card of the main window (locked while a session is starting or running; the choice is remembered in `%ProgramData%\iPhoneUsbShare\mode.txt`).
+Steps 1–10 (WinUSB control path, Apple mode switch, descriptor-based NCM selection, Microsoft `UsbNcm` bind) are identical in both modes. The mode only decides how the resulting USB Ethernet adapter is configured. Pick it in the **Mode** card of the main window (the choice is remembered in `%ProgramData%\iPhoneUsbShare\mode.txt`). It can be switched at any time, including while a device is connected and sharing: the network side (DHCP server or ICS) is torn down and restarted in the new mode without redoing the USB bring-up.
 
 | Mode | What it does | Devices |
 | --- | --- | --- |

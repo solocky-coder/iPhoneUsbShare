@@ -16,6 +16,11 @@ public sealed class ShareEngine
     private const string Vendor = "05AC";
     private const string SafeIndexValue = "2";
     private const string NcmIndexValue = "4";
+    // bConfigurationValue of the Apple mode-5 configuration that carries the CDC-NCM tethering
+    // function (config 5 in the device's descriptor dump: 6 interfaces, NCM control = interface 2).
+    // Usbccgp only exposes that function's MI_xx child when OriginalConfigurationValue names it;
+    // Driver/AppleUsbCompositeConfiguration.inf documents the same value.
+    private const string NcmConfigurationValue = "5";
     private static readonly string[] HostAddresses = { "192.168.99.1", "192.168.100.1", "192.168.101.1", "192.168.102.1" };
     private static readonly string[] PeerAddresses = { "192.168.99.2", "192.168.100.2", "192.168.101.2", "192.168.102.2" };
     private static readonly object LogFileLock = new();
@@ -132,8 +137,23 @@ public sealed class ShareEngine
             if (mode != "5:3:3:0" && mode != "5:3:3")
             {
                 if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
+                // Point usbccgp at the NCM configuration *before* the mode switch, so the device
+                // re-enumerates straight into it. Left at the safe value 2, usbccgp comes back
+                // with only MI_00/MI_01 and the NCM child (MI_02) is never created.
+                WriteLog($"Selecting NCM configuration (OriginalConfigurationValue={NcmConfigurationValue}) before mode switch.");
+                SetConfig(phone.Id, NcmConfigurationValue, "0");
                 if (!await UsbNative.SetConfigurationAsync(target, int.Parse(NcmIndexValue))) throw new InvalidOperationException("Apple CDC-NCM configuration switch failed.");
                 if (!await UsbNative.SetModeAsync(target, 3)) throw new InvalidOperationException("Apple device rejected CDC-NCM mode.");
+            }
+            else
+            {
+                // The device is already in mode 5 (left over from an earlier run) but usbccgp was
+                // just restarted on the safe configuration above; move it to the NCM configuration.
+                WriteLog($"Apple device already in mode {mode}; selecting NCM configuration (OriginalConfigurationValue={NcmConfigurationValue}) and restarting the composite device.");
+                SetConfig(phone.Id, NcmConfigurationValue, "0");
+                RestartDevice(phone.Id);
+                await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate on the NCM configuration");
+                await Task.Delay(1500);
             }
             await BindAppleOrInboxNcmDriverAsync(target);
             await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
@@ -191,20 +211,48 @@ public sealed class ShareEngine
     public async Task StopAsync()
     {
         await _startStopLock.WaitAsync();
+        try { StopAllCore(restoreUsbConfiguration: true); }
+        finally { _startStopLock.Release(); }
+    }
+
+    /// <summary>
+    /// Changes the mode at any time. When sessions are running they are torn down
+    /// (DHCP server stopped / ICS disabled) and started again in the new mode under
+    /// one lock. The USB Ethernet adapter stays up, so the NCM bring-up is skipped and
+    /// the switch only reconfigures the network side. If the restart fails the new mode
+    /// is still selected and the exception is thrown to the caller.
+    /// </summary>
+    public async Task SwitchModeAsync(ShareMode newMode)
+    {
+        await _startStopLock.WaitAsync();
         try
         {
-            var hadReverse = _sessions.Values.Any(session => session.Mode == ShareMode.ReverseTethering);
-            foreach (var session in _sessions.Values.ToArray())
-            {
-                ReleaseSession(session);
-                try { var phone = FindAppleDevice(session.Target.ParentId); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch (Exception ex) { WriteLog($"Stop cleanup {session.Target.ParentId}: {ex.Message}"); }
-            }
-            _sessions.Clear();
+            if (newMode == _mode) return;
+            var wasSharing = _sessions.Count > 0;
+            if (wasSharing) StopAllCore(restoreUsbConfiguration: false);
+            _mode = newMode;
+            WriteLog($"Share mode: {newMode.DisplayName()}");
+            if (wasSharing) await StartAllAsync();
+        }
+        finally { _startStopLock.Release(); }
+    }
+
+    private void StopAllCore(bool restoreUsbConfiguration)
+    {
+        var hadReverse = _sessions.Values.Any(session => session.Mode == ShareMode.ReverseTethering);
+        foreach (var session in _sessions.Values.ToArray())
+        {
+            ReleaseSession(session);
+            if (!restoreUsbConfiguration) continue;
+            try { var phone = FindAppleDevice(session.Target.ParentId); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch (Exception ex) { WriteLog($"Stop cleanup {session.Target.ParentId}: {ex.Message}"); }
+        }
+        _sessions.Clear();
+        if (!restoreUsbConfiguration)
+            WriteLog(hadReverse ? "Network side stopped; Windows ICS disabled (mode switch)." : "Network side stopped (mode switch).");
+        else
             WriteLog(hadReverse
                 ? "Sharing stopped; Windows ICS disabled and Apple USB configurations restored."
                 : "Sharing stopped; Apple USB configurations restored. No ICS/NAT/gateway/DNS state is modified.");
-        }
-        finally { _startStopLock.Release(); }
     }
 
     private static async Task WaitForAppleUsbReadyAsync()
