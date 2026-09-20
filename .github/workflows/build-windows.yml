@@ -154,6 +154,7 @@ jobs:
             'USB child discovery: accepts REV_xxxx before MI_xx in Apple instance IDs',
             'WinUSB driver discovery: custom INF pre-staged with PnPUtil and enumerated with SPDIT_COMPATDRIVER',
             'Network driver: Microsoft UsbNcm inbox driver',
+            'Network modes: Direct USB (isolated static IPv4 + built-in DHCP) and Reverse tethering (Windows ICS); select in the UI or with --mode=direct|reverse',
             'Legacy libusb-win32/libusb0 runtime: NOT INCLUDED'
           ) | Set-Content (Join-Path $package 'BUILD-INFO.txt') -Encoding utf8
           Set-Content (Join-Path $package 'THIRD_PARTY_NOTICES.txt') 'Windows Usbccgp, WinUSB, and UsbNcm are Microsoft-provided inbox components. The package contains configuration metadata and INF files only; it contains no Apple driver binary.'

@@ -21,15 +21,34 @@ public sealed class ShareEngine
     private static readonly object LogFileLock = new();
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
     private readonly Dictionary<string, ActiveSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
-    private sealed record ActiveSession(UsbNative.AppleUsbTarget Target, NetworkInterface Adapter, string HostAddress, string PeerAddress, IsolatedDhcpServer Dhcp);
+    private sealed record ActiveSession(UsbNative.AppleUsbTarget Target, NetworkInterface Adapter, ShareMode Mode, string HostAddress, string PeerAddress, IsolatedDhcpServer? Dhcp, string? IcsPublicName);
+    private ShareMode _mode;
     private string AppDir => AppContext.BaseDirectory;
     private string ActivityLogPath => Path.Combine(AppDir, "ActivityLog.txt");
     private string CacheDir => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "iPhoneUsbShare");
 
-    public ShareEngine()
+    /// <summary>
+    /// How the USB Ethernet link is used. Both modes run the same USB bring-up; see <see cref="ShareMode"/>.
+    /// Can only be changed while no session is active.
+    /// </summary>
+    public ShareMode Mode
     {
+        get => _mode;
+        set
+        {
+            if (value == _mode) return;
+            if (_sessions.Count > 0) throw new InvalidOperationException("Stop sharing before changing the mode.");
+            _mode = value;
+            WriteLog($"Share mode: {value.DisplayName()}");
+        }
+    }
+
+    public ShareEngine(ShareMode mode = ShareMode.DirectUsb)
+    {
+        _mode = mode;
         WriteLog("============================================================");
         WriteLog("iPhoneUsbShare session started");
+        WriteLog($"Share mode: {mode.DisplayName()}");
         WriteLog($"Application directory: {AppDir}");
         WriteLog($"Activity log: {ActivityLogPath}");
     }
@@ -67,11 +86,14 @@ public sealed class ShareEngine
     {
         await WaitUntil(() => UsbNative.EnumerateTargets().Length > 0, 15, "Apple USB devices");
         var targets = UsbNative.EnumerateTargets();
-        for (var index = 0; index < targets.Length && index < HostAddresses.Length; index++)
+        var reverse = _mode == ShareMode.ReverseTethering;
+        // Windows ICS has exactly one private connection, so reverse tethering serves one device at a time.
+        var maxSessions = reverse ? 1 : HostAddresses.Length;
+        for (var index = 0; index < targets.Length && index < HostAddresses.Length && _sessions.Count < maxSessions; index++)
         {
             var target = targets[index];
             if (_sessions.ContainsKey(target.DeviceKey)) continue;
-            var slot = FindFreeSlot();
+            var slot = reverse ? 0 : FindFreeSlot();
             if (slot < 0) break;
             try { await StartCoreAsync(target, slot); }
             catch (Exception ex) { WriteLog($"Apple USB session {target.ParentId} failed: {ex.Message}"); }
@@ -89,10 +111,12 @@ public sealed class ShareEngine
 
     private async Task StartCoreAsync(UsbNative.AppleUsbTarget target, int slot)
     {
-        var hostAddress = HostAddresses[slot];
-        var peerAddress = PeerAddresses[slot];
+        var shareMode = _mode;
         var phone = FindAppleDevice(target.ParentId) ?? throw new InvalidOperationException($"Apple device not found: {target.ParentId}");
-        WriteLog($"Apple device found: {phone.Id} ({phone.Name}); USB slot {slot + 1}, host={hostAddress}, peer={peerAddress}");
+        if (shareMode == ShareMode.ReverseTethering)
+            WriteLog($"Apple device found: {phone.Id} ({phone.Name}); reverse tethering (Windows ICS)");
+        else
+            WriteLog($"Apple device found: {phone.Id} ({phone.Name}); USB slot {slot + 1}, host={HostAddresses[slot]}, peer={PeerAddresses[slot]}");
         DisablePhotoInterfaces();
         var adapter = FindPhoneAdapter(target.ParentId);
         if (adapter is null || adapter.OperationalStatus != OperationalStatus.Up)
@@ -115,12 +139,53 @@ public sealed class ShareEngine
             await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
             adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
         }
+        if (shareMode == ShareMode.ReverseTethering) await StartReverseTetheringAsync(target, adapter);
+        else await StartDirectUsbAsync(target, adapter, slot);
+    }
+
+    // Direct USB: isolated static IPv4 + built-in DHCP lease, no gateway/DNS/ICS.
+    private async Task StartDirectUsbAsync(UsbNative.AppleUsbTarget target, NetworkInterface adapter, int slot)
+    {
+        var hostAddress = HostAddresses[slot];
+        var peerAddress = PeerAddresses[slot];
         await ConfigureStaticNetworkAsync(adapter.Name, hostAddress);
         await WaitUntil(() => HasAddress(adapter.Name, hostAddress), 15, "static USB IPv4 address");
         var dhcp = new IsolatedDhcpServer(WriteLog, hostAddress, peerAddress);
         dhcp.Start();
-        _sessions[target.DeviceKey] = new ActiveSession(target, adapter, hostAddress, peerAddress, dhcp);
+        _sessions[target.DeviceKey] = new ActiveSession(target, adapter, ShareMode.DirectUsb, hostAddress, peerAddress, dhcp, null);
         WriteLog($"Isolated USB network ready: Windows={hostAddress}, iPhone={peerAddress}, mask=255.255.255.0, no gateway, no DNS, no ICS.");
+    }
+
+    // Reverse tethering: Windows ICS shares the PC's uplink with the device's USB Ethernet adapter.
+    // ICS assigns the private side 192.168.137.1 and runs its own DHCP/NAT for the device.
+    private async Task StartReverseTetheringAsync(UsbNative.AppleUsbTarget target, NetworkInterface adapter)
+    {
+        // A previous Direct USB run leaves a static 192.168.99-102.1 address on the adapter; return the
+        // adapter to automatic addressing so ICS can own its configuration.
+        if (HostAddresses.Any(host => HasAddress(adapter.Name, host)))
+        {
+            WriteLog($"Reverse tethering: clearing the Direct USB static address on {adapter.Name} before enabling ICS.");
+            await ResetAdapterToAutomaticAsync(adapter.Name);
+        }
+
+        var publicName = NetworkSharingRecovery.FindPublicConnectionName(adapter.Name)
+            ?? throw new InvalidOperationException("Reverse tethering needs an internet-connected adapter (Wi-Fi preferred) to share, but none with a default gateway is up. Connect this PC to the internet or switch to Direct USB mode.");
+        WriteLog($"Reverse tethering: enabling Windows ICS {publicName} -> {adapter.Name}");
+        var ok = await Task.Run(() => NetworkSharingRecovery.ApplySharingWithFallback(WriteLog, publicName, adapter.Name));
+        if (!ok) throw new InvalidOperationException("Windows Internet Connection Sharing could not be enabled. See ActivityLog.txt ([ICS] lines).");
+
+        _sessions[target.DeviceKey] = new ActiveSession(target, adapter, ShareMode.ReverseTethering, "", "", null, publicName);
+        WriteLog($"Reverse tethering ready: {publicName} shared to {adapter.Name} via Windows ICS (192.168.137.x).");
+    }
+
+    private void ReleaseSession(ActiveSession session)
+    {
+        try { session.Dhcp?.Dispose(); } catch { }
+        if (session.Mode == ShareMode.ReverseTethering)
+        {
+            try { NetworkSharingRecovery.DisableSharing(WriteLog, session.IcsPublicName, session.Adapter.Name); }
+            catch (Exception ex) { WriteLog($"ICS cleanup {session.Adapter.Name}: {ex.Message}"); }
+        }
     }
 
     public async Task StopAsync()
@@ -128,13 +193,16 @@ public sealed class ShareEngine
         await _startStopLock.WaitAsync();
         try
         {
+            var hadReverse = _sessions.Values.Any(session => session.Mode == ShareMode.ReverseTethering);
             foreach (var session in _sessions.Values.ToArray())
             {
-                try { session.Dhcp.Dispose(); } catch { }
+                ReleaseSession(session);
                 try { var phone = FindAppleDevice(session.Target.ParentId); if (phone is not null) SetConfig(phone.Id, SafeIndexValue, "0"); } catch (Exception ex) { WriteLog($"Stop cleanup {session.Target.ParentId}: {ex.Message}"); }
             }
             _sessions.Clear();
-            WriteLog("Sharing stopped; Apple USB configurations restored. No ICS/NAT/gateway/DNS state is modified.");
+            WriteLog(hadReverse
+                ? "Sharing stopped; Windows ICS disabled and Apple USB configurations restored."
+                : "Sharing stopped; Apple USB configurations restored. No ICS/NAT/gateway/DNS state is modified.");
         }
         finally { _startStopLock.Release(); }
     }
@@ -166,10 +234,18 @@ public sealed class ShareEngine
         sb.AppendLine($"USB mode: {await UsbNative.GetModeAsync() ?? "unreachable"}");
         sb.AppendLine($"USB Ethernet: {a?.Name ?? "not present"} [{a?.OperationalStatus.ToString() ?? "—"}]");
         sb.AppendLine($"Windows USB address: {(a is null ? "—" : FindAddress(a.Name) ?? "none")}");
+        sb.AppendLine($"Share mode: {_mode.DisplayName()}");
         foreach (var session in _sessions.Values)
-            sb.AppendLine($"USB slot: {session.HostAddress} -> {session.PeerAddress} | adapter={session.Adapter.Name} | peer={(await PingPeerAsync(session.PeerAddress, 3000) ? "reachable" : "not reachable")}");
-        sb.AppendLine($"Active USB sessions: {_sessions.Count}/4");
-        sb.AppendLine("Network mode: isolated static IPv4; no ICS/NAT/gateway/DNS");
+        {
+            if (session.Mode == ShareMode.ReverseTethering)
+                sb.AppendLine($"ICS: {session.IcsPublicName} -> {session.Adapter.Name}");
+            else
+                sb.AppendLine($"USB slot: {session.HostAddress} -> {session.PeerAddress} | adapter={session.Adapter.Name} | peer={(await PingPeerAsync(session.PeerAddress, 3000) ? "reachable" : "not reachable")}");
+        }
+        sb.AppendLine($"Active USB sessions: {_sessions.Count}/{(_mode == ShareMode.ReverseTethering ? 1 : 4)}");
+        sb.AppendLine(_mode == ShareMode.ReverseTethering
+            ? "Network mode: reverse tethering via Windows ICS (NAT, 192.168.137.x)"
+            : "Network mode: isolated static IPv4; no ICS/NAT/gateway/DNS");
         WriteLog("Diagnostics result: " + sb.ToString().Replace(Environment.NewLine, " | ").Trim());
         return sb.ToString();
     }
@@ -564,6 +640,17 @@ public sealed class ShareEngine
             WriteStaticLog($"netsh DNS cleanup returned {dns.ExitCode}: {dns.Error}");
     }
 
+    private static async Task ResetAdapterToAutomaticAsync(string adapterName)
+    {
+        var address = RunAllowRestart("netsh.exe", $"interface ipv4 set address name=\\\"{adapterName}\\\" source=dhcp");
+        if (address.ExitCode != 0)
+            WriteStaticLog($"netsh address reset to DHCP returned {address.ExitCode}: {address.Error}");
+        var dns = RunAllowRestart("netsh.exe", $"interface ipv4 set dnsservers name=\\\"{adapterName}\\\" source=dhcp");
+        if (dns.ExitCode != 0)
+            WriteStaticLog($"netsh DNS reset to DHCP returned {dns.ExitCode}: {dns.Error}");
+        await Task.Delay(1000);
+    }
+
     private static bool HasAddress(string adapterName, string address) =>
         FindAddresses(adapterName).Any(a => a.Equals(address, StringComparison.OrdinalIgnoreCase));
 
@@ -596,7 +683,7 @@ public sealed class ShareEngine
         {
             var session = _sessions[key];
             if (FindAppleDevice(session.Target.ParentId) is not null) continue;
-            try { session.Dhcp.Dispose(); } catch { }
+            ReleaseSession(session);
             _sessions.Remove(key);
             WriteLog($"Apple USB device removed; session {key} cleaned up.");
         }

@@ -23,7 +23,18 @@ WinUSB control-transfer, and Internet Connection Sharing operations itself.
 8. Reads live USB descriptors through WinUSB and identifies the tethering CDC-NCM control interface by its interrupt-IN notification endpoint.
 9. Rejects the second CDC-NCM-like RemoteXPC function when it has no interrupt notification endpoint.
 10. Selects Microsoft's `UsbNcm` driver on the descriptor-identified NCM child.
-11. Enables Windows ICS from Wi-Fi → iPhone/iPad USB Ethernet.
+11. Applies the selected **mode** (below) to the USB Ethernet adapter: either an isolated Direct USB link, or Windows ICS reverse tethering from this PC's Wi-Fi → iPhone/iPad USB Ethernet.
+
+## Modes
+
+Steps 1–10 (WinUSB control path, Apple mode switch, descriptor-based NCM selection, Microsoft `UsbNcm` bind) are identical in both modes. The mode only decides how the resulting USB Ethernet adapter is configured. Pick it in the **Mode** card of the main window (locked while a session is starting or running; the choice is remembered in `%ProgramData%\iPhoneUsbShare\mode.txt`).
+
+| Mode | What it does | Devices |
+| --- | --- | --- |
+| **Direct USB** (default) | Isolated point-to-point link: static IPv4 on the PC (`192.168.99.1`, `.100.1`, `.101.1`, `.102.1`), built-in DHCP server leasing the device a fixed peer address. No gateway, no DNS, no ICS/NAT. Windows sharing state is never modified. | up to 4 |
+| **Reverse tethering** | Windows Internet Connection Sharing from this PC's uplink (Wi-Fi preferred, otherwise the adapter that has a default gateway) to the device's USB Ethernet adapter (`192.168.137.x`). The device uses this PC's internet. ICS is disabled again on Stop or when the device is unplugged. | 1 (ICS has a single private connection) |
+
+Command-line: `--mode=direct` or `--mode=reverse` (also accepts `direct-usb`, `reverse-tethering`, `ics`). An explicit `--mode=` overrides the saved selection. In headless launches (`--hidden --stop-event=<name>`, used by DYSEKT) the default is **Direct USB** regardless of the saved GUI selection, so a headless start never turns on internet sharing unless `--mode=reverse` is passed. An unknown `--mode=` value aborts startup instead of guessing.
 
 ## USB control path
 

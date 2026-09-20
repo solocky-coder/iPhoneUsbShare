@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Management;
 using System.Net.NetworkInformation;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Threading;
@@ -22,15 +23,22 @@ internal static class NetworkSharingRecovery
         return false;
     }
 
-    public static bool ApplySharingWithFallback(Action<string> log)
+    /// <summary>
+    /// Enables Windows ICS from <paramref name="publicName"/> (the uplink) to
+    /// <paramref name="privateName"/> (the device's USB Ethernet adapter).
+    /// When a name is omitted it is auto-detected as before (first Wi-Fi /
+    /// first Apple-or-NCM Ethernet adapter); the engine always passes both so
+    /// an unrelated wired adapter can never become the ICS private side.
+    /// </summary>
+    public static bool ApplySharingWithFallback(Action<string> log, string? publicName = null, string? privateName = null)
     {
         const int maxAttempts = 2;
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                var wifi = FindWifiName();
-                var ethernet = FindPhoneEthernetName();
+                var wifi = publicName ?? FindWifiName();
+                var ethernet = privateName ?? FindPhoneEthernetName();
                 if (wifi is null || ethernet is null)
                 {
                     log($"[ICS] Recovery could not identify Wi-Fi/USB Ethernet: Wi-Fi={wifi ?? "none"}, Ethernet={ethernet ?? "none"}");
@@ -67,7 +75,10 @@ internal static class NetworkSharingRecovery
         return false;
     }
 
-    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName)
+    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName) =>
+        RunOnSta(() => ExecuteNativeIcsBindingCore(publicConnectionName, privateConnectionName));
+
+    private static void ExecuteNativeIcsBindingCore(string publicConnectionName, string privateConnectionName)
     {
         var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
             ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
@@ -93,6 +104,95 @@ internal static class NetworkSharingRecovery
 
         publicCfg.EnableSharing(0);
         privateCfg.EnableSharing(1);
+    }
+
+    /// <summary>
+    /// Turns ICS off on the named connections (the uplink and the device's USB
+    /// Ethernet adapter). Connections that no longer exist (device unplugged)
+    /// are simply not found and skipped.
+    /// </summary>
+    public static void DisableSharing(Action<string> log, params string?[] connectionNames)
+    {
+        var names = connectionNames
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Select(n => n!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (names.Count == 0) return;
+
+        try
+        {
+            RunOnSta(() =>
+            {
+                var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
+                    ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
+                dynamic mgr = Activator.CreateInstance(mgrType)!;
+                foreach (var connection in mgr.EnumEveryConnection())
+                {
+                    dynamic props = mgr.NetConnectionProps(connection);
+                    var name = (string)props.Name;
+                    if (!names.Contains(name)) continue;
+                    dynamic cfg = mgr.INetSharingConfigurationForINetConnection(connection);
+                    try
+                    {
+                        if ((bool)cfg.SharingEnabled)
+                        {
+                            cfg.DisableSharing();
+                            log($"[ICS] Disabled sharing on {name}.");
+                        }
+                    }
+                    catch (Exception ex) { log($"[ICS] Could not disable sharing on {name}: {ex.GetType().Name}: {ex.Message}"); }
+                }
+            });
+        }
+        catch (Exception ex) { log($"[ICS] Disable failed: {ex.GetType().Name}: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// Picks the connection to share: an up, non-loopback/tunnel adapter that has
+    /// an IPv4 default gateway (i.e. actually reaches the internet), other than the
+    /// device's own adapter. Wi-Fi is preferred, matching the documented behaviour.
+    /// </summary>
+    internal static string? FindPublicConnectionName(string phoneAdapterName)
+    {
+        var uplinks = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Tunnel &&
+                        !n.Name.Equals(phoneAdapterName, StringComparison.OrdinalIgnoreCase) &&
+                        HasIpv4Gateway(n))
+            .ToList();
+        return (uplinks.FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                ?? uplinks.FirstOrDefault())?.Name;
+    }
+
+    private static bool HasIpv4Gateway(NetworkInterface nic)
+    {
+        try
+        {
+            return nic.GetIPProperties().GatewayAddresses.Any(g =>
+                g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                !g.Address.Equals(System.Net.IPAddress.Any));
+        }
+        catch { return false; }
+    }
+
+    // HNetCfg.HNetShare is an apartment-threaded COM object. Callers of the engine
+    // may be on the WPF UI thread or a thread-pool (MTA) thread, so all ICS COM work
+    // runs on its own short-lived STA thread; exceptions (including COMException,
+    // which ApplySharingWithFallback matches on) are rethrown with their type intact.
+    private static void RunOnSta(Action work)
+    {
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            try { work(); }
+            catch (Exception ex) { error = ex; }
+        })
+        { IsBackground = true, Name = "ICS-STA" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (error is not null) ExceptionDispatchInfo.Capture(error).Throw();
     }
 
     private static void ResetSharingServices(Action<string> log)

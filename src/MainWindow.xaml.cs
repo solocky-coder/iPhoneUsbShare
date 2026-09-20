@@ -9,20 +9,27 @@ namespace iPhoneUsbShare;
 
 public partial class MainWindow : Window
 {
-    private readonly ShareEngine _engine = new();
+    private readonly ShareEngine _engine;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private bool _sharing;
     private bool _autoStarting;
     private bool _autoStartArmed = true;
+    private bool _syncingMode;
     private HwndSource? _hwndSource;
 
     private const int WM_DEVICECHANGE = 0x0219;
     private const int DBT_DEVICEARRIVAL = 0x8000;
     private const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
 
-    public MainWindow()
+    /// <param name="modeOverride">Explicit --mode= from the command line; otherwise the last saved selection (Direct USB by default).</param>
+    public MainWindow(ShareMode? modeOverride = null)
     {
+        _engine = new ShareEngine(modeOverride ?? ShareModes.LoadSaved());
         InitializeComponent();
+        SyncModeRadios(_engine.Mode);
+        // The mode can only change while idle: the Start button is disabled while a
+        // session is starting or running, so the selector follows it.
+        StartButton.IsEnabledChanged += (_, _) => ModePanel.IsEnabled = StartButton.IsEnabled;
         _engine.Log += (_, e) =>
         {
             Dispatcher.Invoke(() =>
@@ -52,6 +59,33 @@ public partial class MainWindow : Window
             _timer.Stop();
             _engine.WriteLog("iPhoneUsbShare session ended");
         };
+    }
+
+    private void SyncModeRadios(ShareMode mode)
+    {
+        _syncingMode = true;
+        try
+        {
+            DirectModeRadio.IsChecked = mode == ShareMode.DirectUsb;
+            ReverseModeRadio.IsChecked = mode == ShareMode.ReverseTethering;
+        }
+        finally { _syncingMode = false; }
+    }
+
+    private void ModeRadio_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_syncingMode) return;
+        var selected = ReverseModeRadio.IsChecked == true ? ShareMode.ReverseTethering : ShareMode.DirectUsb;
+        try
+        {
+            _engine.Mode = selected;
+            ShareModes.Save(selected);
+        }
+        catch (Exception ex)
+        {
+            Log($"Mode change refused: {ex.Message}");
+            SyncModeRadios(_engine.Mode);
+        }
     }
 
     private async Task RefreshAsync()

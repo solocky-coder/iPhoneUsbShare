@@ -16,11 +16,12 @@ namespace iPhoneUsbShare;
 internal sealed class HiddenHostService
 {
     private readonly string _stopEventName;
-    private readonly ShareEngine _engine = new();
+    private readonly ShareEngine _engine;
 
-    public HiddenHostService(string stopEventName)
+    public HiddenHostService(string stopEventName, ShareMode mode = ShareMode.DirectUsb)
     {
         _stopEventName = stopEventName;
+        _engine = new ShareEngine(mode);
     }
 
     public async Task RunAsync()
