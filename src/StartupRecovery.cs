@@ -1,3 +1,4 @@
+using Microsoft.Win32;
 using System.Diagnostics;
 using System.Management;
 using System.Runtime.InteropServices;
@@ -29,6 +30,11 @@ internal static class StartupRecovery
             log("Startup recovery: Apple MI_00 is already enumerated.");
             return;
         }
+
+        // MI_00 is missing. A failed or interrupted NCM attempt can leave usbccgp pointed at a
+        // configuration that does not enumerate (no children at all); put the safe selection back
+        // before any re-enumeration so the rebuilt stack comes up with MI_00 again.
+        RestoreSafeUsbccgpConfiguration(parent, log);
 
         // A reboot can leave usbccgp itself stuck in Code 10 while the composite
         // parent has no child PDOs. In that state CM_Reenumerate_DevNode and
@@ -112,6 +118,23 @@ internal static class StartupRecovery
 
         log("Startup recovery: MI_00 remains absent after targeted re-enumeration and one controlled restart; no further automatic device-stack mutations will be attempted.");
         log("Startup recovery: reconnect the Apple device by USB if MI_00 remains absent.");
+    }
+
+    private static void RestoreSafeUsbccgpConfiguration(string parentId, Action<string> log)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{parentId}\Device Parameters", writable: true);
+            if (key is null) return;
+            var original = key.GetValue("OriginalConfigurationValue") as int?;
+            var alt = key.GetValue("AltConfigurationValue") as int?;
+            // Safe pair = ShareEngine.SafeIndexValue / "0" (index 2: PTP + usbmux, WinUSB on MI_00).
+            if (original == 2 && alt == 0) return;
+            key.SetValue("OriginalConfigurationValue", 2, RegistryValueKind.DWord);
+            key.SetValue("AltConfigurationValue", 0, RegistryValueKind.DWord);
+            log($"Startup recovery: usbccgp configuration selection was {original?.ToString() ?? "unset"}/{alt?.ToString() ?? "unset"}; restored the safe 2/0 before re-enumeration.");
+        }
+        catch (Exception ex) { log($"Startup recovery: could not restore the safe usbccgp configuration: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     private static int GetCompositeConfigManagerError(string parentId)
