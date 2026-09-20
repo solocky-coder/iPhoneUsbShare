@@ -684,5 +684,18 @@ public sealed class ShareEngine
 
     public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx, int SessionCount);
     private readonly record struct CommandResult(int ExitCode, string Output, string Error);
-    private sealed record PnpDevice(string Id, string Name);
+    private sealed record PnpDevice(string Id, string Name)
+    {
+        public string ParentId
+        {
+            get
+            {
+                var slash = Id.LastIndexOf('\\\\');
+                if (slash < 0) return Id;
+                var token = Id[(slash + 1)..];
+                var mi = token.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
+                return mi < 0 ? Id : Id[..(slash + 1)] + token[..mi];
+            }
+        }
+    };
 }
