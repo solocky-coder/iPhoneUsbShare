@@ -337,6 +337,15 @@ public sealed class ShareEngine
 
         var appleChildren = FindPnP("USB\\VID_05AC&PID_", null).Where(d => IsChildOfAppleParent(d.Id, target.ParentId)).ToList();
         var targets = controlInterfaces.Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n)).Where(d => d is not null).Cast<PnpDevice>().ToList();
+        // usbccgp publishes the MI_xx children a moment after the composite restarts; give it time
+        // before resorting to a forced re-enumeration.
+        for (var attempt = 0; attempt < 20 && targets.Count == 0; attempt++)
+        {
+            if (attempt == 0) WriteLog("Waiting for usbccgp to publish the NCM child PDO…");
+            await Task.Delay(500);
+            appleChildren = FindPnP("USB\\VID_05AC&PID_", null).Where(d => IsChildOfAppleParent(d.Id, target.ParentId)).ToList();
+            targets = controlInterfaces.Select(n => appleChildren.FirstOrDefault(d => TryGetInterfaceNumber(d.Id, out var mi) && mi == n)).Where(d => d is not null).Cast<PnpDevice>().ToList();
+        }
         if (targets.Count == 0)
         {
             WriteLog("NCM child PDOs are missing; forcing targeted usbccgp devnode re-enumeration before driver replacement.");
@@ -791,11 +800,24 @@ public sealed class ShareEngine
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
     }
 
-    private static bool IsChildOfAppleParent(string childId, string parentId)
+    // A composite child's instance ID is not derived from the parent's serial:
+    //   parent USB\VID_05AC&PID_12AB\6891C03E...            (serial)
+    //   child  USB\VID_05AC&PID_12AB&REV_0503&MI_02\6&2F845C2&1D&0002
+    // so the two are related through the VID/PID hardware segment, not the trailing token.
+    // (The old trailing-token comparison never matched, so an MI_02 that was really present
+    // was reported as missing; UsbNative got the same fix earlier.)
+    private static bool IsChildOfAppleParent(string childId, string parentId) =>
+        string.Equals(HardwareSegment(childId), HardwareSegment(parentId), StringComparison.OrdinalIgnoreCase);
+
+    private static string HardwareSegment(string id)
     {
-        var childToken = childId.LastIndexOf('\\') >= 0 ? childId[(childId.LastIndexOf('\\') + 1)..] : childId;
-        var parentToken = parentId.LastIndexOf('\\') >= 0 ? parentId[(parentId.LastIndexOf('\\') + 1)..] : parentId;
-        return childToken.StartsWith(parentToken + "&", StringComparison.OrdinalIgnoreCase) || childToken.Equals(parentToken, StringComparison.OrdinalIgnoreCase);
+        var parts = id.Split('\\');
+        var hardware = parts.Length > 1 ? parts[1] : id;
+        var mi = hardware.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
+        if (mi >= 0) hardware = hardware[..mi];
+        var rev = hardware.IndexOf("&REV_", StringComparison.OrdinalIgnoreCase);
+        if (rev >= 0) hardware = hardware[..rev];
+        return hardware;
     }
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
