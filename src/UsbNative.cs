@@ -37,6 +37,7 @@ internal static class UsbNative
     internal sealed record AppleUsbTarget(string ParentId, string ControlInterfaceId, string? WinUsbPath)
     {
         public string DeviceKey => ParentId;
+        public string Id => ParentId;
     }
 
     public static AppleUsbTarget[] EnumerateTargets()
