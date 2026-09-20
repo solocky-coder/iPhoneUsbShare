@@ -153,7 +153,7 @@ public partial class MainWindow : Window
         {
             if (_sharing)
             {
-                Log($"Apple USB device detected ({reason}); reconciling additional USB sessions…");
+                Log("Apple USB device detected; reconciling additional USB sessions…");
                 await _engine.StartAsync();
                 await RefreshAsync();
                 return;
