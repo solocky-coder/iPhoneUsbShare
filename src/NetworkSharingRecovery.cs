@@ -46,7 +46,8 @@ internal static class NetworkSharingRecovery
                 }
 
                 log($"[ICS] Recovery attempt {attempt}/{maxAttempts}: {wifi} -> {ethernet}");
-                ExecuteNativeIcsBinding(wifi, ethernet);
+                if (attempt == 1) EnsureIcsServices(log);
+                ExecuteNativeIcsBinding(wifi, ethernet, log);
                 log("[ICS] Recovery binding completed.");
 
                 if (WaitForLease(ethernet, 15))
@@ -75,10 +76,44 @@ internal static class NetworkSharingRecovery
         return false;
     }
 
-    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName) =>
-        RunOnSta(() => ExecuteNativeIcsBindingCore(publicConnectionName, privateConnectionName));
+    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName, Action<string> log) =>
+        RunOnSta(() => ExecuteNativeIcsBindingCore(publicConnectionName, privateConnectionName, log));
 
-    private static void ExecuteNativeIcsBindingCore(string publicConnectionName, string privateConnectionName)
+    // 0x80040201 (EVENT_E_ALL_SUBSCRIBERS_FAILED) from HNetCfg usually means one of the services ICS
+    // relies on (Windows Firewall / Base Filtering Engine, Network Connections, network list) is not
+    // running. Log their state and start the firewall pair if they are merely stopped.
+    private static readonly (string Name, string Label, bool TryStart)[] IcsServices =
+    {
+        ("BFE", "Base Filtering Engine", true),
+        ("MpsSvc", "Windows Defender Firewall", true),
+        ("SharedAccess", "Internet Connection Sharing", false),
+        ("Netman", "Network Connections", false),
+        ("NlaSvc", "Network Location Awareness", false),
+        ("netprofm", "Network List Service", false),
+    };
+
+    private static void EnsureIcsServices(Action<string> log)
+    {
+        foreach (var (name, label, tryStart) in IcsServices)
+        {
+            try
+            {
+                using var sc = new ServiceController(name);
+                var status = sc.Status;
+                var startType = sc.StartType;
+                log($"[ICS] Service {name} ({label}): {status}, start type {startType}");
+                if (tryStart && status == ServiceControllerStatus.Stopped && startType != ServiceStartMode.Disabled)
+                {
+                    sc.Start();
+                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(10));
+                    log($"[ICS] Started {name}.");
+                }
+            }
+            catch (Exception ex) { log($"[ICS] Service {name} check failed: {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    private static void ExecuteNativeIcsBindingCore(string publicConnectionName, string privateConnectionName, Action<string> log)
     {
         var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
             ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
@@ -90,6 +125,7 @@ internal static class NetworkSharingRecovery
         {
             dynamic props = mgr.NetConnectionProps(connection);
             var name = (string)props.Name;
+            try { log($"[ICS] Connection: {name} | device={(string)props.DeviceName} | status={(int)props.Status}"); } catch { }
             if (name.Equals(publicConnectionName, StringComparison.OrdinalIgnoreCase))
                 publicCfg = mgr.INetSharingConfigurationForINetConnection(connection);
             else if (name.Equals(privateConnectionName, StringComparison.OrdinalIgnoreCase))
@@ -99,11 +135,15 @@ internal static class NetworkSharingRecovery
         if (publicCfg is null || privateCfg is null)
             throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
 
-        try { if ((bool)publicCfg.SharingEnabled) publicCfg.DisableSharing(); } catch { }
-        try { if ((bool)privateCfg.SharingEnabled) privateCfg.DisableSharing(); } catch { }
+        try { if ((bool)publicCfg.SharingEnabled) { log($"[ICS] Clearing existing sharing on {publicConnectionName}."); publicCfg.DisableSharing(); } }
+        catch (Exception ex) { log($"[ICS] DisableSharing({publicConnectionName}) failed: {ex.GetType().Name}: {ex.Message}"); }
+        try { if ((bool)privateCfg.SharingEnabled) { log($"[ICS] Clearing existing sharing on {privateConnectionName}."); privateCfg.DisableSharing(); } }
+        catch (Exception ex) { log($"[ICS] DisableSharing({privateConnectionName}) failed: {ex.GetType().Name}: {ex.Message}"); }
 
-        publicCfg.EnableSharing(0);
-        privateCfg.EnableSharing(1);
+        try { publicCfg.EnableSharing(0); }
+        catch (Exception ex) { log($"[ICS] EnableSharing(public) on {publicConnectionName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
+        try { privateCfg.EnableSharing(1); }
+        catch (Exception ex) { log($"[ICS] EnableSharing(private) on {privateConnectionName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
     }
 
     /// <summary>

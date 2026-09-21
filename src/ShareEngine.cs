@@ -196,6 +196,9 @@ public sealed class ShareEngine
         var peerAddress = PeerAddresses[slot];
         await ConfigureStaticNetworkAsync(adapter.Name, hostAddress);
         await WaitUntil(() => HasAddress(adapter.Name, hostAddress), 15, "static USB IPv4 address");
+        // Until duplicate-address detection finishes the address cannot be bound; wait for "preferred".
+        try { await WaitUntil(() => IsAddressPreferred(adapter.Name, hostAddress), 8, "static USB IPv4 address to become preferred"); }
+        catch (TimeoutException ex) { WriteLog($"{ex.Message} Continuing; the DHCP server retries its bind."); }
         var dhcp = new IsolatedDhcpServer(WriteLog, hostAddress, peerAddress);
         dhcp.Start();
         _sessions[target.DeviceKey] = new ActiveSession(target, adapter, ShareMode.DirectUsb, hostAddress, peerAddress, dhcp, null);
@@ -218,7 +221,12 @@ public sealed class ShareEngine
             ?? throw new InvalidOperationException("Reverse tethering needs an internet-connected adapter (Wi-Fi preferred) to share, but none with a default gateway is up. Connect this PC to the internet or switch to Direct USB mode.");
         WriteLog($"Reverse tethering: enabling Windows ICS {publicName} -> {adapter.Name}");
         var ok = await Task.Run(() => NetworkSharingRecovery.ApplySharingWithFallback(WriteLog, publicName, adapter.Name));
-        if (!ok) throw new InvalidOperationException("Windows Internet Connection Sharing could not be enabled. See ActivityLog.txt ([ICS] lines).");
+        if (!ok)
+        {
+            // A half-applied ICS binding (public side enabled, private side not) must not be left behind.
+            await Task.Run(() => NetworkSharingRecovery.DisableSharing(WriteLog, publicName, adapter.Name));
+            throw new InvalidOperationException("Windows Internet Connection Sharing could not be enabled. See ActivityLog.txt ([ICS] lines).");
+        }
 
         _sessions[target.DeviceKey] = new ActiveSession(target, adapter, ShareMode.ReverseTethering, "", "", null, publicName);
         WriteLog($"Reverse tethering ready: {publicName} shared to {adapter.Name} via Windows ICS (192.168.137.x).");
@@ -732,6 +740,17 @@ public sealed class ShareEngine
         if (dns.ExitCode != 0)
             WriteStaticLog($"netsh DNS reset to DHCP returned {dns.ExitCode}: {dns.Error}");
         await Task.Delay(1000);
+    }
+
+    private static bool IsAddressPreferred(string adapterName, string address)
+    {
+        var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName);
+        if (nic is null) return false;
+        foreach (var u in nic.GetIPProperties().UnicastAddresses)
+            if (u.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                u.Address.ToString().Equals(address, StringComparison.OrdinalIgnoreCase))
+                return u.DuplicateAddressDetectionState == DuplicateAddressDetectionState.Preferred;
+        return false;
     }
 
     private static bool HasAddress(string adapterName, string address) =>

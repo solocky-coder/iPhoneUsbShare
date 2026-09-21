@@ -24,15 +24,38 @@ internal sealed class IsolatedDhcpServer : IDisposable
     {
         if (_loop is not null) return;
 
-        _socket = new UdpClient(AddressFamily.InterNetwork);
-        _socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _socket.EnableBroadcast = true;
-
         // DHCPDISCOVER is normally sent from 0.0.0.0:68 to 255.255.255.255:67.
         // Bind UDP/67 to all local IPv4 addresses so Windows can deliver that
         // initial broadcast to us. The Windows Firewall rule below restricts
         // inbound UDP/67 to the isolated NCM host address.
-        _socket.Client.Bind(new IPEndPoint(IPAddress.Parse(_hostAddress), ServerPort));
+        //
+        // A freshly assigned static address is "tentative" for a moment and binding to it
+        // fails with WSAEADDRNOTAVAIL ("The requested address is not valid in its context")
+        // until it becomes preferred, so retry that specific error briefly.
+        var endpoint = new IPEndPoint(IPAddress.Parse(_hostAddress), ServerPort);
+        for (var attempt = 1; ; attempt++)
+        {
+            var socket = new UdpClient(AddressFamily.InterNetwork);
+            try
+            {
+                socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                socket.EnableBroadcast = true;
+                socket.Client.Bind(endpoint);
+                _socket = socket;
+                break;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressNotAvailable && attempt < 10)
+            {
+                socket.Dispose();
+                _log($"DHCP bind to {_hostAddress}:{ServerPort} not ready yet ({ex.Message}); retrying ({attempt}/10)…");
+                Thread.Sleep(500);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
         RunFirewall("add");
 
         _cts = new CancellationTokenSource();
