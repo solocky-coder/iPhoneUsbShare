@@ -52,12 +52,19 @@ internal static class NetworkSharingRecovery
         var recycled = false;
         for (var attempt = 1; ; attempt++)
         {
-            var viaPowerShell = attempt % 2 == 0;
-            log($"[ICS] Enable attempt {attempt} ({(viaPowerShell ? "PowerShell" : "in-process")}): {wifi} -> {ethernet}");
+            // If the device's USB link dropped (the adapter is gone) no amount of retrying can work.
+            if (!NetworkInterface.GetAllNetworkInterfaces().Any(n => n.Name.Equals(ethernet, StringComparison.OrdinalIgnoreCase)))
+            {
+                log($"[ICS] The USB Ethernet adapter \"{ethernet}\" no longer exists (the device's USB network link dropped); stopping.");
+                return false;
+            }
+
+            var (viaPowerShell, strategy) = AttemptPlan[(attempt - 1) % AttemptPlan.Length];
+            log($"[ICS] Enable attempt {attempt} ({(viaPowerShell ? "PowerShell" : "in-process")}, {strategy}): {wifi} -> {ethernet}");
             try
             {
-                if (viaPowerShell) EnableViaPowerShell(wifi, ethernet, log);
-                else ExecuteNativeIcsBinding(wifi, ethernet, log);
+                if (viaPowerShell) EnableViaPowerShell(wifi, ethernet, strategy, log);
+                else ExecuteNativeIcsBinding(wifi, ethernet, log, strategy);
                 log("[ICS] Binding completed.");
 
                 if (WaitForLease(ethernet, 15))
@@ -90,10 +97,21 @@ internal static class NetworkSharingRecovery
 
     private const int IcsRetryBudgetSeconds = 60;
 
+    // Order in which attempts are made (then repeats until the time budget is spent).
+    private static readonly (bool PowerShell, IcsStrategy Strategy)[] AttemptPlan =
+    {
+        (false, IcsStrategy.PublicThenPrivate),
+        (false, IcsStrategy.ResetAllThenPublicThenPrivate),
+        (false, IcsStrategy.PrivateThenPublic),
+        (true, IcsStrategy.PublicThenPrivate),
+        (true, IcsStrategy.PrivateThenPublic),
+    };
+
     // Same HNetCfg calls, made by powershell.exe (STA main thread, its own process). Connection names
     // travel in environment variables so no quoting is needed; the script is passed base64-encoded.
     private const string IcsPowerShellScript = @"
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 try {
   $m = New-Object -ComObject HNetCfg.HNetShare
   $pub = $null; $prv = $null
@@ -105,15 +123,15 @@ try {
   if ($null -eq $pub -or $null -eq $prv) { throw 'ICS did not expose the public and private connections.' }
   if ($pub.SharingEnabled) { $pub.DisableSharing() }
   if ($prv.SharingEnabled) { $prv.DisableSharing() }
-  $pub.EnableSharing(0)
-  $prv.EnableSharing(1)
+  if ($env:ICS_ORDER -eq 'private-first') { $prv.EnableSharing(1); $pub.EnableSharing(0) }
+  else { $pub.EnableSharing(0); $prv.EnableSharing(1) }
 } catch {
   [Console]::Error.WriteLine(('HRESULT=0x{0:X8}: {1}' -f $_.Exception.HResult, $_.Exception.Message))
   exit 1
 }
 ";
 
-    private static void EnableViaPowerShell(string publicName, string privateName, Action<string> log)
+    private static void EnableViaPowerShell(string publicName, string privateName, IcsStrategy strategy, Action<string> log)
     {
         var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(IcsPowerShellScript));
         var psi = new ProcessStartInfo("powershell.exe",
@@ -126,6 +144,7 @@ try {
         };
         psi.Environment["ICS_PUBLIC"] = publicName;
         psi.Environment["ICS_PRIVATE"] = privateName;
+        psi.Environment["ICS_ORDER"] = strategy == IcsStrategy.PrivateThenPublic ? "private-first" : "public-first";
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start powershell.exe.");
         var stdout = process.StandardOutput.ReadToEndAsync();
@@ -135,15 +154,18 @@ try {
             try { process.Kill(true); } catch { }
             throw new System.TimeoutException("The PowerShell ICS helper did not finish within 30 seconds.");
         }
-        var error = stderr.GetAwaiter().GetResult().Trim();
+        var error = string.Join(" ", stderr.GetAwaiter().GetResult()
+            .Split('\n')
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0 && !l.StartsWith("#<", StringComparison.Ordinal) && !l.StartsWith("<Objs", StringComparison.Ordinal)));
         var output = stdout.GetAwaiter().GetResult().Trim();
         if (output.Length > 0) log($"[ICS] PowerShell output: {output}");
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"PowerShell ICS helper exited {process.ExitCode}: {(error.Length > 0 ? error : "no error text")}");
     }
 
-    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName, Action<string> log) =>
-        RunOnSta(() => ExecuteNativeIcsBindingCore(publicConnectionName, privateConnectionName, log));
+    private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName, Action<string> log, IcsStrategy strategy) =>
+        RunOnSta(() => ExecuteNativeIcsBindingCore(publicConnectionName, privateConnectionName, log, strategy));
 
     // 0x80040201 (EVENT_E_ALL_SUBSCRIBERS_FAILED) from HNetCfg usually means one of the services ICS
     // relies on (Windows Firewall / Base Filtering Engine, Network Connections, network list) is not
@@ -179,37 +201,108 @@ try {
         }
     }
 
-    private static void ExecuteNativeIcsBindingCore(string publicConnectionName, string privateConnectionName, Action<string> log)
+    // How one enable attempt is made. Each is a different way of asking HNetCfg for the same result,
+    // because the GUI's "Allow other network users to connect..." works on machines where the plain
+    // public-then-private API sequence fails with 0x80040201.
+    private enum IcsStrategy
+    {
+        /// <summary>Clear our two connections, enable public, then private.</summary>
+        PublicThenPrivate,
+        /// <summary>Clear our two connections, enable private, then public.</summary>
+        PrivateThenPublic,
+        /// <summary>Clear sharing on EVERY connection (stale/other ICS such as a hotspot), wait, re-open the
+        /// ICS manager, then public then private.</summary>
+        ResetAllThenPublicThenPrivate,
+    }
+
+    private sealed class IcsConnections
+    {
+        public object? Public;
+        public object? Private;
+        public readonly List<(string Name, object Cfg, bool Sharing)> All = new();
+    }
+
+    private static IcsConnections ResolveConnections(string publicName, string privateName, Action<string>? verboseLog)
     {
         var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
             ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
         dynamic mgr = Activator.CreateInstance(mgrType)!;
-        dynamic? publicCfg = null;
-        dynamic? privateCfg = null;
-
+        var result = new IcsConnections();
         foreach (var connection in mgr.EnumEveryConnection())
         {
             dynamic props = mgr.NetConnectionProps(connection);
             var name = (string)props.Name;
-            try { log($"[ICS] Connection: {name} | device={(string)props.DeviceName} | status={(int)props.Status}"); } catch { }
-            if (name.Equals(publicConnectionName, StringComparison.OrdinalIgnoreCase))
-                publicCfg = mgr.INetSharingConfigurationForINetConnection(connection);
-            else if (name.Equals(privateConnectionName, StringComparison.OrdinalIgnoreCase))
-                privateCfg = mgr.INetSharingConfigurationForINetConnection(connection);
+            object? cfgObject = null;
+            var sharing = false;
+            var sharingType = -1;
+            try
+            {
+                dynamic cfg = mgr.INetSharingConfigurationForINetConnection(connection);
+                cfgObject = cfg;
+                sharing = (bool)cfg.SharingEnabled;
+                if (sharing) sharingType = (int)cfg.SharingConnectionType;
+            }
+            catch { }
+            if (verboseLog is not null)
+            {
+                string device = "?", status = "?";
+                try { device = (string)props.DeviceName; status = ((int)props.Status).ToString(); } catch { }
+                verboseLog($"[ICS] Connection: {name} | device={device} | status={status} | sharing={(sharing ? (sharingType == 0 ? "PUBLIC" : sharingType == 1 ? "PRIVATE" : "on") : "off")}");
+            }
+            if (cfgObject is null) continue;
+            result.All.Add((name, cfgObject, sharing));
+            if (name.Equals(publicName, StringComparison.OrdinalIgnoreCase)) result.Public = cfgObject;
+            else if (name.Equals(privateName, StringComparison.OrdinalIgnoreCase)) result.Private = cfgObject;
+        }
+        return result;
+    }
+
+    private static void ExecuteNativeIcsBindingCore(string publicName, string privateName, Action<string> log, IcsStrategy strategy)
+    {
+        log($"[ICS] Strategy: {strategy}");
+        var state = ResolveConnections(publicName, privateName, log);
+        if (state.Public is null || state.Private is null)
+            throw new InvalidOperationException($"Windows ICS did not expose {(state.Public is null ? publicName : "")}{(state.Public is null && state.Private is null ? " and " : "")}{(state.Private is null ? privateName : "")}.");
+
+        if (strategy == IcsStrategy.ResetAllThenPublicThenPrivate)
+        {
+            foreach (var (name, cfg, sharing) in state.All.Where(c => c.Sharing))
+            {
+                try { ((dynamic)cfg).DisableSharing(); log($"[ICS] Cleared sharing on {name}."); }
+                catch (Exception ex) { log($"[ICS] Could not clear sharing on {name}: {ex.GetType().Name}: {ex.Message}"); }
+            }
+            Thread.Sleep(2500);
+            state = ResolveConnections(publicName, privateName, null);
+            if (state.Public is null || state.Private is null)
+                throw new InvalidOperationException("Windows ICS lost the Wi-Fi/USB Ethernet connection after clearing sharing.");
+        }
+        else
+        {
+            foreach (var (name, cfg, sharing) in state.All.Where(c => c.Sharing &&
+                         (c.Name.Equals(publicName, StringComparison.OrdinalIgnoreCase) || c.Name.Equals(privateName, StringComparison.OrdinalIgnoreCase))))
+            {
+                try { ((dynamic)cfg).DisableSharing(); log($"[ICS] Cleared existing sharing on {name}."); }
+                catch (Exception ex) { log($"[ICS] DisableSharing({name}) failed: {ex.GetType().Name}: {ex.Message}"); }
+            }
+            Thread.Sleep(1000);
+            state = ResolveConnections(publicName, privateName, null);
+            if (state.Public is null || state.Private is null)
+                throw new InvalidOperationException("Windows ICS lost the Wi-Fi/USB Ethernet connection after clearing sharing.");
         }
 
-        if (publicCfg is null || privateCfg is null)
-            throw new InvalidOperationException("Windows ICS did not expose the Wi-Fi and USB Ethernet adapters.");
+        void EnablePublic()
+        {
+            try { ((dynamic)state.Public!).EnableSharing(0); }
+            catch (Exception ex) { log($"[ICS] EnableSharing(public) on {publicName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
+        }
+        void EnablePrivate()
+        {
+            try { ((dynamic)state.Private!).EnableSharing(1); }
+            catch (Exception ex) { log($"[ICS] EnableSharing(private) on {privateName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
+        }
 
-        try { if ((bool)publicCfg.SharingEnabled) { log($"[ICS] Clearing existing sharing on {publicConnectionName}."); publicCfg.DisableSharing(); } }
-        catch (Exception ex) { log($"[ICS] DisableSharing({publicConnectionName}) failed: {ex.GetType().Name}: {ex.Message}"); }
-        try { if ((bool)privateCfg.SharingEnabled) { log($"[ICS] Clearing existing sharing on {privateConnectionName}."); privateCfg.DisableSharing(); } }
-        catch (Exception ex) { log($"[ICS] DisableSharing({privateConnectionName}) failed: {ex.GetType().Name}: {ex.Message}"); }
-
-        try { publicCfg.EnableSharing(0); }
-        catch (Exception ex) { log($"[ICS] EnableSharing(public) on {publicConnectionName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
-        try { privateCfg.EnableSharing(1); }
-        catch (Exception ex) { log($"[ICS] EnableSharing(private) on {privateConnectionName} failed: {ex.GetType().Name} HRESULT=0x{ex.HResult:X8}: {ex.Message}"); throw; }
+        if (strategy == IcsStrategy.PrivateThenPublic) { EnablePrivate(); EnablePublic(); }
+        else { EnablePublic(); EnablePrivate(); }
     }
 
     /// <summary>
