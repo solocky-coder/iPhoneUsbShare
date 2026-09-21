@@ -325,23 +325,38 @@ try {
                 var mgrType = Type.GetTypeFromProgID("HNetCfg.HNetShare")
                     ?? throw new InvalidOperationException("Windows Internet Connection Sharing is unavailable.");
                 dynamic mgr = Activator.CreateInstance(mgrType)!;
+
+                // Phase 1: read the state of our connections without changing anything.
+                var targets = new List<(string Name, object Cfg, bool Sharing, int Type)>();
                 foreach (var connection in mgr.EnumEveryConnection())
                 {
                     dynamic props = mgr.NetConnectionProps(connection);
                     var name = (string)props.Name;
                     if (!names.Contains(name)) continue;
-                    dynamic cfg = mgr.INetSharingConfigurationForINetConnection(connection);
                     try
                     {
-                        if ((bool)cfg.SharingEnabled)
-                        {
-                            cfg.DisableSharing();
-                            log($"[ICS] Disabled sharing on {name}.");
-                        }
+                        dynamic cfg = mgr.INetSharingConfigurationForINetConnection(connection);
+                        var sharing = (bool)cfg.SharingEnabled;
+                        targets.Add((name, (object)cfg, sharing, sharing ? (int)cfg.SharingConnectionType : -1));
                     }
-                    catch (Exception ex) { log($"[ICS] Could not disable sharing on {name}: {ex.GetType().Name}: {ex.Message}"); }
+                    catch (Exception ex) { log($"[ICS] Could not read sharing state of {name}: {ex.GetType().Name}: {ex.Message}"); }
                 }
-            });
+
+                // Phase 2: switching the public side off tears the whole ICS pairing down, and Windows then
+                // reconfigures the private adapter. Do that first and stop touching ICS afterwards (querying
+                // the private connection at that moment is what used to hang). Only private-only leftovers
+                // are cleared individually.
+                foreach (var target in targets.Where(t => t.Sharing).OrderBy(t => t.Type == 0 ? 0 : 1))
+                {
+                    try
+                    {
+                        ((dynamic)target.Cfg).DisableSharing();
+                        log($"[ICS] Disabled sharing on {target.Name}.");
+                    }
+                    catch (Exception ex) { log($"[ICS] Could not disable sharing on {target.Name}: {ex.GetType().Name}: {ex.Message}"); }
+                    if (target.Type == 0) break;
+                }
+            }, timeoutMs: 10000);
         }
         catch (Exception ex) { log($"[ICS] Disable failed: {ex.GetType().Name}: {ex.Message}"); }
     }
@@ -379,7 +394,7 @@ try {
     // may be on the WPF UI thread or a thread-pool (MTA) thread, so all ICS COM work
     // runs on its own short-lived STA thread; exceptions (including COMException,
     // which ApplySharingWithFallback matches on) are rethrown with their type intact.
-    private static void RunOnSta(Action work)
+    private static void RunOnSta(Action work, int timeoutMs = 30000)
     {
         Exception? error = null;
         var thread = new Thread(() =>
@@ -390,7 +405,11 @@ try {
         { IsBackground = true, Name = "ICS-STA" };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
-        thread.Join();
+        // A hung HNetCfg call must never freeze the app (it did: Stop blocked the UI thread for good
+        // right after ICS was switched off). The thread is a background thread, so abandoning it on
+        // timeout cannot keep the process alive.
+        if (!thread.Join(timeoutMs))
+            throw new System.TimeoutException($"Windows ICS did not respond within {timeoutMs / 1000} s.");
         if (error is not null) ExceptionDispatchInfo.Capture(error).Throw();
     }
 

@@ -1,4 +1,5 @@
 using Microsoft.Win32;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Management;
 using System.Net;
@@ -28,7 +29,8 @@ public sealed class ShareEngine
     private static readonly string[] PeerAddresses = { "192.168.99.2", "192.168.100.2", "192.168.101.2", "192.168.102.2" };
     private static readonly object LogFileLock = new();
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
-    private readonly Dictionary<string, ActiveSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
+    // Concurrent: teardown runs on a worker thread (ICS/registry calls can block) while the UI timer reads it.
+    private readonly ConcurrentDictionary<string, ActiveSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private sealed record ActiveSession(UsbNative.AppleUsbTarget Target, NetworkInterface Adapter, ShareMode Mode, string HostAddress, string PeerAddress, IsolatedDhcpServer? Dhcp, string? IcsPublicName);
     private ShareMode _mode;
     private string AppDir => AppContext.BaseDirectory;
@@ -245,7 +247,8 @@ public sealed class ShareEngine
     public async Task StopAsync()
     {
         await _startStopLock.WaitAsync();
-        try { StopAllCore(restoreUsbConfiguration: true); }
+        // Teardown makes blocking ICS/registry calls; keep them off the UI thread so the window never freezes.
+        try { await Task.Run(() => StopAllCore(restoreUsbConfiguration: true)); }
         finally { _startStopLock.Release(); }
     }
 
@@ -263,7 +266,7 @@ public sealed class ShareEngine
         {
             if (newMode == _mode) return;
             var wasSharing = _sessions.Count > 0;
-            if (wasSharing) StopAllCore(restoreUsbConfiguration: false);
+            if (wasSharing) await Task.Run(() => StopAllCore(restoreUsbConfiguration: false));
             _mode = newMode;
             WriteLog($"Share mode: {newMode.DisplayName()}");
             if (wasSharing) await StartAllAsync();
@@ -783,10 +786,11 @@ public sealed class ShareEngine
     {
         foreach (var key in _sessions.Keys.ToArray())
         {
-            var session = _sessions[key];
+            if (!_sessions.TryGetValue(key, out var session)) continue;
             if (FindAppleDevice(session.Target.ParentId) is not null) continue;
-            ReleaseSession(session);
-            _sessions.Remove(key);
+            _sessions.TryRemove(key, out _);
+            var removed = session;
+            _ = Task.Run(() => ReleaseSession(removed));   // the device is gone; ICS/DHCP cleanup must not block the UI timer
             WriteLog($"Apple USB device removed; session {key} cleaned up.");
         }
     }

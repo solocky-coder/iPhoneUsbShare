@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Windows.Interop;
@@ -56,6 +57,31 @@ public partial class MainWindow : Window
             _timer.Stop();
             _engine.WriteLog("iPhoneUsbShare session ended");
         };
+    }
+
+    private bool _closeApproved;
+
+    // Closing the window while sharing must tear the network side down (DHCP server / ICS) and put the
+    // USB configuration back; otherwise ICS stays on after the app is gone and the next launch finds the
+    // composite device in a broken state (Code 10). The wait is bounded so a hung teardown can never
+    // trap the user in a frozen window.
+    protected override async void OnClosing(CancelEventArgs e)
+    {
+        base.OnClosing(e);
+        if (_closeApproved) return;
+        e.Cancel = true;
+        IsEnabled = false;
+        _timer.Stop();
+        try
+        {
+            Log("Closing: stopping USB network path…");
+            var stop = _engine.StopAsync();
+            if (await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(20))) != stop)
+                Log("Stop did not finish within 20 s; closing anyway.");
+        }
+        catch (Exception ex) { Log($"Close cleanup: {ex.Message}"); }
+        _closeApproved = true;
+        Close();
     }
 
     private void SyncModeRadios(ShareMode mode)
