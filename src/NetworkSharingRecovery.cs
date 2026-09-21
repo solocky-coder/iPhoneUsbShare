@@ -133,7 +133,7 @@ try {
         if (!process.WaitForExit(30000))
         {
             try { process.Kill(true); } catch { }
-            throw new TimeoutException("The PowerShell ICS helper did not finish within 30 seconds.");
+            throw new System.TimeoutException("The PowerShell ICS helper did not finish within 30 seconds.");
         }
         var error = stderr.GetAwaiter().GetResult().Trim();
         var output = stdout.GetAwaiter().GetResult().Trim();
