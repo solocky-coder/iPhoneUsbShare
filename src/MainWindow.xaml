@@ -6,6 +6,56 @@
         MinWidth="560" MinHeight="640"
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource Bg}">
+    <Window.Resources>
+        <!-- Stop is enabled exactly while a connection is running (or being torn down after a failed
+             stop), so "enabled" is the visual cue: solid red when it can be pressed, flat grey when
+             nothing is running. -->
+        <Style x:Key="StopButtonStyle" TargetType="Button">
+            <Setter Property="FontSize" Value="15"/>
+            <Setter Property="Padding" Value="16,10"/>
+            <Setter Property="Margin" Value="4"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Background" Value="#EEF1F5"/>
+            <Setter Property="BorderBrush" Value="#D0D5DD"/>
+            <Setter Property="Foreground" Value="#98A2B3"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Chrome" CornerRadius="4"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="True">
+                                <Setter Property="Background" Value="#DC2626"/>
+                                <Setter Property="BorderBrush" Value="#B91C1C"/>
+                                <Setter Property="Foreground" Value="White"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                            </Trigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsEnabled" Value="True"/>
+                                    <Condition Property="IsMouseOver" Value="True"/>
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Background" Value="#B91C1C"/>
+                                <Setter Property="BorderBrush" Value="#991B1B"/>
+                            </MultiTrigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsEnabled" Value="True"/>
+                                    <Condition Property="IsPressed" Value="True"/>
+                                </MultiTrigger.Conditions>
+                                <Setter Property="Background" Value="#991B1B"/>
+                            </MultiTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
     <Grid Margin="28">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -103,7 +153,10 @@
         <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
             <Button x:Name="StartButton" Content="Start sharing" Click="StartButton_Click"
                     Background="{StaticResource Accent}" Foreground="White"/>
-            <Button x:Name="StopButton" Content="Stop" Click="StopButton_Click" IsEnabled="False"/>
+            <Button x:Name="StopButton" Click="StopButton_Click" IsEnabled="False" Style="{StaticResource StopButtonStyle}">
+                <!-- Explicit TextBlock: the app-wide TextBlock style would otherwise force dark text on the red. -->
+                <TextBlock Text="Stop" Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"/>
+            </Button>
             <Button Content="Diagnostics" Click="DiagnosticsButton_Click"/>
         </StackPanel>
     </Grid>
