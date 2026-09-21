@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
+using System.Text;
 using System.Threading;
 
 namespace iPhoneUsbShare;
@@ -32,48 +33,113 @@ internal static class NetworkSharingRecovery
     /// </summary>
     public static bool ApplySharingWithFallback(Action<string> log, string? publicName = null, string? privateName = null)
     {
-        const int maxAttempts = 2;
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        var wifi = publicName ?? FindWifiName();
+        var ethernet = privateName ?? FindPhoneEthernetName();
+        if (wifi is null || ethernet is null)
         {
+            log($"[ICS] Could not identify Wi-Fi/USB Ethernet: Wi-Fi={wifi ?? "none"}, Ethernet={ethernet ?? "none"}");
+            return false;
+        }
+
+        EnsureIcsServices(log);
+
+        // A USB adapter that was created a moment ago is often not ready for ICS yet (network
+        // identification, address configuration), and HNetCfg then fails with 0x80040201 even though
+        // sharing it by hand a little later works. So keep retrying for up to a minute, alternating the
+        // in-process COM call with an out-of-process PowerShell call (a different apartment/process
+        // environment), and recycle SharedAccess once if it keeps failing.
+        var deadline = DateTime.UtcNow.AddSeconds(IcsRetryBudgetSeconds);
+        var recycled = false;
+        for (var attempt = 1; ; attempt++)
+        {
+            var viaPowerShell = attempt % 2 == 0;
+            log($"[ICS] Enable attempt {attempt} ({(viaPowerShell ? "PowerShell" : "in-process")}): {wifi} -> {ethernet}");
             try
             {
-                var wifi = publicName ?? FindWifiName();
-                var ethernet = privateName ?? FindPhoneEthernetName();
-                if (wifi is null || ethernet is null)
-                {
-                    log($"[ICS] Recovery could not identify Wi-Fi/USB Ethernet: Wi-Fi={wifi ?? "none"}, Ethernet={ethernet ?? "none"}");
-                    return false;
-                }
-
-                log($"[ICS] Recovery attempt {attempt}/{maxAttempts}: {wifi} -> {ethernet}");
-                if (attempt == 1) EnsureIcsServices(log);
-                ExecuteNativeIcsBinding(wifi, ethernet, log);
-                log("[ICS] Recovery binding completed.");
+                if (viaPowerShell) EnableViaPowerShell(wifi, ethernet, log);
+                else ExecuteNativeIcsBinding(wifi, ethernet, log);
+                log("[ICS] Binding completed.");
 
                 if (WaitForLease(ethernet, 15))
-                {
                     log($"[ICS] DHCP lease detected on {ethernet}.");
-                    return true;
-                }
-
-                log("[ICS] Sharing enabled but no 192.168.137.x lease appeared yet.");
+                else
+                    log("[ICS] Sharing enabled but no 192.168.137.x lease appeared yet.");
                 return true;
-            }
-            catch (COMException comEx) when (unchecked((uint)comEx.ErrorCode) == IcsComError)
-            {
-                log($"[ICS] Caught COM subscriber error 0x80040201 on attempt {attempt}; recycling SharedAccess before retry.");
-                if (attempt >= maxAttempts) return false;
-                ResetSharingServices(log);
-                Thread.Sleep(1500);
             }
             catch (Exception ex)
             {
-                log($"[ICS] Recovery failed: {ex.GetType().Name}: {ex.Message}");
+                var hint = IsSubscriberError(ex) || ex.Message.Contains("80040201", StringComparison.OrdinalIgnoreCase)
+                    ? " (0x80040201: ICS event subscribers failed; the adapter or a required service may not be ready yet)"
+                    : "";
+                log($"[ICS] Attempt {attempt} failed: {ex.GetType().Name}: {ex.Message}{hint}");
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                log($"[ICS] Giving up after {IcsRetryBudgetSeconds}s of retries.");
                 return false;
             }
+            if (!recycled && attempt >= 3)
+            {
+                ResetSharingServices(log);
+                recycled = true;
+            }
+            Thread.Sleep(4000);
         }
+    }
 
-        return false;
+    private const int IcsRetryBudgetSeconds = 60;
+
+    // Same HNetCfg calls, made by powershell.exe (STA main thread, its own process). Connection names
+    // travel in environment variables so no quoting is needed; the script is passed base64-encoded.
+    private const string IcsPowerShellScript = @"
+$ErrorActionPreference = 'Stop'
+try {
+  $m = New-Object -ComObject HNetCfg.HNetShare
+  $pub = $null; $prv = $null
+  foreach ($c in $m.EnumEveryConnection) {
+    $p = $m.NetConnectionProps.Invoke($c)
+    if ($p.Name -eq $env:ICS_PUBLIC) { $pub = $m.INetSharingConfigurationForINetConnection.Invoke($c) }
+    elseif ($p.Name -eq $env:ICS_PRIVATE) { $prv = $m.INetSharingConfigurationForINetConnection.Invoke($c) }
+  }
+  if ($null -eq $pub -or $null -eq $prv) { throw 'ICS did not expose the public and private connections.' }
+  if ($pub.SharingEnabled) { $pub.DisableSharing() }
+  if ($prv.SharingEnabled) { $prv.DisableSharing() }
+  $pub.EnableSharing(0)
+  $prv.EnableSharing(1)
+} catch {
+  [Console]::Error.WriteLine(('HRESULT=0x{0:X8}: {1}' -f $_.Exception.HResult, $_.Exception.Message))
+  exit 1
+}
+";
+
+    private static void EnableViaPowerShell(string publicName, string privateName, Action<string> log)
+    {
+        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(IcsPowerShellScript));
+        var psi = new ProcessStartInfo("powershell.exe",
+            $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -STA -OutputFormat Text -EncodedCommand {encoded}")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.Environment["ICS_PUBLIC"] = publicName;
+        psi.Environment["ICS_PRIVATE"] = privateName;
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start powershell.exe.");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(30000))
+        {
+            try { process.Kill(true); } catch { }
+            throw new TimeoutException("The PowerShell ICS helper did not finish within 30 seconds.");
+        }
+        var error = stderr.GetAwaiter().GetResult().Trim();
+        var output = stdout.GetAwaiter().GetResult().Trim();
+        if (output.Length > 0) log($"[ICS] PowerShell output: {output}");
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"PowerShell ICS helper exited {process.ExitCode}: {(error.Length > 0 ? error : "no error text")}");
     }
 
     private static void ExecuteNativeIcsBinding(string publicConnectionName, string privateConnectionName, Action<string> log) =>
