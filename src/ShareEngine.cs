@@ -812,7 +812,7 @@ public sealed class ShareEngine
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private static NetworkInterface? FindPhoneAdapter(string? parentId = null)
+    private NetworkInterface? FindPhoneAdapter(string? parentId = null)
     {
         var nics = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up &&
