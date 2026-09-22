@@ -136,6 +136,23 @@ public sealed class ShareEngine
         return -1;
     }
 
+    private async Task WaitForDistinctNcmAdapterAsync(UsbNative.AppleUsbTarget target, int slot)
+    {
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            var adapter = FindPhoneAdapter(target.ParentId);
+            if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
+            {
+                var owner = _sessions.Values.FirstOrDefault(s => s.Adapter.Name.Equals(adapter.Name, StringComparison.OrdinalIgnoreCase));
+                if (owner is null || owner.Target.DeviceKey.Equals(target.DeviceKey, StringComparison.OrdinalIgnoreCase))
+                    return;
+                WriteStaticLog($"Apple NCM adapter mapping: REJECTED adapter={adapter.Name} for slot={slot + 1}; already owned by another session.");
+            }
+            await Task.Delay(1000);
+        }
+        throw new InvalidOperationException($"Apple NCM adapter for USB slot {slot + 1} did not become distinct from existing sessions.");
+    }
+
     private async Task StartCoreAsync(UsbNative.AppleUsbTarget target, int slot)
     {
         var shareMode = _mode;
@@ -183,8 +200,8 @@ public sealed class ShareEngine
                     await Task.Delay(1500);
                 }
                 await BindAppleOrInboxNcmDriverAsync(target);
-                await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
-                adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
+                await WaitForDistinctNcmAdapterAsync(target, slot);
+                adapter = FindPhoneAdapter(target) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             }
             catch
             {
