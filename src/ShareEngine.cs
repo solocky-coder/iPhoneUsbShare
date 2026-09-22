@@ -201,7 +201,7 @@ public sealed class ShareEngine
                 }
                 await BindAppleOrInboxNcmDriverAsync(target);
                 await WaitForDistinctNcmAdapterAsync(target, slot);
-                adapter = FindPhoneAdapter(target) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
+                adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             }
             catch
             {
