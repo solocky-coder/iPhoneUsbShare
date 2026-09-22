@@ -858,8 +858,25 @@ public sealed class ShareEngine
         // A target-specific lookup must never fall back to an unrelated Apple NCM
         // adapter. With multiple iPads attached, the first device can otherwise inherit
         // the second device's Ethernet adapter and both sessions end up sharing one NIC.
+        // During NCM bring-up the child mapping can lag behind device re-enumeration.
+        // If exactly one unclaimed Apple/NCM adapter has no Direct USB address yet,
+        // reserve it as this target's bootstrap adapter; never steal a configured NIC.
         if (!string.IsNullOrWhiteSpace(parentId))
+        {
+            var claimed = _sessions.Values
+                .Select(session => session.Adapter.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unclaimed = strong
+                .Where(n => !claimed.Contains(n.Name))
+                .Where(n => !HostAddresses.Any(host => HasAddress(n.Name, host)))
+                .ToList();
+            if (unclaimed.Count == 1)
+            {
+                WriteStaticLog($"Apple NCM adapter mapping: bootstrap candidate for parent={parentId}, adapter={unclaimed[0].Name}");
+                return unclaimed[0];
+            }
             return null;
+        }
 
         if (strong.Count == 1) return strong[0];
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
