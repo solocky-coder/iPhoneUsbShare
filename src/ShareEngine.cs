@@ -107,8 +107,6 @@ public sealed class ShareEngine
         var targets = UsbNative.EnumerateTargets();
         var reverse = _mode == ShareMode.ReverseTethering;
         // Windows ICS has exactly one private connection, so reverse tethering serves one device at a time.
-        // Direct USB deliberately keeps four independent slots, with deterministic ordering so a
-        // reconnect does not randomly move an attached device to another 192.168.99-102 subnet.
         var maxSessions = reverse ? 1 : MaxDirectUsbDevices;
         for (var index = 0; index < targets.Length && _sessions.Count < maxSessions; index++)
         {
@@ -814,7 +812,7 @@ public sealed class ShareEngine
         try { var nic = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(n => n.Name == adapterName); return nic is null ? (0, 0) : (nic.GetIPv4Statistics().BytesReceived, nic.GetIPv4Statistics().BytesSent); } catch { return (0, 0); }
     }
 
-    private NetworkInterface? FindPhoneAdapter(string? parentId = null)
+    private static NetworkInterface? FindPhoneAdapter(string? parentId = null)
     {
         var nics = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up &&
@@ -844,15 +842,6 @@ public sealed class ShareEngine
                         n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
                     if (match is not null)
                     {
-                        var claimedByOtherSession = _sessions.Values.Any(session =>
-                            session.Adapter.Name.Equals(match.Name, StringComparison.OrdinalIgnoreCase) &&
-                            !session.Target.DeviceKey.Equals(parentId, StringComparison.OrdinalIgnoreCase));
-                        if (claimedByOtherSession)
-                        {
-                            WriteStaticLog($"Apple NCM adapter mapping: REJECTED shared adapter={match.Name} for parent={parentId}; adapter is already claimed by another Apple USB session.");
-                            continue;
-                        }
-
                         WriteStaticLog($"Apple NCM adapter mapping: parent={parentId}, child={pnp}, adapter={match.Name}");
                         return match;
                     }
@@ -869,6 +858,9 @@ public sealed class ShareEngine
         // A target-specific lookup must never fall back to an unrelated Apple NCM
         // adapter. With multiple iPads attached, the first device can otherwise inherit
         // the second device's Ethernet adapter and both sessions end up sharing one NIC.
+        if (!string.IsNullOrWhiteSpace(parentId))
+            return null;
+
         if (strong.Count == 1) return strong[0];
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
     }
