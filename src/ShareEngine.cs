@@ -855,6 +855,12 @@ public sealed class ShareEngine
             }
         }
 
+        // A target-specific lookup must never fall back to an unrelated Apple NCM
+        // adapter. With multiple iPads attached, the first device can otherwise inherit
+        // the second device's Ethernet adapter and both sessions end up sharing one NIC.
+        if (!string.IsNullOrWhiteSpace(parentId))
+            return null;
+
         if (strong.Count == 1) return strong[0];
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
     }
