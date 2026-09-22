@@ -110,7 +110,7 @@ public sealed class ShareEngine
         var maxSessions = reverse ? 1 : MaxDirectUsbDevices;
         for (var index = 0; index < targets.Length && _sessions.Count < maxSessions; index++)
         {
-            var target = targets[index];
+            var target = NormalizeTargetParent(targets[index]);
             if (_sessions.ContainsKey(target.DeviceKey)) continue;
             var slot = reverse ? 0 : FindFreeSlot();
             if (slot < 0) break;
@@ -119,6 +119,22 @@ public sealed class ShareEngine
         }
         WriteLog($"Direct USB device limit: {MaxDirectUsbDevices}; discovered={targets.Length}, active={_sessions.Count}.");
         if (_sessions.Count == 0) throw new InvalidOperationException("No Apple USB networking session could be started.");
+    }
+
+    private static UsbNative.AppleUsbTarget NormalizeTargetParent(UsbNative.AppleUsbTarget target)
+    {
+        if (!target.ParentId.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
+            return target;
+
+        var actualParent = FindDeviceParentId(target.ParentId);
+        if (string.IsNullOrWhiteSpace(actualParent))
+        {
+            WriteStaticLog($"Apple USB target normalization: could not resolve composite parent for {target.ParentId}");
+            return target;
+        }
+
+        WriteStaticLog($"Apple USB target normalization: parent={target.ParentId} -> compositeParent={actualParent}");
+        return target with { ParentId = actualParent };
     }
 
     private int FindFreeSlot()
@@ -854,6 +870,12 @@ public sealed class ShareEngine
                 WriteStaticLog($"Apple NCM adapter mapping failed for parent={parentId}: {ex.GetType().Name}: {ex.Message}");
             }
         }
+
+        // A target-specific lookup must never fall back to an unrelated Apple NCM
+        // adapter. With multiple iPads attached, the first device can otherwise inherit
+        // the second device's Ethernet adapter and both sessions end up sharing one NIC.
+        if (!string.IsNullOrWhiteSpace(parentId))
+            return null;
 
         // A target-specific lookup must never fall back to an unrelated Apple NCM
         // adapter. With multiple iPads attached, the first device can otherwise inherit
