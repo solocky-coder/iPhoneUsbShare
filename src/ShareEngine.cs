@@ -25,6 +25,7 @@ public sealed class ShareEngine
     // PTP + usbmux children (the third descriptor), and 5 is out of range (only indices 0-4 exist),
     // which leaves the composite with no children at all.
     private const string NcmAltValue = "2";
+    private const int MaxDirectUsbDevices = 4;
     private static readonly string[] HostAddresses = { "192.168.99.1", "192.168.100.1", "192.168.101.1", "192.168.102.1" };
     private static readonly string[] PeerAddresses = { "192.168.99.2", "192.168.100.2", "192.168.101.2", "192.168.102.2" };
     private static readonly object LogFileLock = new();
@@ -106,8 +107,8 @@ public sealed class ShareEngine
         var targets = UsbNative.EnumerateTargets();
         var reverse = _mode == ShareMode.ReverseTethering;
         // Windows ICS has exactly one private connection, so reverse tethering serves one device at a time.
-        var maxSessions = reverse ? 1 : HostAddresses.Length;
-        for (var index = 0; index < targets.Length && index < HostAddresses.Length && _sessions.Count < maxSessions; index++)
+        var maxSessions = reverse ? 1 : MaxDirectUsbDevices;
+        for (var index = 0; index < targets.Length && _sessions.Count < maxSessions; index++)
         {
             var target = targets[index];
             if (_sessions.ContainsKey(target.DeviceKey)) continue;
@@ -116,6 +117,7 @@ public sealed class ShareEngine
             try { await StartCoreAsync(target, slot); }
             catch (Exception ex) { WriteLog($"Apple USB session {target.ParentId} failed: {ex.Message}"); }
         }
+        WriteLog($"Direct USB device limit: {MaxDirectUsbDevices}; discovered={targets.Length}, active={_sessions.Count}.");
         if (_sessions.Count == 0) throw new InvalidOperationException("No Apple USB networking session could be started.");
     }
 
@@ -335,7 +337,7 @@ public sealed class ShareEngine
             else
                 sb.AppendLine($"USB slot: {session.HostAddress} -> {session.PeerAddress} | adapter={session.Adapter.Name} | peer={(await PingPeerAsync(session.PeerAddress, 3000) ? "reachable" : "not reachable")}");
         }
-        sb.AppendLine($"Active USB sessions: {_sessions.Count}/{(_mode == ShareMode.ReverseTethering ? 1 : 4)}");
+        sb.AppendLine($"Active USB sessions: {_sessions.Count}/{(_mode == ShareMode.ReverseTethering ? 1 : MaxDirectUsbDevices)}");
         sb.AppendLine(_mode == ShareMode.ReverseTethering
             ? "Network mode: reverse tethering via Windows ICS (NAT, 192.168.137.x)"
             : "Network mode: isolated static IPv4; no ICS/NAT/gateway/DNS");
