@@ -104,17 +104,12 @@ public sealed class ShareEngine
     private async Task StartAllAsync()
     {
         await WaitUntil(() => UsbNative.EnumerateTargets().Length > 0, 15, "Apple USB devices");
-        var targets = UsbNative.EnumerateTargets()
-            .OrderBy(t => t.DeviceKey, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var targets = UsbNative.EnumerateTargets();
         var reverse = _mode == ShareMode.ReverseTethering;
         // Windows ICS has exactly one private connection, so reverse tethering serves one device at a time.
         // Direct USB deliberately keeps four independent slots, with deterministic ordering so a
         // reconnect does not randomly move an attached device to another 192.168.99-102 subnet.
         var maxSessions = reverse ? 1 : MaxDirectUsbDevices;
-        WriteLog($"Apple USB targets discovered: {targets.Length}; Direct USB capacity={MaxDirectUsbDevices}.");
-        foreach (var target in targets)
-            WriteLog($"Apple USB target: parent={target.ParentId}, control={target.ControlInterfaceId}, winusb={(target.WinUsbPath is null ? "missing" : "present")}");
         for (var index = 0; index < targets.Length && _sessions.Count < maxSessions; index++)
         {
             var target = targets[index];
@@ -134,23 +129,6 @@ public sealed class ShareEngine
             if (!_sessions.Values.Any(session => session.HostAddress.Equals(HostAddresses[i], StringComparison.OrdinalIgnoreCase)))
                 return i;
         return -1;
-    }
-
-    private async Task WaitForDistinctNcmAdapterAsync(UsbNative.AppleUsbTarget target, int slot)
-    {
-        for (var attempt = 0; attempt < 30; attempt++)
-        {
-            var adapter = FindPhoneAdapter(target.ParentId);
-            if (adapter is not null && adapter.OperationalStatus == OperationalStatus.Up)
-            {
-                var owner = _sessions.Values.FirstOrDefault(s => s.Adapter.Name.Equals(adapter.Name, StringComparison.OrdinalIgnoreCase));
-                if (owner is null || owner.Target.DeviceKey.Equals(target.DeviceKey, StringComparison.OrdinalIgnoreCase))
-                    return;
-                WriteStaticLog($"Apple NCM adapter mapping: REJECTED adapter={adapter.Name} for slot={slot + 1}; already owned by another session.");
-            }
-            await Task.Delay(1000);
-        }
-        throw new InvalidOperationException($"Apple NCM adapter for USB slot {slot + 1} did not become distinct from existing sessions.");
     }
 
     private async Task StartCoreAsync(UsbNative.AppleUsbTarget target, int slot)
@@ -200,7 +178,7 @@ public sealed class ShareEngine
                     await Task.Delay(1500);
                 }
                 await BindAppleOrInboxNcmDriverAsync(target);
-                await WaitForDistinctNcmAdapterAsync(target, slot);
+                await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
                 adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
             }
             catch
@@ -891,26 +869,6 @@ public sealed class ShareEngine
         // A target-specific lookup must never fall back to an unrelated Apple NCM
         // adapter. With multiple iPads attached, the first device can otherwise inherit
         // the second device's Ethernet adapter and both sessions end up sharing one NIC.
-        // During NCM bring-up the child mapping can lag behind device re-enumeration.
-        // If exactly one unclaimed Apple/NCM adapter has no Direct USB address yet,
-        // reserve it as this target's bootstrap adapter; never steal a configured NIC.
-        if (!string.IsNullOrWhiteSpace(parentId))
-        {
-            var claimed = _sessions.Values
-                .Select(session => session.Adapter.Name)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var unclaimed = strong
-                .Where(n => !claimed.Contains(n.Name))
-                .Where(n => !HostAddresses.Any(host => HasAddress(n.Name, host)))
-                .ToList();
-            if (unclaimed.Count == 1)
-            {
-                WriteStaticLog($"Apple NCM adapter mapping: bootstrap candidate for parent={parentId}, adapter={unclaimed[0].Name}");
-                return unclaimed[0];
-            }
-            return null;
-        }
-
         if (strong.Count == 1) return strong[0];
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
     }
