@@ -104,10 +104,17 @@ public sealed class ShareEngine
     private async Task StartAllAsync()
     {
         await WaitUntil(() => UsbNative.EnumerateTargets().Length > 0, 15, "Apple USB devices");
-        var targets = UsbNative.EnumerateTargets();
+        var targets = UsbNative.EnumerateTargets()
+            .OrderBy(t => t.DeviceKey, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         var reverse = _mode == ShareMode.ReverseTethering;
         // Windows ICS has exactly one private connection, so reverse tethering serves one device at a time.
+        // Direct USB deliberately keeps four independent slots, with deterministic ordering so a
+        // reconnect does not randomly move an attached device to another 192.168.99-102 subnet.
         var maxSessions = reverse ? 1 : MaxDirectUsbDevices;
+        WriteLog($"Apple USB targets discovered: {targets.Length}; Direct USB capacity={MaxDirectUsbDevices}.");
+        foreach (var target in targets)
+            WriteLog($"Apple USB target: parent={target.ParentId}, control={target.ControlInterfaceId}, winusb={(target.WinUsbPath is null ? "missing" : "present")}");
         for (var index = 0; index < targets.Length && _sessions.Count < maxSessions; index++)
         {
             var target = targets[index];
@@ -842,6 +849,15 @@ public sealed class ShareEngine
                         n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
                     if (match is not null)
                     {
+                        var claimedByOtherSession = _sessions.Values.Any(session =>
+                            session.Adapter.Name.Equals(match.Name, StringComparison.OrdinalIgnoreCase) &&
+                            !session.Target.DeviceKey.Equals(parentId, StringComparison.OrdinalIgnoreCase));
+                        if (claimedByOtherSession)
+                        {
+                            WriteStaticLog($"Apple NCM adapter mapping: REJECTED shared adapter={match.Name} for parent={parentId}; adapter is already claimed by another Apple USB session.");
+                            continue;
+                        }
+
                         WriteStaticLog($"Apple NCM adapter mapping: parent={parentId}, child={pnp}, adapter={match.Name}");
                         return match;
                     }
