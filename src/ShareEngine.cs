@@ -370,7 +370,7 @@ public sealed class ShareEngine
         if (targets.Count == 0)
         {
             WriteLog("NCM child PDOs are missing; forcing targeted usbccgp devnode re-enumeration before driver replacement.");
-            if (ReenumerateAppleCompositeDevNode(out var reenumError))
+            if (ReenumerateAppleCompositeDevNode(target.ParentId, out var reenumError))
             {
                 await Task.Delay(1500);
                 appleChildren = FindPnP("USB\\VID_05AC&PID_", null).Where(d => IsChildOfAppleParent(d.Id, target.ParentId)).ToList();
@@ -654,14 +654,16 @@ public sealed class ShareEngine
     private const uint CM_REENUMERATE_NORMAL = 0x00000000;
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
     [DllImport("cfgmgr32.dll")] private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+    [DllImport("cfgmgr32.dll")] private static extern uint CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, EntryPoint = "CM_Get_Device_IDW")] private static extern uint CM_Get_Device_ID(uint dnDevInst, StringBuilder buffer, int bufferLen, uint ulFlags);
 
-    private static bool ReenumerateAppleCompositeDevNode(out uint error)
+    private static bool ReenumerateAppleCompositeDevNode(string parentId, out uint error)
     {
         error = 0;
         try
         {
-            var phone = FindAppleDevice();
-            if (phone is null) { error = 1; WriteStaticLog("ConfigMgr re-enumeration: Apple composite devnode not found."); return false; }
+            var phone = FindAppleDevice(parentId);
+            if (phone is null) { error = 1; WriteStaticLog($"ConfigMgr re-enumeration: Apple composite devnode not found for {parentId}."); return false; }
             var cr = CM_Locate_DevNodeW(out var devInst, phone.Id, 0);
             if (cr != CR_SUCCESS) { error = cr; WriteStaticLog($"ConfigMgr: CM_Locate_DevNode failed for {phone.Id}, CR=0x{cr:X8}"); return false; }
             cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
@@ -812,45 +814,103 @@ public sealed class ShareEngine
 
     private static NetworkInterface? FindPhoneAdapter(string? parentId = null)
     {
-        var nics = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211).ToList();
-        var strong = nics.Where(n => n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) || n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase)).ToList();
+        var nics = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(n => n.OperationalStatus == OperationalStatus.Up &&
+                        n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211)
+            .ToList();
+        var strong = nics.Where(n =>
+            n.Description.Contains("Apple", StringComparison.OrdinalIgnoreCase) ||
+            n.Description.Contains("NCM", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
         if (!string.IsNullOrWhiteSpace(parentId))
         {
             try
             {
-                using var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, NetConnectionID FROM Win32_NetworkAdapter");
+                using var searcher = new ManagementObjectSearcher(
+                    "SELECT PNPDeviceID, NetConnectionID FROM Win32_NetworkAdapter");
                 foreach (ManagementObject o in searcher.Get())
                 {
                     var pnp = o["PNPDeviceID"]?.ToString() ?? "";
                     var name = o["NetConnectionID"]?.ToString() ?? "";
-                    if (string.IsNullOrWhiteSpace(pnp) || string.IsNullOrWhiteSpace(name) || !IsChildOfAppleParent(pnp, parentId)) continue;
-                    var match = nics.FirstOrDefault(n => n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-                    if (match is not null) return match;
+                    if (string.IsNullOrWhiteSpace(pnp) ||
+                        string.IsNullOrWhiteSpace(name) ||
+                        !IsChildOfAppleParent(pnp, parentId))
+                        continue;
+
+                    var match = nics.FirstOrDefault(n =>
+                        n.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null)
+                    {
+                        WriteStaticLog($"Apple NCM adapter mapping: parent={parentId}, child={pnp}, adapter={match.Name}");
+                        return match;
+                    }
                 }
-            } catch { }
+
+                WriteStaticLog($"Apple NCM adapter mapping: no adapter child matched parent={parentId}");
+            }
+            catch (Exception ex)
+            {
+                WriteStaticLog($"Apple NCM adapter mapping failed for parent={parentId}: {ex.GetType().Name}: {ex.Message}");
+            }
         }
+
         if (strong.Count == 1) return strong[0];
         return strong.FirstOrDefault(n => HostAddresses.Any(host => HasAddress(n.Name, host)));
     }
 
-    // A composite child's instance ID is not derived from the parent's serial:
-    //   parent USB\VID_05AC&PID_12AB\6891C03E...            (serial)
-    //   child  USB\VID_05AC&PID_12AB&REV_0503&MI_02\6&2F845C2&1D&0002
-    // so the two are related through the VID/PID hardware segment, not the trailing token.
-    // (The old trailing-token comparison never matched, so an MI_02 that was really present
-    // was reported as missing; UsbNative got the same fix earlier.)
-    private static bool IsChildOfAppleParent(string childId, string parentId) =>
-        string.Equals(HardwareSegment(childId), HardwareSegment(parentId), StringComparison.OrdinalIgnoreCase);
-
-    private static string HardwareSegment(string id)
+    // Multiple Apple devices share VID_05AC&PID_12AB, so VID/PID hardware matching
+    // is not sufficient to associate a network-function child with its composite parent.
+    // Resolve the real Windows device-tree parent through CfgMgr32 instead.
+    private static bool IsChildOfAppleParent(string childId, string parentId)
     {
-        var parts = id.Split('\\');
-        var hardware = parts.Length > 1 ? parts[1] : id;
-        var mi = hardware.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
-        if (mi >= 0) hardware = hardware[..mi];
-        var rev = hardware.IndexOf("&REV_", StringComparison.OrdinalIgnoreCase);
-        if (rev >= 0) hardware = hardware[..rev];
-        return hardware;
+        var actualParent = FindDeviceParentId(childId);
+        var matched = !string.IsNullOrWhiteSpace(actualParent) &&
+                      string.Equals(actualParent, parentId, StringComparison.OrdinalIgnoreCase);
+        WriteStaticLog($"Apple USB network child discovery: child={childId}, expectedParent={parentId}, actualParent={actualParent ?? "none"}, matched={matched}");
+        return matched;
+    }
+
+    private static string? FindDeviceParentId(string childId)
+    {
+        var emptyGuid = Guid.Empty;
+        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if (h == INVALID_HANDLE_VALUE) return null;
+
+        try
+        {
+            for (uint index = 0; ; index++)
+            {
+                var devInfo = new SP_DEVINFO_DATA
+                {
+                    cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>()
+                };
+                if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
+                {
+                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
+                    continue;
+                }
+
+                var instanceId = GetDeviceInstanceId(h, ref devInfo);
+                if (!string.Equals(instanceId, childId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (CM_Get_Parent(out var parentDevInst, devInfo.DevInst, 0) != CR_SUCCESS)
+                    return null;
+
+                var buffer = new StringBuilder(512);
+                if (CM_Get_Device_ID(parentDevInst, buffer, buffer.Capacity, 0) != CR_SUCCESS)
+                    return null;
+
+                return buffer.ToString();
+            }
+
+            return null;
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(h);
+        }
     }
 
     private static IEnumerable<PnpDevice> FindPnP(string hardwareContains, string? className)
