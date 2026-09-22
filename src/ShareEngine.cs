@@ -73,15 +73,23 @@ public sealed class ShareEngine
     public Task EnsurePrerequisitesAsync()
     {
         Directory.CreateDirectory(CacheDir);
-        if (!UsbNative.IsReachable())
+
+        // Do not gate startup on the first Apple device returned by WMI.
+        // Multiple iPhones/iPads can be attached at once, and one device may
+        // temporarily be between USB configurations while another is already
+        // reachable through WinUSB. EnumerateTargets() is target-aware and also
+        // performs the per-device WinUSB migration when an MI_00 path is missing.
+        var targets = UsbNative.EnumerateTargets();
+        var reachable = targets.Count(UsbNative.IsReachable);
+        if (reachable == 0)
         {
             throw new InvalidOperationException(
-                "Apple USB control interface is not reachable through WinUSB. " +
+                "No Apple USB control interface is reachable through WinUSB. " +
                 "The application will not install or load the legacy libusb-win32 filter. " +
-                "Verify that the Apple control interface has the iPhoneUsbShare WinUSB driver bound, then reconnect the device.");
+                "Verify that at least one connected Apple control interface has the iPhoneUsbShare WinUSB driver bound, then reconnect the device.");
         }
 
-        WriteLog("WinUSB control path is available; no legacy libusb-win32 driver will be installed.");
+        WriteLog($"WinUSB control path is available for {reachable}/{targets.Length} Apple USB device(s); no legacy libusb-win32 driver will be installed.");
         return Task.CompletedTask;
     }
 
