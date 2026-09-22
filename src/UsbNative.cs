@@ -605,22 +605,54 @@ internal static class UsbNative
 
     private static bool IsChildOfAppleParent(string childId, string parentId)
     {
-        // Composite USB children have a different instance token from the
-        // composite parent. The stable relationship is the VID/PID hardware
-        // prefix: e.g. parent USB\\VID_05AC&PID_12AB and child
-        // USB\\VID_05AC&PID_12AB&MI_00\\...
-        static string HardwarePrefix(string id)
-        {
-            var slash = id.IndexOf('\\');
-            var hardware = slash >= 0 ? id[..slash] : id;
-            var mi = hardware.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
-            return mi >= 0 ? hardware[..mi] : hardware;
-        }
+        // Multiple Apple devices share the same VID/PID hardware prefix, so
+        // VID/PID matching alone is not enough to associate an MI_xx child
+        // with its composite parent. Resolve the real Windows device-tree
+        // parent through CfgMgr32 instead.
+        var actualParent = FindDeviceParentId(childId);
+        var matched = !string.IsNullOrWhiteSpace(actualParent) &&
+                      string.Equals(actualParent, parentId, StringComparison.OrdinalIgnoreCase);
+        AppendRaw($"Apple USB child discovery: parent match child={childId}, expectedParent={parentId}, actualParent={actualParent ?? "none"}, matched={matched}");
+        return matched;
+    }
 
-        return string.Equals(
-            HardwarePrefix(childId),
-            HardwarePrefix(parentId),
-            StringComparison.OrdinalIgnoreCase);
+    private static string? FindDeviceParentId(string childId)
+    {
+        var emptyGuid = Guid.Empty;
+        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if (h == INVALID_HANDLE_VALUE) return null;
+
+        try
+        {
+            for (uint index = 0; ; index++)
+            {
+                var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+                if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
+                {
+                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
+                    continue;
+                }
+
+                var instanceId = GetDeviceInstanceId(h, ref devInfo);
+                if (!string.Equals(instanceId, childId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (CM_Get_Parent(out var parentDevInst, devInfo.DevInst, 0) != 0)
+                    return null;
+
+                var buffer = new StringBuilder(512);
+                if (CM_Get_Device_ID(parentDevInst, buffer, buffer.Capacity, 0) != 0)
+                    return null;
+
+                return buffer.ToString();
+            }
+
+            return null;
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(h);
+        }
     }
 
     private static string? GetDeviceIdFromParent(string p)
@@ -712,6 +744,12 @@ internal static class UsbNative
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInterfaceDetailW", SetLastError = true)] private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "DiInstallDevice", SetLastError = true)] private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, uint Flags, out bool NeedReboot);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    private static extern int CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, EntryPoint = "CM_Get_Device_IDW")]
+    private static extern int CM_Get_Device_ID(uint dnDevInst, StringBuilder buffer, int bufferLen, uint ulFlags);
+
     [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Initialize(SafeFileHandle DeviceHandle, out IntPtr InterfaceHandle);
     [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_Free(IntPtr InterfaceHandle);
     [DllImport("winusb.dll", SetLastError = true)] private static extern bool WinUsb_ControlTransfer(IntPtr InterfaceHandle, WINUSB_SETUP_PACKET SetupPacket, byte[] Buffer, uint BufferLength, out uint LengthTransferred, IntPtr Overlapped);
