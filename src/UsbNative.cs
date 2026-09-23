@@ -179,9 +179,12 @@ internal static class UsbNative
                             if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                             return false;
                         }
-                        var detail = GetDriverInfName(h, ref devInfo, ref driver);
-                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | inf={detail ?? "?"}");
-                        if (!string.Equals(Path.GetFileName(detail ?? ""), "winusb.inf", StringComparison.OrdinalIgnoreCase)) continue;
+                        // The driver list is already constrained to the in-box winusb.inf by
+                        // DI_ENUMSINGLEINF + DriverPath above. Do not reject the candidate just
+                        // because SetupDiGetDriverInfoDetail fails to marshal its INF detail.
+                        // Windows can still expose a valid WinUSB candidate while that optional
+                        // detail query returns no path; the previous check left MI_00 on MTP/WPD.
+                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | source=winusb.inf");
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             AppendRaw($"WinUSB driver selection failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}");
