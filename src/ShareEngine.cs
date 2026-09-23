@@ -1029,7 +1029,7 @@ public sealed class ShareEngine
                 if (refreshedControlTarget is null)
                     throw new InvalidOperationException("Apple USB control interface did not reappear through WinUSB after PnP re-enumeration.");
 
-                target = refreshedControlTarget.Value;
+                target = refreshedControlTarget;
                 DisablePhotoInterfaces();
 
                 string? mode = null;
