@@ -1010,7 +1010,26 @@ public sealed class ShareEngine
                 SetConfig(phone.Id, SafeIndexValue, "0");
                 RestartDevice(phone.Id);
 
-                await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate");
+                // The composite parent can survive the PnP restart while the MI_00
+                // control PDO is destroyed and recreated with a new instance path. Do not
+                // keep using the pre-restart target: resolve the newly published WinUSB
+                // control interface before attempting GET_MODE. This is shared by Direct USB
+                // and Reverse Tethering because both modes use the same CDC-NCM bring-up.
+                UsbNative.AppleUsbTarget? refreshedControlTarget = null;
+                for (var i = 0; i < 50; i++)
+                {
+                    refreshedControlTarget = UsbNative.EnumerateTargets()
+                        .FirstOrDefault(t =>
+                            string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase) &&
+                            UsbNative.IsReachable(t));
+                    if (refreshedControlTarget is not null) break;
+                    await Task.Delay(500);
+                }
+
+                if (refreshedControlTarget is null)
+                    throw new InvalidOperationException("Apple USB control interface did not reappear through WinUSB after PnP re-enumeration.");
+
+                target = refreshedControlTarget.Value;
                 DisablePhotoInterfaces();
 
                 string? mode = null;
@@ -1022,7 +1041,7 @@ public sealed class ShareEngine
                 }
 
                 if (mode is null)
-                    throw new InvalidOperationException("Apple USB control interface did not reappear.");
+                    throw new InvalidOperationException("Apple USB control interface reappeared, but GET_MODE is not reachable.");
 
                 WriteLog($"Apple USB mode before NCM negotiation: {mode}.");
 
@@ -1055,7 +1074,9 @@ public sealed class ShareEngine
                 await Task.Delay(1000);
 
                 var refreshedTarget = UsbNative.EnumerateTargets()
-                    .FirstOrDefault(t => string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase))
+                    .FirstOrDefault(t =>
+                        string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase) &&
+                        UsbNative.IsReachable(t))
                     ?? target;
 
                 await BindAppleOrInboxNcmDriverAsync(refreshedTarget);
