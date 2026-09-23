@@ -133,8 +133,20 @@ public partial class MainWindow : Window
         try
         {
             var s = await _engine.GetStatusAsync();
-            PhoneText.Text = s.AppleConnected ? s.AppleName : "Connect your iPhone or iPad by USB";
-            AdapterText.Text = s.AdapterName is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.AdapterName} ({s.AdapterStatus})";
+            if (s.Sessions.Count > 0)
+            {
+                var deviceLines = s.Sessions
+                    .Select((session, index) =>
+                        $"USB {index + 1}  {(session.AdapterStatus == OperationalStatus.Up.ToString() ? "[LINK UP]" : "[WAITING]")}  {session.AdapterName}  |  {session.HostAddress} -> {session.PeerAddress}");
+                PhoneText.Text = $"{s.Sessions.Count} Apple USB device{(s.Sessions.Count == 1 ? "" : "s")} connected\n"
+                               + string.Join(Environment.NewLine, deviceLines);
+                AdapterText.Text = "Each iPad has its own isolated USB network and IP address.";
+            }
+            else
+            {
+                PhoneText.Text = s.AppleConnected ? s.AppleName : "Connect your iPhone or iPad by USB";
+                AdapterText.Text = s.AdapterName is null ? "USB Ethernet: not connected" : $"USB Ethernet: {s.AdapterName} ({s.AdapterStatus})";
+            }
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
                 s.AppleConnected ? (s.AdapterName is not null ? "#16A34A" : "#D97706") : "#98A2B3"));
             StateText.Text = s.AdapterName is not null ? "USB network path is ON" : "Ready";
