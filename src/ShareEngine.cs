@@ -157,61 +157,7 @@ public sealed class ShareEngine
         var adapter = FindPhoneAdapter(target.ParentId);
         if (adapter is null || adapter.OperationalStatus != OperationalStatus.Up)
         {
-            ConfigureUsbCgpEnumerator(phone.Id);
-            SetConfig(phone.Id, SafeIndexValue, "0");
-            RestartDevice(phone.Id);
-            await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate");
-            DisablePhotoInterfaces();
-            string? mode = null;
-            for (var i = 0; i < 20; i++) { mode = await UsbNative.GetModeAsync(target); if (mode is not null) break; await Task.Delay(1000); }
-            if (mode is null) throw new InvalidOperationException("Apple USB control interface did not reappear.");
-            var ncmSelected = false;
-            try
-            {
-                if (mode != "5:3:3:0" && mode != "5:3:3")
-                {
-                    if (mode != "3:3:3:0" && mode != "3:3:3") throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
-                    // Point usbccgp at the NCM configuration *before* the mode switch, so the device
-                    // re-enumerates straight into it. Left at the safe index 2, usbccgp comes back
-                    // with only MI_00/MI_01 and the NCM child (MI_02) is never created.
-                    WriteLog($"Selecting NCM configuration (OriginalConfigurationValue={NcmIndexValue}, AltConfigurationValue={NcmAltValue}) before mode switch.");
-                    SetConfig(phone.Id, NcmIndexValue, NcmAltValue);
-                    ncmSelected = true;
-                    if (!await UsbNative.SetConfigurationAsync(target, int.Parse(NcmIndexValue))) throw new InvalidOperationException("Apple CDC-NCM configuration switch failed.");
-                    if (!await UsbNative.SetModeAsync(target, 3)) throw new InvalidOperationException("Apple device rejected CDC-NCM mode.");
-                }
-                else
-                {
-                    // The device is already in mode 5 (left over from an earlier run) but usbccgp was
-                    // just restarted on the safe configuration above; move it to the NCM configuration.
-                    WriteLog($"Apple device already in mode {mode}; selecting NCM configuration (OriginalConfigurationValue={NcmIndexValue}, AltConfigurationValue={NcmAltValue}) and restarting the composite device.");
-                    SetConfig(phone.Id, NcmIndexValue, NcmAltValue);
-                    ncmSelected = true;
-                    RestartDevice(phone.Id);
-                    await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate on the NCM configuration");
-                    await Task.Delay(1500);
-                }
-                await BindAppleOrInboxNcmDriverAsync(target);
-                await WaitUntil(() => FindPhoneAdapter(target.ParentId)?.OperationalStatus == OperationalStatus.Up, 30, "USB Ethernet adapter");
-                adapter = FindPhoneAdapter(target.ParentId) ?? throw new InvalidOperationException("USB Ethernet adapter did not start.");
-            }
-            catch
-            {
-                // A failed NCM attempt must not leave usbccgp pointed at the NCM configuration:
-                // if that configuration does not enumerate, the composite comes up with no
-                // children (no MI_00, no WinUSB) and every later start times out.
-                if (ncmSelected)
-                {
-                    try
-                    {
-                        SetConfig(phone.Id, SafeIndexValue, "0");
-                        RestartDevice(phone.Id);
-                        WriteLog("NCM bring-up failed; restored the safe usbccgp configuration and restarted the composite device.");
-                    }
-                    catch (Exception restoreEx) { WriteLog($"Could not restore the safe usbccgp configuration: {restoreEx.Message}"); }
-                }
-                throw;
-            }
+            adapter = await BringUpNcmAdapterAsync(target, phone);
         }
         if (shareMode == ShareMode.ReverseTethering) await StartReverseTetheringAsync(target, adapter);
         else await StartDirectUsbAsync(target, adapter, slot);
@@ -1049,4 +995,111 @@ public sealed class ShareEngine
             }
         }
     }
+        private async Task<NetworkInterface> BringUpNcmAdapterAsync(UsbNative.AppleUsbTarget target, AppleDevice phone)
+    {
+        const int maxAttempts = 3;
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            var ncmSelected = false;
+            try
+            {
+                WriteLog($"NCM bring-up attempt {attempt}/{maxAttempts} for {phone.Id} ({phone.Name}).");
+                ConfigureUsbCgpEnumerator(phone.Id);
+                SetConfig(phone.Id, SafeIndexValue, "0");
+                RestartDevice(phone.Id);
+
+                await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate");
+                DisablePhotoInterfaces();
+
+                string? mode = null;
+                for (var i = 0; i < 30; i++)
+                {
+                    mode = await UsbNative.GetModeAsync(target);
+                    if (mode is not null) break;
+                    await Task.Delay(500);
+                }
+
+                if (mode is null)
+                    throw new InvalidOperationException("Apple USB control interface did not reappear.");
+
+                WriteLog($"Apple USB mode before NCM negotiation: {mode}.");
+
+                if (mode != "5:3:3:0" && mode != "5:3:3")
+                {
+                    if (mode != "3:3:3:0" && mode != "3:3:3")
+                        throw new InvalidOperationException($"Unexpected Apple USB mode: {mode}.");
+
+                    WriteLog($"Selecting NCM configuration (OriginalConfigurationValue={NcmIndexValue}, AltConfigurationValue={NcmAltValue}) before mode switch.");
+                    SetConfig(phone.Id, NcmIndexValue, NcmAltValue);
+                    ncmSelected = true;
+
+                    if (!await UsbNative.SetConfigurationAsync(target, int.Parse(NcmIndexValue)))
+                        throw new InvalidOperationException("Apple CDC-NCM configuration switch failed.");
+
+                    if (!await UsbNative.SetModeAsync(target, 3))
+                        throw new InvalidOperationException("Apple device rejected CDC-NCM mode.");
+
+                    WriteLog("Apple CDC-NCM mode switch accepted; waiting for device re-enumeration.");
+                }
+                else
+                {
+                    WriteLog($"Apple device already reports NCM mode {mode}; selecting NCM configuration and restarting the composite device.");
+                    SetConfig(phone.Id, NcmIndexValue, NcmAltValue);
+                    ncmSelected = true;
+                    RestartDevice(phone.Id);
+                }
+
+                await WaitUntil(() => FindAppleDevice(target.ParentId) is not null, 25, "Apple USB device to re-enumerate on NCM configuration");
+                await Task.Delay(1000);
+
+                var refreshedTarget = UsbNative.EnumerateTargets()
+                    .FirstOrDefault(t => string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase))
+                    ?? target;
+
+                await BindAppleOrInboxNcmDriverAsync(refreshedTarget);
+
+                await WaitUntil(() =>
+                {
+                    var current = FindPhoneAdapter(refreshedTarget.ParentId);
+                    return current?.OperationalStatus == OperationalStatus.Up;
+                }, 30, "USB Ethernet adapter");
+
+                var adapter = FindPhoneAdapter(refreshedTarget.ParentId);
+                if (adapter is null || adapter.OperationalStatus != OperationalStatus.Up)
+                    throw new InvalidOperationException("USB Ethernet adapter did not start.");
+
+                WriteLog($"NCM bring-up succeeded on attempt {attempt}/{maxAttempts}: {adapter.Name}.");
+                return adapter;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                WriteLog($"NCM bring-up attempt {attempt}/{maxAttempts} failed: {ex.Message}");
+
+                try
+                {
+                    if (ncmSelected)
+                    {
+                        SetConfig(phone.Id, SafeIndexValue, "0");
+                        RestartDevice(phone.Id);
+                        WriteLog("NCM recovery: restored safe usbccgp configuration and restarted the composite device.");
+                    }
+                }
+                catch (Exception restoreEx)
+                {
+                    WriteLog($"NCM recovery warning: could not restore safe usbccgp configuration: {restoreEx.Message}");
+                }
+
+                if (attempt < maxAttempts)
+                    await Task.Delay(1500);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Unable to bring up Apple CDC-NCM after {maxAttempts} attempts.",
+            lastError);
     }
+
+}
