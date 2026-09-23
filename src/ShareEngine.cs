@@ -326,11 +326,39 @@ public sealed class ShareEngine
     public async Task<Status> GetStatusAsync()
     {
         ReconcileRemovedSessions();
+
+        var sessions = _sessions.Values
+            .OrderBy(s => s.HostAddress, StringComparer.OrdinalIgnoreCase)
+            .Select(s =>
+            {
+                var (rx, tx) = GetRates(s.Adapter.Name);
+                return new SessionStatus(
+                    s.HostAddress,
+                    s.PeerAddress,
+                    s.Adapter.Name,
+                    s.Adapter.OperationalStatus.ToString(),
+                    FindAddress(s.Adapter.Name),
+                    rx,
+                    tx);
+            })
+            .ToArray();
+
         var p = FindAppleDevice();
         var a = _sessions.Values.FirstOrDefault()?.Adapter ?? FindPhoneAdapter();
         var sharing = _sessions.Count > 0;
         var (rx, tx) = a is null ? (0d, 0d) : GetRates(a.Name);
-        return await Task.FromResult(new Status(p is not null, p?.Name ?? "Apple device", a?.Name, a?.OperationalStatus.ToString() ?? "—", sharing, a is null ? null : FindAddress(a.Name), rx, tx, _sessions.Count));
+
+        return await Task.FromResult(new Status(
+            p is not null,
+            p?.Name ?? "Apple device",
+            a?.Name,
+            a?.OperationalStatus.ToString() ?? "—",
+            sharing,
+            a is null ? null : FindAddress(a.Name),
+            rx,
+            tx,
+            _sessions.Count,
+            sessions));
     }
 
     public async Task<string> DiagnosticsAsync()
@@ -986,7 +1014,26 @@ public sealed class ShareEngine
         throw new TimeoutException($"Timed out waiting for {what}.");
     }
 
-    public readonly record struct Status(bool AppleConnected, string AppleName, string? AdapterName, string AdapterStatus, bool Sharing, string? Lease, double Rx, double Tx, int SessionCount);
+    public readonly record struct SessionStatus(
+        string HostAddress,
+        string PeerAddress,
+        string AdapterName,
+        string AdapterStatus,
+        string? Lease,
+        double Rx,
+        double Tx);
+
+    public readonly record struct Status(
+        bool AppleConnected,
+        string AppleName,
+        string? AdapterName,
+        string AdapterStatus,
+        bool Sharing,
+        string? Lease,
+        double Rx,
+        double Tx,
+        int SessionCount,
+        IReadOnlyList<SessionStatus> Sessions);
     private readonly record struct CommandResult(int ExitCode, string Output, string Error);
     private sealed record PnpDevice(string Id, string Name)
     {
