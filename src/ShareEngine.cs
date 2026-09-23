@@ -995,7 +995,7 @@ public sealed class ShareEngine
             }
         }
     }
-        private async Task<NetworkInterface> BringUpNcmAdapterAsync(UsbNative.AppleUsbTarget target, AppleDevice phone)
+        private async Task<NetworkInterface> BringUpNcmAdapterAsync(UsbNative.AppleUsbTarget target, PnpDevice phone)
     {
         const int maxAttempts = 3;
         Exception? lastError = null;
