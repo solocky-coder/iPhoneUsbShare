@@ -17,7 +17,7 @@ internal static class UsbNative
     private const uint DI_ENUMSINGLEINF = 0x00000002;
     private const uint DI_QUIETINSTALL = 0x00000020;
     private const uint DI_FLAGSEX_ALLOWEXCLUDEDDRVS = 0x00000001;
-    private const uint SPDIT_CLASSDRIVER = 0x00000001;
+    private const uint SPDIT_COMPATDRIVER = 0x00000002;
     private const int ERROR_NO_MORE_ITEMS = 259;
     private const uint GENERIC_READ = 0x80000000;
     private const uint GENERIC_WRITE = 0x40000000;
@@ -152,6 +152,18 @@ internal static class UsbNative
         if (h == INVALID_HANDLE_VALUE) return false;
         try
         {
+            var customInf = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");
+            if (!File.Exists(customInf))
+            {
+                AppendRaw($"WinUSB migration: custom control INF is missing: {customInf}");
+                return false;
+            }
+
+            AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
+            var stage = RunAllowRestart("pnputil.exe", $"/add-driver \"{customInf}\" /install");
+            AppendRaw($"WinUSB migration: custom INF staging exit={stage.ExitCode}; output={stage.Output.Trim()}");
+            if (stage.ExitCode != 0) return false;
+
             for (uint index = 0; ; index++)
             {
                 var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
@@ -166,15 +178,15 @@ internal static class UsbNative
                 if (!SetupDiGetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
                 installParams.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
                 installParams.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
-                installParams.DriverPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "INF", "winusb.inf");
+                installParams.DriverPath = customInf;
                 if (!SetupDiSetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
-                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER)) return false;
+                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER)) return false;
                 try
                 {
                     for (uint driverIndex = 0; ; driverIndex++)
                     {
                         var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
-                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_CLASSDRIVER, driverIndex, ref driver))
+                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_COMPATDRIVER, driverIndex, ref driver))
                         {
                             if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
                             return false;
@@ -184,7 +196,11 @@ internal static class UsbNative
                         // because SetupDiGetDriverInfoDetail fails to marshal its INF detail.
                         // Windows can still expose a valid WinUSB candidate while that optional
                         // detail query returns no path; the previous check left MI_00 on MTP/WPD.
-                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | source=winusb.inf");
+                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | source=WinUsbControl.inf");
+                        if (!string.Equals(driver.Description, "iPhoneUsbShare Apple USB Control Interface", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
                         if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
                         {
                             AppendRaw($"WinUSB driver selection failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}");
@@ -199,7 +215,7 @@ internal static class UsbNative
                         return true;
                     }
                 }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_CLASSDRIVER); }
+                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER); }
                 return false;            }
             return false;
         }
