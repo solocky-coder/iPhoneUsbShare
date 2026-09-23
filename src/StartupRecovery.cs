@@ -184,6 +184,16 @@ internal static class StartupRecovery
         catch (Exception ex) { log($"Startup recovery: ConfigMgr child inspection failed: {ex.GetType().Name}: {ex.Message}"); }
     }
 
+    private static int GetCfgMgrChildCount(string parentId)
+    {
+        try
+        {
+            var result = CM_Locate_DevNodeW(out var parentDevInst, parentId, CmLocateDevNodeNormal);
+            return result == CrSuccess ? GetCfgMgrChildren(parentDevInst).Length : 0;
+        }
+        catch { return 0; }
+    }
+
     private static string[] GetCfgMgrChildren(uint parentDevInst)
     {
         var ids = new List<string>();
