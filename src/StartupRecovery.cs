@@ -36,17 +36,16 @@ internal static class StartupRecovery
         // before any re-enumeration so the rebuilt stack comes up with MI_00 again.
         RestoreSafeUsbccgpConfiguration(parent, log);
 
-        // A reboot can leave usbccgp itself stuck in Code 10 while the composite
-        // parent has no child PDOs. In that state CM_Reenumerate_DevNode and
-        // /restart-device only restart the already-broken parent stack and do not
-        // recreate MI_00. Remove only this broken Apple composite instance (and its
-        // nonexistent child subtree), then let PnP scan the still-connected device
-        // and rebuild usbccgp. This is deliberately restricted to Code 10 + zero
-        // children at startup; normal NCM transitions never use subtree removal.
+        // If usbccgp is not producing any child PDOs, restarting/re-enumerating the
+        // existing parent can simply restart the same broken device stack. Rebuild the
+        // present Apple composite devnode once so Windows can bind the normal composite
+        // parent (usbccgp) and recreate MI_00. This is startup-only; normal NCM transitions
+        // never remove the device subtree.
         var cmError = GetCompositeConfigManagerError(parent);
-        if (cmError == 10)
+        var childCount = GetCfgMgrChildCount(parent);
+        if (childCount == 0)
         {
-            log("Startup recovery: Apple composite parent is in ConfigMgr Code 10 with no child devnodes; rebuilding the usbccgp device instance once.");
+            log($"Startup recovery: Apple composite parent has zero child devnodes (ConfigMgr error={cmError}); rebuilding the usbccgp device instance once.");
             var remove = RunPnpUtil($"/remove-device \"{parent}\" /subtree");
             log($"Startup recovery: pnputil /remove-device /subtree exit code {remove.ExitCode}.");
             if (!string.IsNullOrWhiteSpace(remove.Output)) log($"Startup recovery: {remove.Output.Trim()}");
@@ -54,7 +53,7 @@ internal static class StartupRecovery
             await Task.Delay(1200);
 
             var scanAfterRemove = RunPnpUtil("/scan-devices");
-            log($"Startup recovery: pnputil /scan-devices after Code 10 rebuild exit code {scanAfterRemove.ExitCode}.");
+            log($"Startup recovery: pnputil /scan-devices after usbccgp rebuild exit code {scanAfterRemove.ExitCode}.");
             if (!string.IsNullOrWhiteSpace(scanAfterRemove.Output)) log($"Startup recovery: {scanAfterRemove.Output.Trim()}");
             if (!string.IsNullOrWhiteSpace(scanAfterRemove.Error)) log($"Startup recovery: {scanAfterRemove.Error.Trim()}");
 
@@ -64,18 +63,18 @@ internal static class StartupRecovery
                 parent = FindAppleCompositeParent() ?? parent;
                 if (FindMi00(parent) is not null)
                 {
-                    LogAppleTree(parent, log, "after Code 10 rebuild");
-                    LogCfgMgrChildren(parent, log, "after Code 10 rebuild");
-                    log("Startup recovery: usbccgp Code 10 recovery restored Apple MI_00; WinUSB prerequisite check can continue.");
+                    LogAppleTree(parent, log, "after usbccgp rebuild");
+                    LogCfgMgrChildren(parent, log, "after usbccgp rebuild");
+                    log("Startup recovery: usbccgp rebuild restored Apple MI_00; WinUSB prerequisite check can continue.");
                     return;
                 }
                 if (attempt == 1 || attempt == 5 || attempt == 10)
-                    log($"Startup recovery: waiting for MI_00 after Code 10 rebuild ({attempt}/10)…");
+                    log($"Startup recovery: waiting for MI_00 after usbccgp rebuild ({attempt}/10)…");
             }
 
             parent = FindAppleCompositeParent() ?? parent;
-            LogAppleTree(parent, log, "after Code 10 rebuild attempt");
-            LogCfgMgrChildren(parent, log, "after Code 10 rebuild attempt");
+            LogAppleTree(parent, log, "after usbccgp rebuild attempt");
+            LogCfgMgrChildren(parent, log, "after usbccgp rebuild attempt");
         }
 
         log($"Startup recovery: MI_00 is missing; requesting targeted PnP re-enumeration of {parent}.");
