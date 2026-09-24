@@ -1006,38 +1006,55 @@ public sealed class ShareEngine
             try
             {
                 WriteLog($"NCM bring-up attempt {attempt}/{maxAttempts} for {phone.Id} ({phone.Name}).");
-                ConfigureUsbCgpEnumerator(phone.Id);
-                SetConfig(phone.Id, SafeIndexValue, "0");
-                RestartDevice(phone.Id);
 
-                // The composite parent can survive the PnP restart while the MI_00
-                // control PDO is destroyed and recreated with a new instance path. Do not
-                // keep using the pre-restart target: resolve the newly published WinUSB
-                // control interface before attempting GET_MODE. This is shared by Direct USB
-                // and Reverse Tethering because both modes use the same CDC-NCM bring-up.
-                UsbNative.AppleUsbTarget? refreshedControlTarget = null;
-                for (var i = 0; i < 50; i++)
-                {
-                    refreshedControlTarget = UsbNative.EnumerateTargets()
-                        .FirstOrDefault(t =>
-                            string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase) &&
-                            UsbNative.IsReachable(t));
-                    if (refreshedControlTarget is not null) break;
-                    await Task.Delay(500);
-                }
-
-                if (refreshedControlTarget is null)
-                    throw new InvalidOperationException("Apple USB control interface did not reappear through WinUSB after PnP re-enumeration.");
-
-                target = refreshedControlTarget;
+                // Do not reset a healthy Apple control interface just to discover its mode.
+                // Reset 5 was needlessly doing:
+                //   safe usbccgp config -> PnP restart -> GET_MODE
+                // and the restart could leave the newly published MI_00 reachable by
+                // SetupAPI while the Apple control endpoint itself was not yet usable.
+                // Query the already-published WinUSB target first. This keeps both Direct USB
+                // and Reverse Tethering on the same non-destructive NCM bring-up path.
                 DisablePhotoInterfaces();
-
                 string? mode = null;
-                for (var i = 0; i < 30; i++)
+                for (var i = 0; i < 8; i++)
                 {
                     mode = await UsbNative.GetModeAsync(target);
                     if (mode is not null) break;
                     await Task.Delay(500);
+                }
+
+                // Only use the old safe-config/PnP recovery path when GET_MODE really is
+                // unavailable on the existing control interface.
+                if (mode is null)
+                {
+                    WriteLog("GET_MODE is not reachable on the existing WinUSB control interface; starting targeted usbccgp recovery.");
+                    ConfigureUsbCgpEnumerator(phone.Id);
+                    SetConfig(phone.Id, SafeIndexValue, "0");
+                    RestartDevice(phone.Id);
+
+                    UsbNative.AppleUsbTarget? refreshedControlTarget = null;
+                    for (var i = 0; i < 50; i++)
+                    {
+                        refreshedControlTarget = UsbNative.EnumerateTargets()
+                            .FirstOrDefault(t =>
+                                string.Equals(t.ParentId, target.ParentId, StringComparison.OrdinalIgnoreCase) &&
+                                UsbNative.IsReachable(t));
+                        if (refreshedControlTarget is not null) break;
+                        await Task.Delay(500);
+                    }
+
+                    if (refreshedControlTarget is null)
+                        throw new InvalidOperationException("Apple USB control interface did not reappear through WinUSB after PnP re-enumeration.");
+
+                    target = refreshedControlTarget;
+                    DisablePhotoInterfaces();
+
+                    for (var i = 0; i < 30; i++)
+                    {
+                        mode = await UsbNative.GetModeAsync(target);
+                        if (mode is not null) break;
+                        await Task.Delay(500);
+                    }
                 }
 
                 if (mode is null)
