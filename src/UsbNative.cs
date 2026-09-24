@@ -314,7 +314,11 @@ internal static class UsbNative
                 if (mode == "5:3:3:0") DumpAllConfigurations(usb, id ?? "05AC:????");
                 return new ModeDiagnostic(0, 0, true, id, true, 4, 4, mode, "GET_MODE succeeded via WinUSB.");
             }
-            finally { WinUsb_Free(usb); }
+            finally
+            {
+                WinUsb_Free(usb);
+                file.Dispose();
+            }
         }
         catch (Exception ex) { return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, $"WinUSB diagnostic exception: {ex.GetType().Name}: {ex.Message}"); }
     }
@@ -477,22 +481,84 @@ internal static class UsbNative
     {
         file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
         var path = FindWinUsbDevicePathForInstance(target.ControlInterfaceId);
-        if (path is null) return IntPtr.Zero;
+        if (path is null)
+        {
+            AppendRaw($"WINUSB OPEN: no interface path for {target.ControlInterfaceId}");
+            return IntPtr.Zero;
+        }
+
+        LogWinUsbBinding(target.ControlInterfaceId, path);
         file = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
             IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-        if (file.IsInvalid) return IntPtr.Zero;
-        return WinUsb_Initialize(file, out var usb) ? usb : IntPtr.Zero;
+        if (file.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            AppendRaw($"WINUSB OPEN: CreateFile failed for {target.ControlInterfaceId}; error={error}; path={path}");
+            file.Dispose();
+            file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+            return IntPtr.Zero;
+        }
+
+        if (!WinUsb_Initialize(file, out var usb))
+        {
+            var error = Marshal.GetLastWin32Error();
+            AppendRaw($"WINUSB OPEN: WinUsb_Initialize failed for {target.ControlInterfaceId}; error={error}; path={path}");
+            file.Dispose();
+            file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+            return IntPtr.Zero;
+        }
+
+        AppendRaw($"WINUSB OPEN: CreateFile + WinUsb_Initialize succeeded for {target.ControlInterfaceId}.");
+        return usb;
     }
 
     private static IntPtr OpenWinUsb(out SafeFileHandle file)
     {
         file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
         var path = FindWinUsbDevicePath();
-        if (path is null) return IntPtr.Zero;
+        if (path is null)
+        {
+            AppendRaw("WINUSB OPEN: no default interface path.");
+            return IntPtr.Zero;
+        }
+
         file = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-        if (file.IsInvalid) { file.Dispose(); return IntPtr.Zero; }
-        if (!WinUsb_Initialize(file, out var usb)) { file.Dispose(); return IntPtr.Zero; }
+        if (file.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            AppendRaw($"WINUSB OPEN: default CreateFile failed; error={error}; path={path}");
+            file.Dispose();
+            file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+            return IntPtr.Zero;
+        }
+
+        if (!WinUsb_Initialize(file, out var usb))
+        {
+            var error = Marshal.GetLastWin32Error();
+            AppendRaw($"WINUSB OPEN: default WinUsb_Initialize failed; error={error}; path={path}");
+            file.Dispose();
+            file = new SafeFileHandle(IntPtr.Zero, ownsHandle: true);
+            return IntPtr.Zero;
+        }
+
         return usb;
+    }
+
+    private static void LogWinUsbBinding(string instanceId, string interfacePath)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{instanceId}");
+            var service = key?.GetValue("Service")?.ToString() ?? "<missing>";
+            var driver = key?.GetValue("Driver")?.ToString() ?? "<missing>";
+            var className = key?.GetValue("Class")?.ToString() ?? "<missing>";
+            var description = key?.GetValue("DeviceDesc")?.ToString() ?? "<missing>";
+            AppendRaw($"WINUSB BINDING: instance={instanceId} | service={service} | driver={driver} | class={className} | desc={description} | interface={interfacePath}");
+        }
+        catch (Exception ex)
+        {
+            AppendRaw($"WINUSB BINDING: registry query failed for {instanceId}: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static SafeFileHandle OpenDevice(string path) => CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, IntPtr.Zero);
