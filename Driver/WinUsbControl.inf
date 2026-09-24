@@ -8,7 +8,7 @@ Class       = USBDevice
 ClassGUID   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
 Provider    = %ManufacturerName%
 CatalogFile = WinUsbControl.cat
-DriverVer   = 09/15/2026,1.0.0.1
+DriverVer   = 09/24/2026,1.0.0.2
 PnpLockdown = 1
 
 [Manufacturer]
