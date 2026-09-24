@@ -13,6 +13,7 @@ public partial class MainWindow : Window
     private readonly ShareEngine _engine;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(2) };
     private bool _sharing;
+    private bool _starting;
     private bool _autoStarting;
     private bool _autoStartArmed = true;
     private bool _syncingMode;
@@ -109,9 +110,22 @@ public partial class MainWindow : Window
         var wasSharing = _sharing;
         try
         {
-            if (wasSharing) { _timer.Stop(); Log($"Switching to {selected.DisplayName()}…"); }
+            if (wasSharing)
+            {
+                _timer.Stop();
+                _starting = true;
+                SetConnectionProgress($"Switching to {selected.DisplayName()}…", running: true);
+                Log($"Switching to {selected.DisplayName()}…");
+            }
             await _engine.SwitchModeAsync(selected);
-            if (wasSharing) { _timer.Start(); await RefreshAsync(); }
+            if (wasSharing)
+            {
+                _starting = false;
+                _sharing = true;
+                SetConnectionProgress("Connected", running: false, complete: true);
+                _timer.Start();
+                await RefreshAsync();
+            }
         }
         catch (Exception ex)
         {
@@ -120,12 +134,34 @@ public partial class MainWindow : Window
             {
                 // The new mode is selected but its session did not start; let the user retry with Start.
                 _sharing = false;
+                _starting = false;
+                SetConnectionProgress("Mode switch failed — see Activity", running: false);
                 StartButton.IsEnabled = true;
                 StopButton.IsEnabled = false;
             }
             await RefreshAsync();
         }
         finally { ModePanel.IsEnabled = true; }
+    }
+
+    private void SetConnectionProgress(string phase, bool running, bool complete = false)
+    {
+        var modeName = _engine.Mode == ShareMode.ReverseTethering ? "Reverse tethering" : "Direct USB";
+        ProgressText.Text = string.IsNullOrWhiteSpace(phase) ? modeName : $"{modeName} — {phase}";
+        if (complete)
+        {
+            ConnectionProgress.IsIndeterminate = false;
+            ConnectionProgress.Value = 100;
+        }
+        else if (running)
+        {
+            ConnectionProgress.IsIndeterminate = true;
+        }
+        else
+        {
+            ConnectionProgress.IsIndeterminate = false;
+            ConnectionProgress.Value = 0;
+        }
     }
 
     private async Task RefreshAsync()
@@ -149,7 +185,26 @@ public partial class MainWindow : Window
             }
             StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
                 s.AppleConnected ? (s.AdapterName is not null ? "#16A34A" : "#D97706") : "#98A2B3"));
-            StateText.Text = s.AdapterName is not null ? "USB network path is ON" : "Ready";
+            if (s.AdapterName is not null)
+            {
+                StateText.Text = _engine.Mode == ShareMode.ReverseTethering
+                    ? "REVERSE TETHERING — USB network path is ON"
+                    : "DIRECT USB — isolated USB network is ON";
+                SetConnectionProgress("Connected", running: false, complete: true);
+            }
+            else if (_starting || _autoStarting)
+            {
+                StateText.Text = _engine.Mode == ShareMode.ReverseTethering
+                    ? "REVERSE TETHERING — starting…"
+                    : "DIRECT USB — starting…";
+            }
+            else
+            {
+                StateText.Text = _engine.Mode == ShareMode.ReverseTethering
+                    ? "REVERSE TETHERING — ready"
+                    : "DIRECT USB — ready";
+                SetConnectionProgress("Ready", running: false);
+            }
             IpText.Text = s.Lease ?? "—";
             RxText.Text = $"{s.Rx:0.0} KB/s";
             TxText.Text = $"{s.Tx:0.0} KB/s";
@@ -158,6 +213,7 @@ public partial class MainWindow : Window
                 _sharing = false;
                 StartButton.IsEnabled = true;
                 StopButton.IsEnabled = false;
+                SetConnectionProgress("Waiting for USB network", running: false);
             }
         }
         catch (Exception ex) { Log($"Status: {ex.Message}"); }
@@ -168,9 +224,11 @@ public partial class MainWindow : Window
         _autoStartArmed = true;
         StartButton.IsEnabled = false;
         StopButton.IsEnabled = false;
+        _starting = true;
+        SetConnectionProgress("Starting USB control path…", running: true);
         try
         {
-            Log("Starting USB network path…");
+            Log($"Starting {_engine.Mode.DisplayName()} USB network path…");
 
             // ShareEngine owns the complete reference-compatible transition:
             // usbccgp EnumeratorClass preparation -> registry index 2 -> restart
@@ -181,14 +239,18 @@ public partial class MainWindow : Window
             await _engine.StartAsync();
 
             _sharing = true;
+            _starting = false;
             StopButton.IsEnabled = true;
-            Log("USB network path is ON.");
+            SetConnectionProgress("Connected", running: false, complete: true);
+            Log($"{_engine.Mode.DisplayName()} USB network path is ON.");
             _timer.Start();
             await RefreshAsync();
         }
         catch (Exception ex)
         {
+            _starting = false;
             Log($"ERROR: {ex.Message}");
+            SetConnectionProgress("Start failed — see Activity", running: false);
             StartButton.IsEnabled = true;
         }
     }
@@ -199,16 +261,20 @@ public partial class MainWindow : Window
         try
         {
             _sharing = false;
+            _starting = false;
             _autoStartArmed = false;
             _timer.Stop();
+            SetConnectionProgress("Stopping USB network path…", running: true);
             Log("Stopping USB network path…");
             await _engine.StopAsync();
             StartButton.IsEnabled = true;
+            SetConnectionProgress("Ready", running: false);
             await RefreshAsync();
         }
         catch (Exception ex)
         {
             Log($"ERROR: {ex.Message}");
+            SetConnectionProgress("Stop failed — see Activity", running: false);
             StopButton.IsEnabled = true;
         }
     }
@@ -277,17 +343,23 @@ public partial class MainWindow : Window
 
             StartButton.IsEnabled = false;
             StopButton.IsEnabled = false;
-            Log($"Apple USB device detected ({reason}); starting USB network path automatically…");
+            _starting = true;
+            SetConnectionProgress("Starting USB control path…", running: true);
+            Log($"Apple USB device detected ({reason}); starting {_engine.Mode.DisplayName()} USB network path automatically…");
             await _engine.StartAsync();
             _sharing = true;
+            _starting = false;
             StopButton.IsEnabled = true;
+            SetConnectionProgress("Connected", running: false, complete: true);
             _timer.Start();
-            Log("Automatic USB network startup complete.");
+            Log($"Automatic {_engine.Mode.DisplayName()} USB network startup complete.");
             await RefreshAsync();
         }
         catch (Exception ex)
         {
+            _starting = false;
             Log($"Automatic USB startup failed: {ex.Message}");
+            SetConnectionProgress("Start failed — see Activity", running: false);
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
         }
