@@ -147,79 +147,54 @@ internal static class UsbNative
 
     private static bool InstallWinUsbDriver(string instanceId)
     {
-        var emptyGuid = Guid.Empty;
-        var h = SetupDiGetClassDevs(ref emptyGuid, null, IntPtr.Zero, DIGCF_ALLCLASSES | DIGCF_PRESENT);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        try
+        var customInf = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");
+        if (!File.Exists(customInf))
         {
-            var customInf = Path.Combine(AppContext.BaseDirectory, "Driver", "WinUsbControl.inf");
-            if (!File.Exists(customInf))
-            {
-                AppendRaw($"WinUSB migration: custom control INF is missing: {customInf}");
-                return false;
-            }
-
-            AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
-            var stage = RunAllowRestart("pnputil.exe", $"/add-driver \"{customInf}\" /install");
-            AppendRaw($"WinUSB migration: custom INF staging exit={stage.ExitCode}; output={stage.Output.Trim()}");
-            if (stage.ExitCode != 0) return false;
-
-            for (uint index = 0; ; index++)
-            {
-                var devInfo = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
-                if (!SetupDiEnumDeviceInfo(h, index, ref devInfo))
-                {
-                    if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
-                    return false;
-                }
-                var id = GetDeviceInstanceId(h, ref devInfo);
-                if (!string.Equals(id, instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-                var installParams = new SP_DEVINSTALL_PARAMS { cbSize = (uint)Marshal.SizeOf<SP_DEVINSTALL_PARAMS>(), DriverPath = string.Empty };
-                if (!SetupDiGetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
-                installParams.Flags |= DI_ENUMSINGLEINF | DI_QUIETINSTALL;
-                installParams.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
-                installParams.DriverPath = customInf;
-                if (!SetupDiSetDeviceInstallParams(h, ref devInfo, ref installParams)) return false;
-                if (!SetupDiBuildDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER)) return false;
-                try
-                {
-                    for (uint driverIndex = 0; ; driverIndex++)
-                    {
-                        var driver = new SP_DRVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DRVINFO_DATA>() };
-                        if (!SetupDiEnumDriverInfo(h, ref devInfo, SPDIT_COMPATDRIVER, driverIndex, ref driver))
-                        {
-                            if (Marshal.GetLastWin32Error() == ERROR_NO_MORE_ITEMS) break;
-                            return false;
-                        }
-                        // The driver list is already constrained to the in-box winusb.inf by
-                        // DI_ENUMSINGLEINF + DriverPath above. Do not reject the candidate just
-                        // because SetupDiGetDriverInfoDetail fails to marshal its INF detail.
-                        // Windows can still expose a valid WinUSB candidate while that optional
-                        // detail query returns no path; the previous check left MI_00 on MTP/WPD.
-                        AppendRaw($"WinUSB driver candidate: description={driver.Description} | provider={driver.ProviderName} | source=WinUsbControl.inf");
-                        if (!string.Equals(driver.Description, "iPhoneUsbShare Apple USB Control Interface", StringComparison.OrdinalIgnoreCase))
-                        {
-                            continue;
-                        }
-                        if (!SetupDiSetSelectedDriver(h, ref devInfo, ref driver))
-                        {
-                            AppendRaw($"WinUSB driver selection failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}");
-                            return false;
-                        }
-                        if (!DiInstallDevice(IntPtr.Zero, h, ref devInfo, ref driver, 0, out var reboot))
-                        {
-                            AppendRaw($"WinUSB DiInstallDevice failed for {instanceId}, Win32Error={Marshal.GetLastWin32Error()}, reboot={reboot}");
-                            return false;
-                        }
-                        AppendRaw($"WinUSB installed on {instanceId}; reboot={reboot}");
-                        return true;
-                    }
-                }
-                finally { SetupDiDestroyDriverInfoList(h, ref devInfo, SPDIT_COMPATDRIVER); }
-                return false;            }
+            AppendRaw($"WinUSB migration: custom control INF is missing: {customInf}");
             return false;
         }
-        finally { SetupDiDestroyDeviceInfoList(h); }
+
+        AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
+        var stage = RunAllowRestart("pnputil.exe", $"/add-driver \"{customInf}\" /install");
+        AppendRaw($"WinUSB migration: custom INF staging exit={stage.ExitCode}; output={stage.Output.Trim()}; error={stage.Error.Trim()}");
+        if (stage.ExitCode != 0) return false;
+
+        // SetupDi's compatibility-driver enumeration can omit the freshly staged
+        // WinUSB package when the existing Apple WPD/MTP package is already
+        // selected. Use the Windows-supported driver-update API with FORCE so the
+        // exact MI_00 hardware ID in our INF is actually rebound to WinUSB.
+        const uint INSTALLFLAG_FORCE = 0x00000001;
+        const uint INSTALLFLAG_NONINTERACTIVE = 0x00000002;
+        const string mi00HardwareId = "USB\\VID_05AC&PID_12AB&REV_0503&MI_00";
+        var updated = UpdateDriverForPlugAndPlayDevices(
+            IntPtr.Zero,
+            mi00HardwareId,
+            customInf,
+            INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE,
+            out var rebootRequired);
+
+        var updateError = updated ? 0 : Marshal.GetLastWin32Error();
+        AppendRaw($"WinUSB migration: UpdateDriverForPlugAndPlayDevices hardwareId={mi00HardwareId}; updated={updated}; error={updateError}; reboot={rebootRequired}");
+
+        if (!updated)
+        {
+            // The alternate Apple PID variant is also declared in the INF. This
+            // keeps the migration working for hardware revisions that omit REV_0503.
+            const string fallbackHardwareId = "USB\\VID_05AC&PID_12AB&MI_00";
+            var fallback = UpdateDriverForPlugAndPlayDevices(
+                IntPtr.Zero,
+                fallbackHardwareId,
+                customInf,
+                INSTALLFLAG_FORCE | INSTALLFLAG_NONINTERACTIVE,
+                out var fallbackReboot);
+            var fallbackError = fallback ? 0 : Marshal.GetLastWin32Error();
+            AppendRaw($"WinUSB migration: fallback UpdateDriverForPlugAndPlayDevices hardwareId={fallbackHardwareId}; updated={fallback}; error={fallbackError}; reboot={fallbackReboot}");
+            if (!fallback) return false;
+            rebootRequired |= fallbackReboot;
+        }
+
+        AppendRaw($"WinUSB migration: forced WinUSB driver update completed for {instanceId}; reboot={rebootRequired}");
+        return true;
     }
 
     private static string? GetDriverInfName(IntPtr h, ref SP_DEVINFO_DATA devInfo, ref SP_DRVINFO_DATA driver)
@@ -833,6 +808,9 @@ internal static class UsbNative
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
     [DllImport("setupapi.dll", SetLastError = true)] private static extern bool SetupDiEnumDeviceInterfaces(IntPtr DeviceInfoSet, IntPtr DeviceInfoData, ref Guid InterfaceClassGuid, uint MemberIndex, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "SetupDiGetDeviceInterfaceDetailW", SetLastError = true)] private static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr DeviceInfoSet, ref SP_DEVICE_INTERFACE_DATA DeviceInterfaceData, IntPtr DeviceInterfaceDetailData, uint DeviceInterfaceDetailDataSize, out uint RequiredSize, IntPtr DeviceInfoData);
+    [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "UpdateDriverForPlugAndPlayDevicesW", SetLastError = true)]
+    private static extern bool UpdateDriverForPlugAndPlayDevices(IntPtr hwndParent, string hardwareId, string fullInfPath, uint installFlags, out bool rebootRequired);
+
     [DllImport("newdev.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "DiInstallDevice", SetLastError = true)] private static extern bool DiInstallDevice(IntPtr hwndParent, IntPtr DeviceInfoSet, ref SP_DEVINFO_DATA DeviceInfoData, ref SP_DRVINFO_DATA DriverInfoData, uint Flags, out bool NeedReboot);
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
     private static extern int CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
