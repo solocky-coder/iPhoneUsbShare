@@ -289,9 +289,14 @@ internal static class UsbNative
             var path = target is null ? FindWinUsbDevicePath() : FindWinUsbDevicePathForInstance(target.ControlInterfaceId);
             if (path is null) return new ModeDiagnostic(0, 0, false, null, false, 0, 4, null, "WinUSB control interface is not present.");
             var id = target is null ? GetDeviceId() : GetDeviceId(target);
-            using var file = OpenDevice(path);
-            if (file.IsInvalid) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"CreateFile failed: {Marshal.GetLastWin32Error()}");
-            if (!WinUsb_Initialize(file, out var usb)) return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"WinUsb_Initialize failed: {Marshal.GetLastWin32Error()}");
+
+            // Use the same WinUSB open path as all target-scoped control transfers.
+            // The old diagnostic path opened the interface directly and initialized
+            // WinUSB itself, which can disagree with the target-scoped WinUSB handle
+            // (especially after usbccgp re-enumeration). Keep one canonical open path.
+            var usb = target is null ? OpenWinUsb(out var file) : OpenWinUsb(target, out file);
+            if (usb == IntPtr.Zero)
+                return new ModeDiagnostic(0, 0, true, id, false, 0, 4, null, $"WinUSB open/initialize failed: {Marshal.GetLastWin32Error()}");
             try
             {
                 var buf = new byte[4];
