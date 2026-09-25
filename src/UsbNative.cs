@@ -49,8 +49,9 @@ internal static class UsbNative
             var mi00 = FindAppleInterfaceId(parent, 0);
             if (string.IsNullOrWhiteSpace(mi00)) continue;
             var path = FindWinUsbDevicePathForInstance(mi00);
-            if (path is null)
+            if (path is null || !IsWinUsbServiceBound(mi00))
             {
+                AppendRaw($"WinUSB migration: MI_00 path/service is not backed by WinUSB for {mi00}; forcing driver migration.");
                 SetWinUsbDeviceParameters(mi00);
                 if (InstallWinUsbDriver(mi00))
                 {
@@ -122,8 +123,15 @@ internal static class UsbNative
         lock (InitLock)
         {
             if (!migrationAttempted) migrationAttempted = true;
-            if (FindWinUsbDevicePath() is not null) return;
-            var parent = FindAppleCompositeId();
+            var existingPath = FindWinUsbDevicePath();
+            var existingParent = FindAppleCompositeId();
+            if (existingPath is not null && existingParent is not null)
+            {
+                var existingMi00 = FindAppleInterfaceId(existingParent, 0);
+                if (existingMi00 is not null && IsWinUsbServiceBound(existingMi00)) return;
+                AppendRaw($"WinUSB migration: interface GUID is present but MI_00 is not bound to WinUSB; forcing migration for {existingMi00 ?? "unknown MI_00"}.");
+            }
+            var parent = existingParent;
             if (parent is null) return;
             RemoveLegacyLibUsbFilter(parent);
             var mi00 = FindAppleInterfaceId(parent, 0);
@@ -211,6 +219,23 @@ internal static class UsbNative
             return detail.InfFileName;
         }
         finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    private static bool IsWinUsbServiceBound(string instanceId)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"SYSTEM\CurrentControlSet\Enum\{instanceId}");
+            var service = key?.GetValue("Service")?.ToString();
+            var bound = string.Equals(service, "WinUSB", StringComparison.OrdinalIgnoreCase);
+            AppendRaw($"WINUSB BINDING CHECK: instance={instanceId} | service={service ?? "<missing>"} | boundToWinUSB={bound}");
+            return bound;
+        }
+        catch (Exception ex)
+        {
+            AppendRaw($"WINUSB BINDING CHECK failed for {instanceId}: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 
     private static void SetWinUsbDeviceParameters(string instanceId)
