@@ -1,0 +1,3 @@
+# Private signing keys / certificate containers
+*.pfx
+*.p12
