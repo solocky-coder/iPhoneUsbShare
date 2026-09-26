@@ -1,22 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWPF>true</UseWPF>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <PlatformTarget>x64</PlatformTarget>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <PublishTrimmed>false</PublishTrimmed>
-    <AssemblyName>iPhoneUsbShare</AssemblyName>
-    <RootNamespace>iPhoneUsbShare</RootNamespace>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    ...
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="9.0.9" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="9.0.9" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\Driver\WinUsbControlSigning.cer">
+      <LogicalName>iPhoneUsbShare.Driver.WinUsbControlSigning.cer</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 </Project>
