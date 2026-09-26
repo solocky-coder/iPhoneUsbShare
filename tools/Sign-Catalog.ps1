@@ -19,7 +19,7 @@ function Find-Tool([string]$Name) {
 $infPath = (Resolve-Path $Inf).Path
 $pfxResolved = (Resolve-Path $PfxPath).Path
 $infDir = Split-Path -Parent $infPath
-$catPath = Join-Path $infDir ((Split-Path -LeafBase $infPath) + '.cat')
+$catPath = Join-Path $infDir ([System.IO.Path]::GetFileNameWithoutExtension($infPath) + '.cat')
 $inf2cat = Find-Tool 'Inf2Cat.exe'
 $signtool = Find-Tool 'signtool.exe'
 if (-not $PfxPassword) { $PfxPassword = Read-Host 'Enter the PFX password' -AsSecureString }
