@@ -71,6 +71,15 @@ public static class IPhoneUsbShare_NewDev
 '@
 }
 
+Write-Host "`n=== Step 0: Trust the driver signing certificate ==="
+$signingCert = Join-Path $packageDir 'WinUsbControlSigning.cer'
+if (-not (Test-Path $signingCert)) {
+    throw "WinUsbControlSigning.cer not found: $signingCert"
+}
+& certutil.exe -addstore Root $signingCert | Out-Null
+& certutil.exe -addstore TrustedPublisher $signingCert | Out-Null
+Write-Host "Installed $signingCert into LocalMachine Root + TrustedPublisher."
+
 Write-Host "`n=== Step 1: Configure Usbccgp to select USB configuration 5 ==="
 Write-Host "Staging composite-parent configuration package..."
 & pnputil.exe /add-driver $parentInf /install

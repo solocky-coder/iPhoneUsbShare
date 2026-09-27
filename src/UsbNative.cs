@@ -5,6 +5,7 @@ using System.Management;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using System.Text;
+using iPhoneUsbShare.Driver;
 
 namespace iPhoneUsbShare;
 
@@ -162,7 +163,14 @@ internal static class UsbNative
             return false;
         }
 
-        AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
+        if (!CertTrustInstaller.EnsureDriverSigningCertTrusted())
+        {
+            AppendRaw("WinUSB migration: failed to establish trust for the driver signing certificate (needs elevation); aborting staging.");
+            return false;
+        }
+        AppendRaw("WinUSB migration: driver signing certificate trust confirmed (Root + TrustedPublisher).");
+
+AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
         var stage = RunAllowRestart("pnputil.exe", $"/add-driver \"{customInf}\" /install");
         AppendRaw($"WinUSB migration: custom INF staging exit={stage.ExitCode}; output={stage.Output.Trim()}; error={stage.Error.Trim()}");
         if (stage.ExitCode != 0) return false;
