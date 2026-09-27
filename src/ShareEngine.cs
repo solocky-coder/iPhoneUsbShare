@@ -372,8 +372,8 @@ public sealed class ShareEngine
         foreach (var ncmTarget in targets)
         {
             LogPnpDriverState(ncmTarget.Id, "NCM candidate");
-            LogPnpIds(target.Id);
-            LogPnpUtilDrivers(target.Id);
+            LogPnpIds(ncmTarget.Id);
+            LogPnpUtilDrivers(ncmTarget.Id);
         }
         if (targets.Count == 0)
         {
