@@ -15,7 +15,7 @@ public partial class MainWindow : Window
     private bool _sharing;
     private bool _starting;
     private bool _autoStarting;
-    private bool _autoStartArmed = true;
+    private bool _autoStartArmed = false;
     private bool _syncingMode;
     private HwndSource? _hwndSource;
 
@@ -45,7 +45,6 @@ public partial class MainWindow : Window
             }
             catch (Exception ex) { Log($"Setup check: {ex.Message}"); }
             await RefreshAsync();
-            await TryAutoStartAsync("startup");
         };
         SourceInitialized += (_, _) =>
         {
