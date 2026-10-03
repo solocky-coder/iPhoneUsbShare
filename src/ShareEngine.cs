@@ -384,6 +384,16 @@ public sealed class ShareEngine
 
         IReadOnlyList<string> NcmIds() => targets.Select(t => t.Id).ToList();
 
+        // If every NCM function is already started (problem 0 and DN_STARTED), Windows bound a working
+        // driver on its own. Force-installing UsbNcm over it can only break it, so leave it alone.
+        const uint DN_STARTED = 0x00000008;
+        if (targets.All(t => TryGetDevNodeProblem(t.Id, out var st, out var prob) && prob == 0 && (st & DN_STARTED) != 0))
+        {
+            foreach (var t in targets)
+                WriteLog($"NCM function {t.Id} is already started (service={GetDevNodeService(t.Id) ?? "?"}); not replacing its driver.");
+            return NcmIds();
+        }
+
         var appleInfCandidates = new[] { Path.Combine(AppDir, "AppleNcm", "AppleNcm.inf"), Path.Combine(AppDir, "Driver", "artifacts", "AppleNcm", "AppleNcm.inf"), Path.Combine(AppDir, "AppleNcm.inf") }.Where(File.Exists).ToList();
         var appleInf = appleInfCandidates.FirstOrDefault();
         WriteLog($"AppleNcm bring-up INF: {appleInf ?? "not bundled"}");
@@ -464,12 +474,12 @@ public sealed class ShareEngine
     {
         try
         {
-            using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT PNPDeviceID, Name, Service, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
+            using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT PNPDeviceID, Name, Service, Manufacturer, ConfigManagerErrorCode, Status FROM Win32_PnPEntity");
             foreach (ManagementObject o in searcher.Get())
             {
                 var id = o["PNPDeviceID"]?.ToString() ?? "";
                 if (!id.Equals(instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-                WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | class={o["PNPClass"]} | service={o["Service"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
+                WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | service={o["Service"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
                 return;
             }
             WriteStaticLog($"{prefix}: no Win32_PnPEntity row found");
@@ -1172,6 +1182,15 @@ public sealed class ShareEngine
                     throw new InvalidOperationException("Apple USB control interface reappeared, but GET_MODE is not reachable.");
 
                 WriteLog($"Apple USB mode before NCM negotiation: {mode}.");
+
+                // Every Apple device needs usbccgp's EnumeratorClass = CDC so its tethering function
+                // enumerates with CDC compatible IDs (...&CDC_0D&MI_02) and the in-box UsbNcm driver
+                // starts on it. Previously this was only applied in the GET_MODE recovery branch above,
+                // so a second device that never hit that branch enumerated as a plain MI_02, bound
+                // Apple's Netaapl, and failed with Code 10. The value takes effect on the composite
+                // restart / mode-switch re-enumeration that follows below.
+                try { ConfigureUsbCgpEnumerator(phone.Id); }
+                catch (Exception ex) { WriteLog($"Could not prepare usbccgp EnumeratorClass for {phone.Id}: {ex.Message}"); }
 
                 if (mode != "5:3:3:0" && mode != "5:3:3")
                 {
