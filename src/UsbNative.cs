@@ -788,7 +788,7 @@ AppendRaw($"WinUSB migration: pre-staging custom INF: {customInf}");
 
     private static string Hex(byte[] data, int count) => count <= 0 ? "" : string.Join(" ", data.Take(count).Select(b => b.ToString("X2")));
     private static string Hex(byte[] data, int offset, int count) => count <= 0 ? "" : string.Join(" ", data.Skip(offset).Take(count).Select(b => b.ToString("X2")));
-    private static void AppendRaw(string message) { try { lock (LogLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}", new UTF8Encoding(false)); } catch { } }
+    private static void AppendRaw(string message) { if (!LogThrottle.ShouldWrite(ref message)) return; try { lock (LogLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}", new UTF8Encoding(false)); } catch { } }
     private static void AppendDiagnostic(ModeDiagnostic d) => AppendRaw($"WINUSB GET_MODE DETAIL: device={d.DeviceId ?? "none"}, enumerated={d.DeviceEnumerated}, open={d.OpenSucceeded}, return={d.ControlReturn}/{d.ExpectedBytes}, error={d.Error}");
 
     [StructLayout(LayoutKind.Sequential)]

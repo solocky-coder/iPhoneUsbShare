@@ -335,14 +335,14 @@ public sealed class ShareEngine
         return sb.ToString();
     }
 
-    private async Task BindAppleOrInboxNcmDriverAsync(UsbNative.AppleUsbTarget target)
+    private async Task<IReadOnlyList<string>> BindAppleOrInboxNcmDriverAsync(UsbNative.AppleUsbTarget target)
     {
         var controlInterfaces = await UsbNative.GetNcmControlInterfacesAsync(target);
         if (controlInterfaces.Length == 0)
         {
             WriteLog("USB descriptors expose no CDC-NCM control interface after mode 5.");
             LogAppleInterfaces();
-            return;
+            return Array.Empty<string>();
         }
         foreach (var n in controlInterfaces) WriteLog($"USB descriptor NCM control interface: {n}");
 
@@ -379,8 +379,10 @@ public sealed class ShareEngine
         {
             WriteLog("CDC-NCM descriptors were present, but Windows still exposed no matching Apple MI child nodes after targeted usbccgp re-enumeration.");
             LogAppleInterfaces();
-            return;
+            return Array.Empty<string>();
         }
+
+        IReadOnlyList<string> NcmIds() => targets.Select(t => t.Id).ToList();
 
         var appleInfCandidates = new[] { Path.Combine(AppDir, "AppleNcm", "AppleNcm.inf"), Path.Combine(AppDir, "Driver", "artifacts", "AppleNcm", "AppleNcm.inf"), Path.Combine(AppDir, "AppleNcm.inf") }.Where(File.Exists).ToList();
         var appleInf = appleInfCandidates.FirstOrDefault();
@@ -402,7 +404,7 @@ public sealed class ShareEngine
                 await Task.Delay(2000);
                 LogPnpDriverState(ncmTarget.Id, "after AppleNcm driver install settled");
                 var adapter = FindPhoneAdapter(ncmTarget.ParentId);
-                if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteStaticLog($"AppleNcm produced a usable adapter: {adapter.Name}"); return; }
+                if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteStaticLog($"AppleNcm produced a usable adapter: {adapter.Name}"); return NcmIds(); }
             }
             WriteLog("Bundled AppleNcm was present but did not produce an active adapter; continuing with inbox UsbNcm diagnostics.");
         }
@@ -415,7 +417,29 @@ public sealed class ShareEngine
         }
         var inf = candidatesInf.FirstOrDefault();
         WriteLog($"Windows NCM INF: {inf ?? "not found"}");
-        if (inf is null) { WriteLog("No Microsoft UsbNcm INF is installed on this Windows system; leaving the existing Apple NCM driver untouched."); return; }
+        if (inf is null) { WriteLog("No Microsoft UsbNcm INF is installed on this Windows system; leaving the existing Apple NCM driver untouched."); return NcmIds(); }
+        // usbncm.inf matches on the Microsoft OS compatible ID usb\ms_comp_winncm, not on the Apple function's
+        // Class_02&SubClass_0d IDs, so DiInstallDevice below is a "force-install" of a non-matching driver node.
+        // If this function already failed to start under that driver (Code 10 / Code 0x38), installing the very
+        // same driver again cannot succeed; stop here instead of repeating it and waiting out the timeout.
+        // Only skip when the node is failing under UsbNcm itself; a failure under some other driver (for example
+        // Apple's netaapl64) says nothing about whether UsbNcm would start, so that case still gets one attempt.
+        var alreadyFailed = targets.Where(t =>
+            TryGetDevNodeProblem(t.Id, out _, out var prob) && IsStartFailureProblem(prob) &&
+            string.Equals(GetDevNodeService(t.Id), "UsbNcm", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (alreadyFailed.Count == targets.Count)
+        {
+            foreach (var t in alreadyFailed)
+            {
+                TryGetDevNodeProblem(t.Id, out var st, out var prob);
+                WriteLog($"NCM function {t.Id} is already in start-failure state under UsbNcm (problem=0x{prob:X2}, status=0x{st:X8}); not force-installing the in-box UsbNcm again.");
+            }
+            throw new NcmDriverStartException(
+                "No working NCM driver is available for this Apple function: the AppleNcm package is " +
+                (appleInf is null ? "not bundled" : "present but did not start") +
+                ", and the in-box UsbNcm driver already failed to start on it.");
+        }
+
         var add = RunAllowRestart("pnputil.exe", $"/add-driver \"{inf}\" /install");
         WriteLog($"UsbNcm package registration exit code: {add.ExitCode}");
         if (!string.IsNullOrWhiteSpace(add.Output)) WriteLog($"UsbNcm package output: {add.Output.Trim()}");
@@ -430,21 +454,22 @@ public sealed class ShareEngine
             await Task.Delay(2000);
             LogPnpDriverState(ncmTarget.Id, "after NCM driver install settled");
             var adapter = FindPhoneAdapter(ncmTarget.ParentId);
-            if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}"); return; }
+            if (adapter?.OperationalStatus == OperationalStatus.Up) { WriteLog($"UsbNcm produced a usable adapter: {adapter.Name}"); return NcmIds(); }
             WriteLog("Selected NCM function did not produce an active network adapter; trying the next descriptor-identified NCM function.");
         }
+        return NcmIds();
     }
 
     private static void LogPnpDriverState(string instanceId, string prefix)
     {
         try
         {
-            using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT PNPDeviceID, Name, Service, DriverVersion, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
+            using var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT PNPDeviceID, Name, Service, Manufacturer, ConfigManagerErrorCode, Status, PNPClass FROM Win32_PnPEntity");
             foreach (ManagementObject o in searcher.Get())
             {
                 var id = o["PNPDeviceID"]?.ToString() ?? "";
                 if (!id.Equals(instanceId, StringComparison.OrdinalIgnoreCase)) continue;
-                WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | class={o["PNPClass"]} | service={o["Service"]} | driver={o["DriverVersion"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
+                WriteStaticLog($"{prefix}: id={id} | name={o["Name"]} | class={o["PNPClass"]} | service={o["Service"]} | manufacturer={o["Manufacturer"]} | configError={o["ConfigManagerErrorCode"]} | status={o["Status"]}");
                 return;
             }
             WriteStaticLog($"{prefix}: no Win32_PnPEntity row found");
@@ -481,6 +506,7 @@ public sealed class ShareEngine
 
     private static void WriteStaticLog(string message)
     {
+        if (!LogThrottle.ShouldWrite(ref message)) return;
         var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
         try { lock (LogFileLock) File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "ActivityLog.txt"), line + Environment.NewLine, new UTF8Encoding(false)); } catch { }
     }
@@ -645,6 +671,91 @@ public sealed class ShareEngine
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
     [DllImport("cfgmgr32.dll")] private static extern uint CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
     [DllImport("cfgmgr32.dll")] private static extern uint CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+    [DllImport("cfgmgr32.dll")] private static extern uint CM_Get_DevNode_Status(out uint pulStatus, out uint pulProblemNumber, uint dnDevInst, uint ulFlags);
+    private const uint CM_PROB_FAILED_START = 0x0A;
+    private const uint CM_PROB_NEED_CLASS_CONFIG = 0x38;
+
+    /// <summary>Reads the live ConfigMgr status/problem code of a devnode (0 problem = started or not failed).</summary>
+    private static bool TryGetDevNodeProblem(string instanceId, out uint status, out uint problem)
+    {
+        status = 0; problem = 0;
+        try
+        {
+            if (CM_Locate_DevNodeW(out var devInst, instanceId, 0) != CR_SUCCESS) return false;
+            return CM_Get_DevNode_Status(out status, out problem, devInst, 0) == CR_SUCCESS;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Service currently assigned to a devnode (e.g. "UsbNcm"), from its Enum registry key; null when unavailable.</summary>
+    private static string? GetDevNodeService(string instanceId)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\" + instanceId);
+            return key?.GetValue("Service") as string;
+        }
+        catch { return null; }
+    }
+
+    private static bool IsStartFailureProblem(uint problem) => problem == CM_PROB_FAILED_START || problem == CM_PROB_NEED_CLASS_CONFIG;
+
+    /// <summary>Raised when the NCM function's driver has deterministically failed to start; retrying cannot help.</summary>
+    private sealed class NcmDriverStartException : InvalidOperationException
+    {
+        public NcmDriverStartException(string message) : base(message) { }
+    }
+
+    /// <summary>
+    /// Waits for the USB Ethernet adapter, but gives up early when every NCM child devnode sits in a
+    /// start-failure problem state (Code 10 / Code 0x38) for several consecutive seconds. A driver that
+    /// failed to start does not recover by waiting, so there is no reason to burn the full timeout.
+    /// </summary>
+    private static async Task WaitForNcmAdapterAsync(IReadOnlyList<string> ncmIds, Func<bool> adapterUp, int maxSeconds)
+    {
+        const double StableFailureSeconds = 4.0;
+        var sw = Stopwatch.StartNew();
+        var lastAdapterCheck = TimeSpan.FromSeconds(-10);
+        TimeSpan? failingSince = null;
+        string failureDetail = "";
+
+        while (sw.Elapsed.TotalSeconds < maxSeconds)
+        {
+            // The adapter lookup uses WMI and is comparatively expensive; poll it about once a second.
+            if (sw.Elapsed - lastAdapterCheck >= TimeSpan.FromSeconds(1))
+            {
+                lastAdapterCheck = sw.Elapsed;
+                if (adapterUp()) return;
+            }
+
+            if (ncmIds.Count > 0)
+            {
+                var details = new List<string>();
+                var allFailed = true;
+                foreach (var id in ncmIds)
+                {
+                    if (TryGetDevNodeProblem(id, out var st, out var prob) && IsStartFailureProblem(prob))
+                        details.Add($"{id}: problem=0x{prob:X2} status=0x{st:X8}");
+                    else { allFailed = false; break; }
+                }
+
+                if (allFailed)
+                {
+                    failingSince ??= sw.Elapsed;
+                    failureDetail = string.Join("; ", details);
+                    if ((sw.Elapsed - failingSince.Value).TotalSeconds >= StableFailureSeconds)
+                        throw new NcmDriverStartException(
+                            $"The NCM driver failed to start and stayed failed for {StableFailureSeconds:0}s ({failureDetail}). " +
+                            "Waiting longer will not help; the bound driver cannot start on this function.");
+                }
+                else failingSince = null;
+            }
+
+            await Task.Delay(250);
+        }
+
+        throw new TimeoutException("Timed out waiting for USB Ethernet adapter.");
+    }
     [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, EntryPoint = "CM_Get_Device_IDW")] private static extern uint CM_Get_Device_ID(uint dnDevInst, StringBuilder buffer, int bufferLen, uint ulFlags);
 
     private static bool ReenumerateAppleCompositeDevNode(string parentId, out uint error)
@@ -1096,13 +1207,13 @@ public sealed class ShareEngine
                         UsbNative.IsReachable(t))
                     ?? target;
 
-                await BindAppleOrInboxNcmDriverAsync(refreshedTarget);
+                var ncmIds = await BindAppleOrInboxNcmDriverAsync(refreshedTarget);
 
-                await WaitUntil(() =>
+                await WaitForNcmAdapterAsync(ncmIds, () =>
                 {
                     var current = FindPhoneAdapter(refreshedTarget.ParentId);
                     return current?.OperationalStatus == OperationalStatus.Up;
-                }, 30, "USB Ethernet adapter");
+                }, 30);
 
                 var adapter = FindPhoneAdapter(refreshedTarget.ParentId);
                 if (adapter is null || adapter.OperationalStatus != OperationalStatus.Up)
@@ -1130,13 +1241,19 @@ public sealed class ShareEngine
                     WriteLog($"NCM recovery warning: could not restore safe usbccgp configuration: {restoreEx.Message}");
                 }
 
+                // A driver that already failed to start is deterministic: repeating the same sequence only
+                // restarts the composite device again. Surface the real reason instead of retrying.
+                if (ex is NcmDriverStartException) break;
+
                 if (attempt < maxAttempts)
                     await Task.Delay(1500);
             }
         }
 
         throw new InvalidOperationException(
-            $"Unable to bring up Apple CDC-NCM after {maxAttempts} attempts.",
+            lastError is NcmDriverStartException
+                ? $"Unable to bring up Apple CDC-NCM: {lastError.Message}"
+                : $"Unable to bring up Apple CDC-NCM after {maxAttempts} attempts.",
             lastError);
     }
 
