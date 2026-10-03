@@ -13,4 +13,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AppleNcm-x64
-          path: Driver\artifacts\AppleNcm\**
+          # build-driver.ps1 writes to <repo root>\artifacts\AppleNcm (not under Driver\).
+          path: artifacts\AppleNcm\**
+          if-no-files-found: error
