@@ -50,6 +50,7 @@ internal static class NetworkSharingRecovery
         // environment), and recycle SharedAccess once if it keeps failing.
         var deadline = DateTime.UtcNow.AddSeconds(IcsRetryBudgetSeconds);
         var recycled = false;
+        var staleIcsStateRepaired = false;
         for (var attempt = 1; ; attempt++)
         {
             // If the device's USB link dropped (the adapter is gone) no amount of retrying can work.
@@ -75,10 +76,33 @@ internal static class NetworkSharingRecovery
             }
             catch (Exception ex)
             {
-                var hint = IsSubscriberError(ex) || ex.Message.Contains("80040201", StringComparison.OrdinalIgnoreCase)
-                    ? " (0x80040201: ICS event subscribers failed; the adapter or a required service may not be ready yet)"
+                var subscriberError = IsSubscriberError(ex) ||
+                                      ex.Message.Contains("80040201", StringComparison.OrdinalIgnoreCase);
+                var hint = subscriberError
+                    ? " (0x80040201: ICS event subscribers failed)"
                     : "";
                 log($"[ICS] Attempt {attempt} failed: {ex.GetType().Name}: {ex.Message}{hint}");
+
+                // Windows can retain ICS role flags in ROOT\\Microsoft\\HomeNet for network
+                // connections that no longer exist. In that state HNetCfg can return
+                // EVENT_E_ALL_SUBSCRIBERS_FAILED (0x80040201) indefinitely, while the Network
+                // Connections GUI repairs it when sharing is toggled manually. Only perform this
+                // destructive ICS metadata repair after the specific subscriber error, so Direct
+                // USB mode and normal reverse-tethering startup are not affected.
+                if (subscriberError && !staleIcsStateRepaired)
+                {
+                    staleIcsStateRepaired = true;
+                    try
+                    {
+                        ClearStaleHomeNetIcsState(log);
+                        DisableSharing(log, wifi, ethernet);
+                        log("[ICS] Stale HomeNet ICS state repair completed; retrying HNetCfg.");
+                    }
+                    catch (Exception repairEx)
+                    {
+                        log($"[ICS] Stale HomeNet ICS repair failed: {repairEx.GetType().Name}: {repairEx.Message}");
+                    }
+                }
             }
 
             if (DateTime.UtcNow >= deadline)
@@ -303,6 +327,52 @@ try {
 
         if (strategy == IcsStrategy.PrivateThenPublic) { EnablePrivate(); EnablePublic(); }
         else { EnablePublic(); EnablePrivate(); }
+    }
+
+    /// <summary>
+    /// Clears stale Internet Connection Sharing role flags stored by Windows in
+    /// ROOT\\Microsoft\\HomeNet. Windows can retain IsIcsPublic/IsIcsPrivate
+    /// records for adapters that have already disappeared. HNetCfg may then return
+    /// 0x80040201 forever until the stale flags are cleared; toggling the Sharing
+    /// checkbox in the Network Connections GUI performs the equivalent repair.
+    ///
+    /// This is intentionally NOT called during Direct USB mode or normal startup.
+    /// It is a targeted recovery for HNetCfg's 0x80040201 failure.
+    /// </summary>
+    private static void ClearStaleHomeNetIcsState(Action<string> log)
+    {
+        var scope = new ManagementScope(@"\\.\root\Microsoft\HomeNet");
+        scope.Connect();
+
+        var query = new ObjectQuery("SELECT * FROM HNet_ConnectionProperties");
+        using var searcher = new ManagementObjectSearcher(scope, query);
+        using var results = searcher.Get();
+
+        var options = new PutOptions
+        {
+            Type = PutType.UpdateOnly
+        };
+
+        var changed = 0;
+        var examined = 0;
+        foreach (ManagementObject entry in results)
+        {
+            examined++;
+            var connection = entry["Connection"]?.ToString() ?? "(unknown)";
+            var isPublic = entry["IsIcsPublic"] is bool publicValue && publicValue;
+            var isPrivate = entry["IsIcsPrivate"] is bool privateValue && privateValue;
+
+            if (!isPublic && !isPrivate)
+                continue;
+
+            log($"[ICS] Clearing stale HomeNet flags: Connection={connection}, IsIcsPublic={isPublic}, IsIcsPrivate={isPrivate}");
+            if (isPublic) entry["IsIcsPublic"] = false;
+            if (isPrivate) entry["IsIcsPrivate"] = false;
+            entry.Put(options);
+            changed++;
+        }
+
+        log($"[ICS] HomeNet ICS metadata scan complete: examined={examined}, changed={changed}.");
     }
 
     /// <summary>
